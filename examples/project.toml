@@ -1,0 +1,28 @@
+schema_version = 1
+project_name = "Example app"
+assignment_file = ".ports.env"
+port_min = 1024
+port_max = 65535
+
+[discovery]
+compose_files = ["compose.yaml"]
+env_files = [".env"]
+package_files = ["web/package.json"]
+
+[[service]]
+id = "api"
+name = "API"
+group = "backend"
+variable = "API_PORT"
+preferred_port = 3000
+protocols = ["tcp"]
+sources = ["compose:compose.yaml#api"]
+
+[[service]]
+id = "web"
+name = "Web"
+group = "frontend"
+variable = "WEB_PORT"
+preferred_port = 5173
+protocols = ["tcp"]
+sources = ["package:web/package.json#dev"]

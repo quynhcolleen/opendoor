@@ -29,7 +29,7 @@ static void describe_owner(const OdScanSnapshot *snapshot,
     for (size_t index = 0U; index < snapshot->docker_mapping_count; ++index) {
         const OdDockerMapping *mapping = &snapshot->docker_mappings[index];
         if (mapping->host_port != port) continue;
-        (void)snprintf(owner, capacity, "Docker %.80s (project %.80s) on port %u",
+        (void)snprintf(owner, capacity, "Docker %.72s (project %.72s) on port %u",
                        mapping->container,
                        mapping->project[0] == '\0' ? "unknown" : mapping->project,
                        (unsigned)port);

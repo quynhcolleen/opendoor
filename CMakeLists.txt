@@ -101,6 +101,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_settings PRIVATE opendoor_core)
   target_compile_options(test_settings PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME settings_contracts COMMAND test_settings)
+  add_test(
+    NAME packaging_contracts
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_packaging.sh
+            ${CMAKE_BINARY_DIR}/opendoor ${CMAKE_CURRENT_SOURCE_DIR}
+  )
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(
@@ -113,5 +118,7 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)
+install(FILES README.md DESTINATION share/doc/opendoor)
+install(FILES examples/project.toml DESTINATION share/doc/opendoor/examples)
 install(FILES LICENSE DESTINATION share/licenses/opendoor)
 install(FILES THIRD_PARTY_LICENSES.md DESTINATION share/licenses/opendoor)

@@ -54,11 +54,14 @@ static volatile sig_atomic_t termination_signal = 0;
 static int signal_pipe_write = -1;
 
 static void termination_handler(int signal_number) {
+    int saved_errno = errno;
     termination_signal = signal_number;
     if (signal_pipe_write >= 0) {
         unsigned char value = (unsigned char)signal_number;
-        (void)write(signal_pipe_write, &value, sizeof(value));
+        ssize_t written = write(signal_pipe_write, &value, sizeof(value));
+        (void)written;
     }
+    errno = saved_errno;
 }
 
 static bool signal_state_install(SignalState *state) {
@@ -135,9 +138,9 @@ static void *startup_scan_main(void *argument) {
 
 static int canvas_attributes(const OdCell *cell, bool use_color) {
     int attributes = 0;
-    if (use_color) attributes |= COLOR_PAIR((int)cell->role + 1);
-    if ((cell->attributes & 1U) != 0U) attributes |= A_BOLD;
-    if ((cell->attributes & 2U) != 0U) attributes |= A_REVERSE;
+    if (use_color) attributes |= (int)COLOR_PAIR((int)cell->role + 1);
+    if ((cell->attributes & 1U) != 0U) attributes |= (int)A_BOLD;
+    if ((cell->attributes & 2U) != 0U) attributes |= (int)A_REVERSE;
     return attributes;
 }
 

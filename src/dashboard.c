@@ -22,7 +22,7 @@ static bool port_occupied(const OdScanSnapshot *snapshot, uint16_t port, char *d
     for (size_t index = 0U; index < snapshot->docker_mapping_count; ++index) {
         const OdDockerMapping *mapping = &snapshot->docker_mappings[index];
         if (mapping->host_port != port) continue;
-        (void)snprintf(detail, capacity, "Docker %s (%s)", mapping->container,
+        (void)snprintf(detail, capacity, "Docker %.80s (%.80s)", mapping->container,
                        mapping->project[0] == '\0' ? "unlabelled" : mapping->project);
         return true;
     }
