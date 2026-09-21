@@ -1,0 +1,10 @@
+/build/
+/dist/
+/.cache/
+/.superpowers/
+*.log
+*.tmp
+*.swp
+.ports.env
+.ports.env.opendoor.bak
+
