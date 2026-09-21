@@ -51,6 +51,9 @@ void od_scan_snapshot_free(OdScanSnapshot *snapshot) {
     if (snapshot == NULL) {
         return;
     }
+    for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {
+        free(snapshot->endpoints[index].command);
+    }
     free(snapshot->endpoints);
     free(snapshot->docker_mappings);
     for (size_t index = 0U; index < snapshot->warning_count; ++index) {
@@ -486,7 +489,7 @@ static OdStatus scan_proc(OdScanSnapshot *snapshot, OdError *error) {
     return OD_OK;
 }
 
-OdStatus od_scan_host(OdScanSnapshot *snapshot, OdError *error) {
+OdStatus od_scan_sockets(OdScanSnapshot *snapshot, OdError *error) {
     if (snapshot == NULL) {
         od_error_set(error, OD_ERROR_INVALID, "scan snapshot is required");
         return OD_ERROR_INVALID;
@@ -500,9 +503,12 @@ OdStatus od_scan_host(OdScanSnapshot *snapshot, OdError *error) {
         if (warning_status != OD_OK) return warning_status;
         status = scan_proc(snapshot, error);
     }
-    if (status == OD_OK) {
-        status = od_resolve_process_owners("/proc", snapshot, error);
-    }
+    return status;
+}
+
+OdStatus od_scan_host(OdScanSnapshot *snapshot, OdError *error) {
+    OdStatus status = od_scan_sockets(snapshot, error);
+    if (status == OD_OK) status = od_resolve_process_owners("/proc", snapshot, error);
     return status;
 }
 
@@ -519,6 +525,41 @@ static void sanitize_field(char *text) {
         unsigned char character = (unsigned char)text[index];
         if (character < 0x20U || character == 0x7fU) text[index] = ' ';
     }
+}
+
+static char *read_command_line(int descriptor) {
+    size_t capacity = 1024U;
+    size_t length = 0U;
+    char *command = malloc(capacity);
+    if (command == NULL) return NULL;
+    while (length + 1U < OD_PROC_FILE_LIMIT) {
+        if (length + 1U == capacity) {
+            size_t next = capacity * 2U;
+            if (next > OD_PROC_FILE_LIMIT) next = OD_PROC_FILE_LIMIT;
+            char *grown = realloc(command, next);
+            if (grown == NULL) {
+                free(command);
+                return NULL;
+            }
+            command = grown;
+            capacity = next;
+        }
+        ssize_t count = read(descriptor, command + length, capacity - length - 1U);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            free(command);
+            return NULL;
+        }
+        if (count == 0) break;
+        length += (size_t)count;
+    }
+    for (size_t index = 0U; index < length; ++index) {
+        unsigned char character = (unsigned char)command[index];
+        if (character < 0x20U || character == 0x7fU) command[index] = ' ';
+    }
+    while (length > 0U && command[length - 1U] == ' ') --length;
+    command[length] = '\0';
+    return command;
 }
 
 static void read_process_metadata(const char *proc_root, pid_t pid, OdEndpoint *endpoint) {
@@ -541,19 +582,10 @@ static void read_process_metadata(const char *proc_root, pid_t pid, OdEndpoint *
     (void)snprintf(path, sizeof(path), "%s/%ld/cmdline", proc_root, (long)pid);
     int command_fd = open(path, O_RDONLY | O_CLOEXEC);
     if (command_fd >= 0) {
-        ssize_t command_length = read(command_fd, endpoint->command, sizeof(endpoint->command) - 1U);
+        char *command = read_command_line(command_fd);
         (void)close(command_fd);
-        if (command_length > 0) {
-            size_t length = (size_t)command_length;
-            for (size_t index = 0U; index < length; ++index) {
-                unsigned char character = (unsigned char)endpoint->command[index];
-                if (character < 0x20U || character == 0x7fU) {
-                    endpoint->command[index] = ' ';
-                }
-            }
-            while (length > 0U && endpoint->command[length - 1U] == ' ') --length;
-            endpoint->command[length] = '\0';
-        }
+        free(endpoint->command);
+        endpoint->command = command;
     }
     struct passwd pwd;
     struct passwd *result = NULL;

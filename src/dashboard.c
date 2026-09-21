@@ -45,6 +45,7 @@ const char *od_service_status_name(OdServiceStatus status) {
 }
 
 static bool contains_case_insensitive(const char *text, const char *query) {
+    if (text == NULL) return false;
     if (query[0] == '\0') return true;
     size_t query_length = strlen(query);
     for (size_t start = 0U; text[start] != '\0'; ++start) {
@@ -363,6 +364,8 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
     dashboard->page_size = 8U;
     dashboard->sort = OD_SERVICE_SORT_NAME;
     dashboard->sort_ascending = true;
+    dashboard->profile_saved = true;
+    dashboard->refresh_seconds = 5U;
     dashboard->focused = OD_WIDGET_SERVICES;
     dashboard->conflict_sort_ascending = true;
     dashboard->listener_sort_ascending = true;
@@ -413,7 +416,7 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
         row->status = OD_SERVICE_AVAILABLE;
         if (allocation != NULL && allocation->reason == OD_ALLOC_REASSIGNED) {
             row->status = allocation->old_port == 0U ?
-                          OD_SERVICE_REASSIGNED : OD_SERVICE_IN_USE;
+                          OD_SERVICE_REASSIGNED : OD_SERVICE_STALE;
             ++dashboard->summary.reassigned;
         } else if (allocation != NULL && allocation->reason == OD_ALLOC_PRESERVED) {
             row->status = OD_SERVICE_SAVED;

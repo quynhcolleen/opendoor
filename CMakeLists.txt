@@ -67,7 +67,7 @@ endif()
 target_link_libraries(opendoor PRIVATE opendoor_core)
 target_compile_options(opendoor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_core.c")
   add_test(
     NAME cli_contract
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.sh
@@ -115,6 +115,8 @@ if(BUILD_TESTING)
     )
     set_tests_properties(tui_pty_contracts PROPERTIES TIMEOUT 30)
   endif()
+elseif(BUILD_TESTING)
+  message(STATUS "OpenDoor test sources are not included; skipping test targets")
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)

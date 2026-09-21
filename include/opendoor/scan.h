@@ -11,7 +11,6 @@
 
 #define OD_ADDRESS_CAP 64U
 #define OD_PROCESS_CAP 64U
-#define OD_COMMAND_CAP 256U
 #define OD_PATH_CAP 4096U
 #define OD_USER_CAP 64U
 
@@ -29,7 +28,7 @@ typedef struct {
     pid_t pid;
     char process[OD_PROCESS_CAP];
     char executable[OD_PATH_CAP];
-    char command[OD_COMMAND_CAP];
+    char *command;
     char user[OD_USER_CAP];
     bool permission_limited;
 } OdEndpoint;
@@ -69,6 +68,7 @@ OdStatus od_parse_proc_net(const char *text,
                            OdError *error);
 bool od_parse_socket_inode(const char *target, uint64_t *inode);
 OdStatus od_scan_host(OdScanSnapshot *snapshot, OdError *error);
+OdStatus od_scan_sockets(OdScanSnapshot *snapshot, OdError *error);
 OdStatus od_resolve_process_owners(const char *proc_root,
                                    OdScanSnapshot *snapshot,
                                    OdError *error);

@@ -252,10 +252,17 @@ void od_render_dashboard(OdCanvas *canvas,
         return;
     }
 
-    char header[256];
-    (void)snprintf(header, sizeof(header), "OPEN DOOR  /  %s  /  scan #%llu%s",
+    char header[384];
+    char refresh[64];
+    (void)snprintf(refresh, sizeof(refresh),
+                   dashboard->auto_refresh ? "auto %us" : "manual",
+                   dashboard->refresh_seconds);
+    (void)snprintf(header, sizeof(header),
+                   "OPEN DOOR / %s / profile: %s / scan #%llu / refresh: %s%s",
                    dashboard->project_name,
+                   dashboard->profile_saved ? "saved" : "listener-only",
                    (unsigned long long)dashboard->snapshot->generation,
+                   refresh,
                    dashboard->snapshot->process_permissions_limited ?
                        "  [process details limited]" : "");
     od_canvas_write(canvas, 1, 0, header, canvas->width - 2U, OD_ROLE_PRIMARY, 1U);
@@ -340,8 +347,8 @@ void od_render_dashboard(OdCanvas *canvas,
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_SERVICES);                         \
         DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_SERVICES);                  \
         const char *columns__ = inner_width__ >= 72 ?                              \
-            "SERVICE             GROUP      VARIABLE             PREF  PORT STATUS" : \
-            "SERVICE          VARIABLE      PREF  PORT STATUS";                   \
+            "SERVICE        GROUP   VARIABLE      PREF  PORT STATUS   CONFLICT" : \
+            "SERVICE       VARIABLE      PREF  PORT STATUS   CFL";                \
         od_canvas_write(canvas, (X) + 2, (Y) + 2, columns__,                       \
                         (size_t)(inner_width__ > 0 ? inner_width__ : 0),            \
                         OD_ROLE_MUTED, 1U);                                        \
@@ -356,21 +363,24 @@ void od_render_dashboard(OdCanvas *canvas,
             char line__[384];                                                      \
             if (inner_width__ >= 72) {                                             \
                 (void)snprintf(line__, sizeof(line__),                             \
-                    "%-19.19s %-10.10s %-19.19s %5u %5u %-10.10s",                \
+                    "%-14.14s %-7.7s %-12.12s %5u %5u %-8.8s %-8s",               \
                     row__->service, row__->group, row__->variable,                 \
                     (unsigned)row__->preferred_port, (unsigned)row__->selected_port,\
-                    od_service_status_name(row__->status));                        \
+                    od_service_status_name(row__->status),                         \
+                    row__->conflict ? "YES" : "NO");                             \
             } else {                                                               \
                 (void)snprintf(line__, sizeof(line__),                             \
-                    "%-16.16s %-13.13s %5u %5u %-10.10s",                         \
+                    "%-13.13s %-11.11s %5u %5u %-8.8s %-3s",                      \
                     row__->service, row__->variable,                               \
                     (unsigned)row__->preferred_port, (unsigned)row__->selected_port,\
-                    od_service_status_name(row__->status));                        \
+                    od_service_status_name(row__->status),                         \
+                    row__->conflict ? "YES" : "NO");                             \
             }                                                                      \
             bool selected__ = visible__ == dashboard->selected_visible;            \
             OdThemeRole role__ = selected__ ? OD_ROLE_SELECTED :                   \
                 (row__->conflict ? OD_ROLE_DANGER :                                \
-                 (row__->status == OD_SERVICE_REASSIGNED ? OD_ROLE_WARNING :       \
+                 ((row__->status == OD_SERVICE_REASSIGNED ||                       \
+                   row__->status == OD_SERVICE_STALE) ? OD_ROLE_WARNING :          \
                                                             OD_ROLE_DEFAULT));      \
             int row_y__ = (Y) + 3 + (int)(visible__ - dashboard->page_start);      \
             od_canvas_write(canvas, (X) + 2, row_y__, line__,                      \
@@ -454,9 +464,18 @@ void od_render_dashboard(OdCanvas *canvas,
     do {                                                                          \
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_LISTENERS);                        \
         DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_LISTENERS);                 \
-        size_t capacity__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                     \
+        size_t capacity__ = (H) > 5 ? (size_t)((H) - 5) : 1U;                     \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_LISTENERS,          \
                                           capacity__);                             \
+        int listener_inner__ = (W) - 4;                                            \
+        const char *listener_columns__ = listener_inner__ >= 72 ?                  \
+            " PORT PROTO BIND             PROCESS             PID USER       SOURCE" :\
+            " PORT PROTO BIND             PROCESS";                              \
+        od_canvas_write(canvas, (X) + 2, (Y) + 2, listener_columns__,              \
+                        (size_t)(listener_inner__ > 0 ? listener_inner__ : 0),      \
+                        OD_ROLE_MUTED, 1U);                                        \
+        ADD_HIT((X) + 2, (Y) + 2, (W) - 4, 1, OD_HIT_SORT_COLUMN,                 \
+                OD_WIDGET_LISTENERS, 0U);                                         \
         size_t start__ = dashboard->listener_page_start;                          \
         if (start__ >= dashboard->listener_visible_count) start__ = 0U;             \
         for (size_t offset__ = 0U; offset__ < capacity__ &&                        \
@@ -465,13 +484,25 @@ void od_render_dashboard(OdCanvas *canvas,
                 &dashboard->snapshot->endpoints[                                   \
                     dashboard->listener_order[start__ + offset__]];                \
             char line__[384];                                                      \
-            (void)snprintf(line__, sizeof(line__), "%s %s:%u  %s%s%ld",          \
-                endpoint__->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP",          \
-                endpoint__->local_address, (unsigned)endpoint__->local_port,       \
-                endpoint__->process[0] == '\0' ? "unknown owner" : endpoint__->process,\
-                endpoint__->pid == 0 ? "" : " pid ",                             \
-                endpoint__->pid == 0 ? 0L : (long)endpoint__->pid);                \
-            int line_y__ = (Y) + 2 + (int)offset__;                               \
+            if (listener_inner__ >= 72) {                                          \
+                (void)snprintf(line__, sizeof(line__),                             \
+                    "%5u %-5s %-16.16s %-19.19s %6ld %-10.10s %-8s",             \
+                    (unsigned)endpoint__->local_port,                              \
+                    endpoint__->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP",      \
+                    endpoint__->local_address,                                    \
+                    endpoint__->process[0] == '\0' ? "unknown owner" :            \
+                                                       endpoint__->process,        \
+                    (long)endpoint__->pid, endpoint__->user,                       \
+                    endpoint__->permission_limited ? "limited" : "kernel");      \
+            } else {                                                               \
+                (void)snprintf(line__, sizeof(line__), "%5u %-4s %.18s  %.20s",  \
+                    (unsigned)endpoint__->local_port,                              \
+                    endpoint__->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP",      \
+                    endpoint__->local_address,                                    \
+                    endpoint__->process[0] == '\0' ? "unknown owner" :            \
+                                                       endpoint__->process);       \
+            }                                                                      \
+            int line_y__ = (Y) + 3 + (int)offset__;                               \
             bool selected__ = start__ + offset__ == dashboard->listener_selected;  \
             od_canvas_write(canvas, (X) + 2, line_y__, line__,                     \
                             (size_t)((W) > 4 ? (W) - 4 : 0),                       \
@@ -483,7 +514,7 @@ void od_render_dashboard(OdCanvas *canvas,
                     OD_WIDGET_LISTENERS, start__ + offset__);                      \
         }                                                                          \
         if (dashboard->listener_visible_count == 0U)                               \
-            od_canvas_write(canvas, (X) + 2, (Y) + 2,                              \
+            od_canvas_write(canvas, (X) + 2, (Y) + 3,                              \
                             dashboard->listener_search[0] == '\0' ?                \
                                 "No host listeners found" : "No listeners match",\
                             (size_t)((W) > 4 ? (W) - 4 : 0), OD_ROLE_MUTED, 0U);   \
@@ -500,8 +531,17 @@ void od_render_dashboard(OdCanvas *canvas,
     do {                                                                          \
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_DOCKER);                           \
         DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_DOCKER);                    \
-        size_t capacity__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                     \
+        size_t capacity__ = (H) > 5 ? (size_t)((H) - 5) : 1U;                     \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_DOCKER, capacity__);\
+        int docker_inner__ = (W) - 4;                                              \
+        const char *docker_columns__ = docker_inner__ >= 72 ?                      \
+            "CONTAINER        HOST PORT  CONTAINER PORT  PROTOCOL PROJECT" :      \
+            "CONTAINER          HOST -> CONTAINER/PROTO";                         \
+        od_canvas_write(canvas, (X) + 2, (Y) + 2, docker_columns__,                \
+                        (size_t)(docker_inner__ > 0 ? docker_inner__ : 0),          \
+                        OD_ROLE_MUTED, 1U);                                        \
+        ADD_HIT((X) + 2, (Y) + 2, (W) - 4, 1, OD_HIT_SORT_COLUMN,                 \
+                OD_WIDGET_DOCKER, 0U);                                            \
         size_t start__ = dashboard->docker_page_start;                            \
         if (start__ >= dashboard->docker_visible_count) start__ = 0U;              \
         for (size_t offset__ = 0U; offset__ < capacity__ &&                        \
@@ -511,13 +551,20 @@ void od_render_dashboard(OdCanvas *canvas,
                 &dashboard->snapshot->docker_mappings[                             \
                     dashboard->docker_order[start__ + offset__]];                  \
             char line__[320];                                                      \
-            (void)snprintf(line__, sizeof(line__), "%s  %s:%u -> %u/%s",         \
-                mapping__->container,                                              \
-                mapping__->bind_address[0] == '\0' ? "0.0.0.0" :                  \
-                                                     mapping__->bind_address,       \
-                (unsigned)mapping__->host_port, (unsigned)mapping__->container_port,\
-                mapping__->protocol == OD_PROTOCOL_UDP ? "udp" : "tcp");          \
-            int line_y__ = (Y) + 2 + (int)offset__;                               \
+            if (docker_inner__ >= 72) {                                            \
+                (void)snprintf(line__, sizeof(line__),                             \
+                    "%-16.16s %9u %15u %-8s %-16.16s",                            \
+                    mapping__->container, (unsigned)mapping__->host_port,           \
+                    (unsigned)mapping__->container_port,                           \
+                    mapping__->protocol == OD_PROTOCOL_UDP ? "udp" : "tcp",       \
+                    mapping__->project);                                           \
+            } else {                                                               \
+                (void)snprintf(line__, sizeof(line__), "%-18.18s %5u -> %5u/%s",  \
+                    mapping__->container, (unsigned)mapping__->host_port,           \
+                    (unsigned)mapping__->container_port,                           \
+                    mapping__->protocol == OD_PROTOCOL_UDP ? "udp" : "tcp");      \
+            }                                                                      \
+            int line_y__ = (Y) + 3 + (int)offset__;                               \
             bool selected__ = start__ + offset__ == dashboard->docker_selected;    \
             od_canvas_write(canvas, (X) + 2, line_y__, line__,                     \
                             (size_t)((W) > 4 ? (W) - 4 : 0),                       \
@@ -527,7 +574,7 @@ void od_render_dashboard(OdCanvas *canvas,
                     OD_WIDGET_DOCKER, start__ + offset__);                         \
         }                                                                          \
         if (dashboard->docker_visible_count == 0U)                                 \
-            od_canvas_write(canvas, (X) + 2, (Y) + 2,                              \
+            od_canvas_write(canvas, (X) + 2, (Y) + 3,                              \
                             dashboard->docker_search[0] != '\0' ?                  \
                                 "No Docker mappings match" :                      \
                                 (dashboard->snapshot->docker_available ?           \
@@ -1060,7 +1107,7 @@ void od_render_settings(OdCanvas *canvas, const OdSettingsView *view, bool ascii
                         canvas->width - 4U, OD_ROLE_MUTED, 0U);
     }
     od_canvas_write(canvas, 1, (int)canvas->height - 1,
-                    "Up/Down Select  Left/Right Change  Space Toggle  s Save  Esc Cancel",
+                    "[Save Enter] [Cancel Esc]  Up/Down  Left/Right  Space Toggle",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
 }
 

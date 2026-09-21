@@ -37,6 +37,7 @@ OdStatus od_onboarding_edit_selected(OdOnboarding *onboarding,
                                      const char *group,
                                      const char *variable,
                                      uint16_t port,
+                                     unsigned protocols,
                                      OdError *error);
 OdStatus od_onboarding_add_manual(OdOnboarding *onboarding,
                                   const char *name,
@@ -52,4 +53,3 @@ OdStatus od_onboarding_build_profile(const OdOnboarding *onboarding,
                                      OdError *error);
 
 #endif
-

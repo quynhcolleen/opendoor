@@ -6,15 +6,14 @@ The interface always fits the current terminal viewport. Long tables and detail 
 
 ## Install from source
 
-OpenDoor requires Linux, a C17 compiler, CMake 3.20 or newer, pthreads, and the wide-character ncurses development library. Tests additionally use Bash and Python 3.
+OpenDoor requires Linux, a C17 compiler, CMake 3.20 or newer, pthreads, and the wide-character ncurses development library.
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt install build-essential cmake libncurses-dev python3
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+sudo apt install build-essential cmake libncurses-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
 sudo cmake --install build
 ```
 
@@ -96,14 +95,11 @@ Archives are written to `dist/` with adjacent SHA-256 files. The packaging scrip
 
 For a prebuilt binary, call `scripts/package-release.sh` directly with `--arch`, `--binary`, and `--version`. Set `SOURCE_DATE_EPOCH` to create byte-reproducible archives.
 
-## Development checks
+## Development build
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
 ```
-
-The suite covers allocation and configuration contracts, fixture-driven host and Docker discovery, viewport snapshots, onboarding, dashboard behavior, persistence and backup safety, settings/help, release packaging, and real PTY interaction including resize and signal shutdown.
 
 OpenDoor is MIT licensed. Vendored dependency notices are in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).

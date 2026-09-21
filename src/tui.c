@@ -33,10 +33,18 @@
 #include <unistd.h>
 
 typedef struct {
+    pthread_mutex_t mutex;
+    int read_fd;
+    int write_fd;
+    bool initialized;
+    bool ready;
+} WorkerSignal;
+
+typedef struct {
     pthread_t thread;
     atomic_int stage;
-    atomic_bool done;
     atomic_size_t warning_count;
+    WorkerSignal signal;
     const char *project_root;
     OdCandidateList candidates;
     OdError discovery_error;
@@ -56,6 +64,55 @@ typedef struct {
 
 static volatile sig_atomic_t termination_signal = 0;
 static int signal_pipe_write = -1;
+
+static bool worker_signal_init(WorkerSignal *signal) {
+    *signal = (WorkerSignal){.read_fd = -1, .write_fd = -1};
+    int descriptors[2];
+    if (pipe(descriptors) != 0) return false;
+    signal->read_fd = descriptors[0];
+    signal->write_fd = descriptors[1];
+    (void)fcntl(signal->read_fd, F_SETFL, O_NONBLOCK);
+    (void)fcntl(signal->write_fd, F_SETFL, O_NONBLOCK);
+    (void)fcntl(signal->read_fd, F_SETFD, FD_CLOEXEC);
+    (void)fcntl(signal->write_fd, F_SETFD, FD_CLOEXEC);
+    if (pthread_mutex_init(&signal->mutex, NULL) != 0) {
+        (void)close(signal->read_fd);
+        (void)close(signal->write_fd);
+        *signal = (WorkerSignal){.read_fd = -1, .write_fd = -1};
+        return false;
+    }
+    signal->initialized = true;
+    return true;
+}
+
+static void worker_signal_publish(WorkerSignal *signal) {
+    if (!signal->initialized) return;
+    (void)pthread_mutex_lock(&signal->mutex);
+    signal->ready = true;
+    (void)pthread_mutex_unlock(&signal->mutex);
+    unsigned char marker = 1U;
+    ssize_t written = write(signal->write_fd, &marker, sizeof(marker));
+    (void)written;
+}
+
+static bool worker_signal_ready(WorkerSignal *signal) {
+    if (!signal->initialized) return false;
+    unsigned char markers[32];
+    while (read(signal->read_fd, markers, sizeof(markers)) > 0) {
+    }
+    (void)pthread_mutex_lock(&signal->mutex);
+    bool ready = signal->ready;
+    (void)pthread_mutex_unlock(&signal->mutex);
+    return ready;
+}
+
+static void worker_signal_destroy(WorkerSignal *signal) {
+    if (!signal->initialized) return;
+    (void)close(signal->read_fd);
+    (void)close(signal->write_fd);
+    (void)pthread_mutex_destroy(&signal->mutex);
+    *signal = (WorkerSignal){.read_fd = -1, .write_fd = -1};
+}
 
 static void termination_handler(int signal_number) {
     int saved_errno = errno;
@@ -129,9 +186,14 @@ static void *startup_scan_main(void *argument) {
                                                  &scan->candidates,
                                                  &scan->discovery_error);
     atomic_store(&scan->stage, OD_LOAD_KERNEL_SOCKETS);
-    scan->status = od_scan_host(&scan->snapshot, &scan->error);
+    scan->status = od_scan_sockets(&scan->snapshot, &scan->error);
     atomic_store(&scan->warning_count, scan->snapshot.warning_count);
     atomic_store(&scan->stage, OD_LOAD_PROCESS_OWNERS);
+    if (scan->status == OD_OK) {
+        scan->status = od_resolve_process_owners("/proc", &scan->snapshot,
+                                                &scan->error);
+        atomic_store(&scan->warning_count, scan->snapshot.warning_count);
+    }
     if (scan->status == OD_OK) {
         atomic_store(&scan->stage, OD_LOAD_DOCKER);
         scan->status = od_docker_scan("docker", 2500U, 4U * 1024U * 1024U,
@@ -139,7 +201,7 @@ static void *startup_scan_main(void *argument) {
         atomic_store(&scan->warning_count, scan->snapshot.warning_count);
     }
     atomic_store(&scan->stage, OD_LOAD_RECONCILIATION);
-    atomic_store(&scan->done, true);
+    worker_signal_publish(&scan->signal);
     return NULL;
 }
 
@@ -286,6 +348,9 @@ static bool prompt_text(WINDOW *window,
     }
 }
 
+static bool parse_port_text(const char *text, uint16_t *port);
+static bool parse_protocols(const char *text, unsigned *protocols);
+
 static bool prompt_candidate(WINDOW *window,
                              OdCanvas *canvas,
                              bool use_color,
@@ -298,18 +363,25 @@ static bool prompt_candidate(WINDOW *window,
     char group[128] = "default";
     char variable[128] = {0};
     char port_text[16] = {0};
+    char protocol_text[16] = "tcp";
     if (editing && onboarding->selected < onboarding->candidates.count) {
         const OdCandidate *candidate = &onboarding->candidates.items[onboarding->selected];
         (void)snprintf(name, sizeof(name), "%s", candidate->name);
         (void)snprintf(group, sizeof(group), "%s", candidate->group);
         (void)snprintf(variable, sizeof(variable), "%s", candidate->variable);
         (void)snprintf(port_text, sizeof(port_text), "%u", (unsigned)candidate->port);
+        (void)snprintf(protocol_text, sizeof(protocol_text), "%s",
+            candidate->protocols == (OD_PROTOCOL_TCP | OD_PROTOCOL_UDP) ? "tcp,udp" :
+            (candidate->protocols == OD_PROTOCOL_UDP ? "udp" : "tcp"));
     }
     const char *title = editing ? "Edit discovered service" : "Add managed service";
     if (!prompt_text(window, canvas, use_color, ascii, title, "Display name", name, sizeof(name)) ||
         !prompt_text(window, canvas, use_color, ascii, title, "Group", group, sizeof(group)) ||
         !prompt_text(window, canvas, use_color, ascii, title, "Environment variable", variable, sizeof(variable)) ||
-        !prompt_text(window, canvas, use_color, ascii, title, "Preferred port", port_text, sizeof(port_text))) {
+        !prompt_text(window, canvas, use_color, ascii, title, "Preferred port", port_text, sizeof(port_text)) ||
+        !prompt_text(window, canvas, use_color, ascii, title,
+                     "Protocols: tcp, udp, or tcp,udp", protocol_text,
+                     sizeof(protocol_text))) {
         (void)snprintf(status, status_capacity, "Edit cancelled; no candidate was changed.");
         return false;
     }
@@ -322,11 +394,17 @@ static bool prompt_candidate(WINDOW *window,
         return false;
     }
     OdError error;
+    unsigned protocols = 0U;
+    if (!parse_protocols(protocol_text, &protocols)) {
+        (void)snprintf(status, status_capacity,
+                       "Use tcp, udp, or tcp,udp for protocols.");
+        return false;
+    }
     OdStatus result = editing ?
         od_onboarding_edit_selected(onboarding, name, group, variable,
-                                    (uint16_t)numeric, &error) :
+                                    (uint16_t)numeric, protocols, &error) :
         od_onboarding_add_manual(onboarding, name, group, variable,
-                                 (uint16_t)numeric, OD_PROTOCOL_TCP, &error);
+                                 (uint16_t)numeric, protocols, &error);
     if (result != OD_OK) {
         (void)snprintf(status, status_capacity, "%s", error.message);
         return false;
@@ -336,8 +414,6 @@ static bool prompt_candidate(WINDOW *window,
                              "Manual candidate added; review it before continuing.");
     return true;
 }
-
-static bool parse_port_text(const char *text, uint16_t *port);
 
 static char *duplicate_text(const char *value) {
     size_t length = strlen(value) + 1U;
@@ -646,13 +722,17 @@ static bool run_settings(WINDOW *window,
                     input = KEY_UP;
                 } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
                     input = KEY_DOWN;
-                } else if ((event.bstate & BUTTON1_CLICKED) != 0U &&
-                           event.y >= 6 && event.y < 12) {
-                    selected = (size_t)(event.y - 6);
-                    change_setting(&draft, selected, 1);
-                    (void)snprintf(status, sizeof(status),
-                                   "Changed locally; press s to save.");
-                    input = ERR;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U) {
+                    if (event.y == height - 1) {
+                        if (event.x >= 1 && event.x < 13) input = '\n';
+                        else if (event.x >= 14 && event.x < 26) input = 27;
+                    } else if (event.y >= 6 && event.y < 12) {
+                        selected = (size_t)(event.y - 6);
+                        change_setting(&draft, selected, 1);
+                        (void)snprintf(status, sizeof(status),
+                                       "Changed locally; press s to save.");
+                        input = ERR;
+                    }
                 }
             }
         }
@@ -919,9 +999,12 @@ static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) 
             case OD_WIDGET_COUNT:
                 break;
         }
-    } else if (hit->action == OD_HIT_SORT_COLUMN &&
-               hit->widget == OD_WIDGET_SERVICES) {
-        od_dashboard_sort(dashboard, dashboard->sort);
+    } else if (hit->action == OD_HIT_SORT_COLUMN) {
+        if (hit->widget == OD_WIDGET_SERVICES) {
+            od_dashboard_sort(dashboard, dashboard->sort);
+        } else {
+            od_dashboard_sort_focused(dashboard);
+        }
     }
 }
 
@@ -964,6 +1047,9 @@ static bool apply_dashboard_snapshot(const char *project_root,
     bool ascending = dashboard->sort_ascending;
     OdDashboardWidget focused = dashboard->focused;
     bool expanded = dashboard->expanded;
+    bool profile_saved = dashboard->profile_saved;
+    bool auto_refresh = dashboard->auto_refresh;
+    unsigned refresh_seconds = dashboard->refresh_seconds;
     new_dashboard.selected_id = selected_id;
     if (od_dashboard_search(&new_dashboard, search, &error) != OD_OK) {
         od_dashboard_free(&new_dashboard);
@@ -977,6 +1063,9 @@ static bool apply_dashboard_snapshot(const char *project_root,
     od_dashboard_restore_secondary_selection(&new_dashboard, dashboard);
     new_dashboard.focused = focused;
     new_dashboard.expanded = expanded;
+    new_dashboard.profile_saved = profile_saved;
+    new_dashboard.auto_refresh = auto_refresh;
+    new_dashboard.refresh_seconds = refresh_seconds;
 
     od_dashboard_free(dashboard);
     od_allocation_plan_free(plan);
@@ -995,9 +1084,9 @@ static bool apply_dashboard_snapshot(const char *project_root,
 
 typedef struct {
     pthread_t thread;
-    atomic_bool done;
     atomic_bool cancel;
     atomic_int stage;
+    WorkerSignal signal;
     bool active;
     OdScanSnapshot snapshot;
     OdError error;
@@ -1009,7 +1098,7 @@ static void *dashboard_refresh_main(void *argument) {
     refresh->status = scan_now(refresh->snapshot.generation,
                                &refresh->snapshot, &refresh->cancel,
                                &refresh->stage, &refresh->error);
-    atomic_store(&refresh->done, true);
+    worker_signal_publish(&refresh->signal);
     return NULL;
 }
 
@@ -1019,16 +1108,28 @@ static bool dashboard_refresh_start(DashboardRefresh *refresh,
     if (refresh->active) return false;
     *refresh = (DashboardRefresh){0};
     od_scan_snapshot_init(&refresh->snapshot, generation);
-    atomic_init(&refresh->done, false);
     atomic_init(&refresh->cancel, false);
     atomic_init(&refresh->stage, OD_LOAD_KERNEL_SOCKETS);
+    if (!worker_signal_init(&refresh->signal)) {
+        od_scan_snapshot_free(&refresh->snapshot);
+        od_error_set(error, OD_ERROR_IO, "unable to create scan wake pipe");
+        return false;
+    }
     if (pthread_create(&refresh->thread, NULL, dashboard_refresh_main, refresh) != 0) {
+        worker_signal_destroy(&refresh->signal);
         od_scan_snapshot_free(&refresh->snapshot);
         od_error_set(error, OD_ERROR_IO, "unable to start background refresh");
         return false;
     }
     refresh->active = true;
     return true;
+}
+
+static void dashboard_refresh_join(DashboardRefresh *refresh) {
+    if (!refresh->active) return;
+    (void)pthread_join(refresh->thread, NULL);
+    refresh->active = false;
+    worker_signal_destroy(&refresh->signal);
 }
 
 static OdStatus run_scan_interactive(WINDOW *window,
@@ -1043,7 +1144,7 @@ static OdStatus run_scan_interactive(WINDOW *window,
     uint64_t started = monotonic_milliseconds();
     unsigned frame = 0U;
     bool cancelling = false;
-    while (!atomic_load(&refresh.done)) {
+    while (!worker_signal_ready(&refresh.signal)) {
         int width = getmaxx(window);
         int height = getmaxy(window);
         if (!canvas_resize(canvas, width, height, error)) {
@@ -1072,8 +1173,7 @@ static OdStatus run_scan_interactive(WINDOW *window,
             cancelling = true;
         }
     }
-    (void)pthread_join(refresh.thread, NULL);
-    refresh.active = false;
+    dashboard_refresh_join(&refresh);
     if (refresh.status == OD_OK) {
         *snapshot = refresh.snapshot;
         refresh.snapshot = (OdScanSnapshot){0};
@@ -1130,6 +1230,7 @@ static void run_dashboard(WINDOW *window,
                           bool ascii,
                           const char *project_root,
                           const OdProfile *profile,
+                          bool profile_saved,
                           const OdSettings *settings,
                           OdScanSnapshot *snapshot) {
     OdDashboard dashboard;
@@ -1145,6 +1246,9 @@ static void run_dashboard(WINDOW *window,
         return;
     }
     if (profile->service_count == 0U) dashboard.focused = OD_WIDGET_LISTENERS;
+    dashboard.profile_saved = profile_saved;
+    dashboard.auto_refresh = settings->auto_refresh;
+    dashboard.refresh_seconds = settings->refresh_seconds;
     OdHitMap hit_map;
     od_hitmap_init(&hit_map);
     char status[256];
@@ -1155,9 +1259,8 @@ static void run_dashboard(WINDOW *window,
     bool pending_refresh = false;
     bool done = false;
     while (!done) {
-        if (refresh.active && atomic_load(&refresh.done)) {
-            (void)pthread_join(refresh.thread, NULL);
-            refresh.active = false;
+        if (refresh.active && worker_signal_ready(&refresh.signal)) {
+            dashboard_refresh_join(&refresh);
             if (refresh.status == OD_OK) {
                 if (!apply_dashboard_snapshot(project_root, profile, snapshot,
                                               &refresh.snapshot, &saved, &plan,
@@ -1290,7 +1393,7 @@ static void run_dashboard(WINDOW *window,
     }
     if (refresh.active) {
         atomic_store(&refresh.cancel, true);
-        (void)pthread_join(refresh.thread, NULL);
+        dashboard_refresh_join(&refresh);
         od_scan_snapshot_free(&refresh.snapshot);
     }
     od_hitmap_free(&hit_map);
@@ -1322,7 +1425,7 @@ static void run_listener_explorer(WINDOW *window,
     profile.port_min = 1024U;
     profile.port_max = 65535U;
     run_dashboard(window, canvas, use_color, ascii, project_root,
-                  &profile, settings, snapshot);
+                  &profile, false, settings, snapshot);
     od_profile_free(&profile);
 }
 
@@ -1338,7 +1441,15 @@ static OdStatus scan_now(uint64_t generation,
         return OD_ERROR_CANCELLED;
     }
     if (stage != NULL) atomic_store(stage, OD_LOAD_KERNEL_SOCKETS);
-    OdStatus status = od_scan_host(snapshot, error);
+    OdStatus status = od_scan_sockets(snapshot, error);
+    if (status == OD_OK && cancel != NULL && atomic_load(cancel)) {
+        status = OD_ERROR_CANCELLED;
+        od_error_set(error, status, "scan generation cancelled");
+    }
+    if (status == OD_OK) {
+        if (stage != NULL) atomic_store(stage, OD_LOAD_PROCESS_OWNERS);
+        status = od_resolve_process_owners("/proc", snapshot, error);
+    }
     if (status == OD_OK && cancel != NULL && atomic_load(cancel)) {
         status = OD_ERROR_CANCELLED;
         od_error_set(error, status, "scan generation cancelled");
@@ -1822,9 +1933,15 @@ int od_tui_run(const OpendoorOptions *options) {
     od_candidate_list_init(&scan.candidates);
     od_scan_snapshot_init(&scan.snapshot, 1U);
     atomic_init(&scan.stage, OD_LOAD_PROJECT_FILES);
-    atomic_init(&scan.done, false);
     atomic_init(&scan.warning_count, 0U);
+    if (!worker_signal_init(&scan.signal)) {
+        od_scan_snapshot_free(&scan.snapshot);
+        od_candidate_list_free(&scan.candidates);
+        signal_state_restore(&signal_state);
+        return 5;
+    }
     if (pthread_create(&scan.thread, NULL, startup_scan_main, &scan) != 0) {
+        worker_signal_destroy(&scan.signal);
         od_scan_snapshot_free(&scan.snapshot);
         od_candidate_list_free(&scan.candidates);
         signal_state_restore(&signal_state);
@@ -1834,6 +1951,7 @@ int od_tui_run(const OpendoorOptions *options) {
     WINDOW *window = initscr();
     if (window == NULL) {
         (void)pthread_join(scan.thread, NULL);
+        worker_signal_destroy(&scan.signal);
         od_scan_snapshot_free(&scan.snapshot);
         od_candidate_list_free(&scan.candidates);
         signal_state_restore(&signal_state);
@@ -1857,6 +1975,7 @@ int od_tui_run(const OpendoorOptions *options) {
         if (!canvas_resize(&canvas, width, height, &canvas_error)) {
             (void)endwin();
             (void)pthread_join(scan.thread, NULL);
+            worker_signal_destroy(&scan.signal);
             od_scan_snapshot_free(&scan.snapshot);
             od_candidate_list_free(&scan.candidates);
             signal_state_restore(&signal_state);
@@ -1881,7 +2000,7 @@ int od_tui_run(const OpendoorOptions *options) {
             break;
         }
         if (input == 27) animation_skipped = true;
-        if (atomic_load(&scan.done) && elapsed >= 350U) break;
+        if (worker_signal_ready(&scan.signal) && elapsed >= 350U) break;
     }
 
     bool configured = profile_exists(options);
@@ -1924,7 +2043,7 @@ int od_tui_run(const OpendoorOptions *options) {
         if (width < 60 || height < 18) {
             od_render_resize_required(&canvas);
         } else {
-            if (!atomic_load(&scan.done)) {
+            if (!worker_signal_ready(&scan.signal)) {
                 (void)snprintf(status, sizeof(status),
                                "Scan continues in the background • %zu warning(s)",
                                atomic_load(&scan.warning_count));
@@ -1977,7 +2096,7 @@ int od_tui_run(const OpendoorOptions *options) {
             if (selected == count - 1U) {
                 quit = true;
             } else if (!configured && selected == 0U) {
-                if (!atomic_load(&scan.done)) {
+                if (!worker_signal_ready(&scan.signal)) {
                     (void)snprintf(status, sizeof(status),
                                    "Project discovery is still running; try again in a moment.");
                 } else if (scan.discovery_status != OD_OK) {
@@ -1991,7 +2110,6 @@ int od_tui_run(const OpendoorOptions *options) {
                     if (run_onboarding(window, &canvas, use_color, ascii,
                                        project_root, &scan.candidates,
                                        &session_profile)) {
-                    configured = true;
                     session_profile_ready = true;
                     selected = 0U;
                     if (!scan_joined) {
@@ -2004,11 +2122,15 @@ int od_tui_run(const OpendoorOptions *options) {
                                        project_root, active_profile_path, &session_profile,
                                        &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
+                        configured = true;
                         (void)snprintf(status, sizeof(status),
                             od_assignment_appears_ignored(project_root,
                                                           session_profile.assignment_file) ?
                                 "Profile and assignments saved atomically." :
                                 "Saved atomically; warning: assignment file appears unignored.");
+                        run_dashboard(window, &canvas, use_color, ascii,
+                                      project_root, &session_profile, true,
+                                      &settings, &scan.snapshot);
                     } else if (workflow_status == OD_ERROR_CANCELLED) {
                         (void)snprintf(status, sizeof(status),
                                        "Save cancelled; no assignment changes were written.");
@@ -2023,7 +2145,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     }
                 }
             } else if (!configured && selected == 1U) {
-                if (!atomic_load(&scan.done)) {
+                if (!worker_signal_ready(&scan.signal)) {
                     (void)snprintf(status, sizeof(status),
                                    "The startup scan is still running; try again in a moment.");
                 } else {
@@ -2039,7 +2161,7 @@ int od_tui_run(const OpendoorOptions *options) {
                 if (!session_profile_ready) {
                     (void)snprintf(status, sizeof(status),
                                    "No valid project profile is available.");
-                } else if (!atomic_load(&scan.done)) {
+                } else if (!worker_signal_ready(&scan.signal)) {
                     (void)snprintf(status, sizeof(status),
                                    "The startup scan is still running; try again in a moment.");
                 } else {
@@ -2048,7 +2170,7 @@ int od_tui_run(const OpendoorOptions *options) {
                         scan_joined = true;
                     }
                     run_dashboard(window, &canvas, use_color, ascii,
-                                  project_root, &session_profile, &settings,
+                                  project_root, &session_profile, true, &settings,
                                   &scan.snapshot);
                     menu_status(status, sizeof(status), configured, selected);
                 }
@@ -2056,7 +2178,7 @@ int od_tui_run(const OpendoorOptions *options) {
                 if (!session_profile_ready || active_profile_path == NULL) {
                     (void)snprintf(status, sizeof(status),
                                    "No valid project profile is available.");
-                } else if (!atomic_load(&scan.done)) {
+                } else if (!worker_signal_ready(&scan.signal)) {
                     (void)snprintf(status, sizeof(status),
                                    "The startup scan is still running; try again in a moment.");
                 } else {
@@ -2083,7 +2205,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     }
                 }
             } else if (configured && selected == 2U) {
-                if (!atomic_load(&scan.done)) {
+                if (!worker_signal_ready(&scan.signal)) {
                     (void)snprintf(status, sizeof(status),
                                    "The startup scan is still running; try again in a moment.");
                 } else {
@@ -2111,7 +2233,7 @@ int od_tui_run(const OpendoorOptions *options) {
                 if (!session_profile_ready || active_profile_path == NULL) {
                     (void)snprintf(status, sizeof(status),
                                    "No valid project profile is available.");
-                } else if (!atomic_load(&scan.done)) {
+                } else if (!worker_signal_ready(&scan.signal)) {
                     (void)snprintf(status, sizeof(status),
                                    "The startup scan is still running; try again in a moment.");
                 } else {
@@ -2160,6 +2282,7 @@ int od_tui_run(const OpendoorOptions *options) {
     od_canvas_free(&canvas);
     (void)endwin();
     if (!scan_joined) (void)pthread_join(scan.thread, NULL);
+    worker_signal_destroy(&scan.signal);
     od_scan_snapshot_free(&scan.snapshot);
     od_candidate_list_free(&scan.candidates);
     if (session_profile_ready) od_profile_free(&session_profile);

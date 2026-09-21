@@ -64,8 +64,8 @@ int getmouse(MEVENT *event);
 #define REPORT_MOUSE_POSITION ((mmask_t)0x10000000UL)
 #define BUTTON1_CLICKED ((mmask_t)0x00000004UL)
 #define BUTTON1_DOUBLE_CLICKED ((mmask_t)0x00000008UL)
-#define BUTTON4_PRESSED ((mmask_t)0x00200000UL)
-#define BUTTON5_PRESSED ((mmask_t)0x04000000UL)
+#define BUTTON4_PRESSED ((mmask_t)0x00010000UL)
+#define BUTTON5_PRESSED ((mmask_t)0x00200000UL)
 #define A_REVERSE 0x00040000
 #define A_BOLD 0x00200000
 #define COLOR_PAIR(number) ((number) << 8)

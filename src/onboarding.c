@@ -178,9 +178,15 @@ OdStatus od_onboarding_edit_selected(OdOnboarding *onboarding,
                                      const char *group,
                                      const char *variable,
                                      uint16_t port,
+                                     unsigned protocols,
                                      OdError *error) {
     if (onboarding == NULL || onboarding->selected >= onboarding->candidates.count) {
         od_error_set(error, OD_ERROR_INVALID, "no candidate is selected");
+        return OD_ERROR_INVALID;
+    }
+    if (protocols == 0U ||
+        (protocols & ~(unsigned)(OD_PROTOCOL_TCP | OD_PROTOCOL_UDP)) != 0U) {
+        od_error_set(error, OD_ERROR_INVALID, "service protocols are invalid");
         return OD_ERROR_INVALID;
     }
     OdStatus status = validate_fields(onboarding, name, group, variable, port,
@@ -204,6 +210,7 @@ OdStatus od_onboarding_edit_selected(OdOnboarding *onboarding,
     candidate->group = group_copy;
     candidate->variable = variable_copy;
     candidate->port = port;
+    candidate->protocols = protocols;
     update_stable_id(candidate);
     onboarding->reviewed[onboarding->selected] = true;
     od_error_clear(error);

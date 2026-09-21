@@ -68,6 +68,9 @@ typedef struct {
     char search[128];
     OdServiceSort sort;
     bool sort_ascending;
+    bool profile_saved;
+    bool auto_refresh;
+    unsigned refresh_seconds;
     OdDashboardWidget focused;
     bool expanded;
     size_t conflict_selected;

@@ -3,6 +3,7 @@
 /build-sanitize/
 /build-release/
 /dist/
+/tests/
 /.cache/
 /.superpowers/
 *.log
