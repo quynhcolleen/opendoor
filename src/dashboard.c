@@ -120,16 +120,63 @@ static int compare_secondary(const OdDashboard *dashboard,
     } else if (widget == OD_WIDGET_LISTENERS) {
         const OdEndpoint *left = &dashboard->snapshot->endpoints[left_index];
         const OdEndpoint *right = &dashboard->snapshot->endpoints[right_index];
-        comparison = left->local_port == right->local_port ?
-                     strcmp(left->stable_id, right->stable_id) :
-                     (left->local_port < right->local_port ? -1 : 1);
+        switch (dashboard->listener_sort) {
+            case OD_LISTENER_SORT_PORT:
+                comparison = left->local_port == right->local_port ? 0 :
+                    (left->local_port < right->local_port ? -1 : 1);
+                break;
+            case OD_LISTENER_SORT_PROTOCOL:
+                comparison = left->protocol == right->protocol ? 0 :
+                    (left->protocol < right->protocol ? -1 : 1);
+                break;
+            case OD_LISTENER_SORT_BIND:
+                comparison = strcmp(left->local_address, right->local_address);
+                break;
+            case OD_LISTENER_SORT_PROCESS:
+                comparison = strcmp(left->process, right->process);
+                break;
+            case OD_LISTENER_SORT_PID:
+                comparison = left->pid == right->pid ? 0 :
+                    (left->pid < right->pid ? -1 : 1);
+                break;
+            case OD_LISTENER_SORT_USER:
+                comparison = strcmp(left->user, right->user);
+                break;
+            case OD_LISTENER_SORT_SOURCE:
+                comparison = left->permission_limited == right->permission_limited ? 0 :
+                    (left->permission_limited ? 1 : -1);
+                break;
+            case OD_LISTENER_SORT_COUNT:
+                break;
+        }
+        if (comparison == 0) comparison = strcmp(left->stable_id, right->stable_id);
         ascending = dashboard->listener_sort_ascending;
     } else {
         const OdDockerMapping *left = &dashboard->snapshot->docker_mappings[left_index];
         const OdDockerMapping *right = &dashboard->snapshot->docker_mappings[right_index];
-        comparison = left->host_port == right->host_port ?
-                     strcmp(left->container, right->container) :
-                     (left->host_port < right->host_port ? -1 : 1);
+        switch (dashboard->docker_sort) {
+            case OD_DOCKER_SORT_CONTAINER:
+                comparison = strcmp(left->container, right->container);
+                break;
+            case OD_DOCKER_SORT_HOST_PORT:
+                comparison = left->host_port == right->host_port ? 0 :
+                    (left->host_port < right->host_port ? -1 : 1);
+                break;
+            case OD_DOCKER_SORT_CONTAINER_PORT:
+                comparison = left->container_port == right->container_port ? 0 :
+                    (left->container_port < right->container_port ? -1 : 1);
+                break;
+            case OD_DOCKER_SORT_PROTOCOL:
+                comparison = left->protocol == right->protocol ? 0 :
+                    (left->protocol < right->protocol ? -1 : 1);
+                break;
+            case OD_DOCKER_SORT_PROJECT:
+                comparison = strcmp(left->project, right->project);
+                break;
+            case OD_DOCKER_SORT_COUNT:
+                break;
+        }
+        if (comparison == 0) comparison = strcmp(left->container_id, right->container_id);
         ascending = dashboard->docker_sort_ascending;
     }
     return ascending ? comparison : -comparison;
@@ -242,6 +289,9 @@ static int compare_rows(const OdDashboard *dashboard, size_t left_index, size_t 
         case OD_SERVICE_SORT_GROUP:
             comparison = strcmp(left->group, right->group);
             break;
+        case OD_SERVICE_SORT_VARIABLE:
+            comparison = strcmp(left->variable, right->variable);
+            break;
         case OD_SERVICE_SORT_PREFERRED:
             comparison = left->preferred_port == right->preferred_port ? 0 :
                          (left->preferred_port < right->preferred_port ? -1 : 1);
@@ -252,6 +302,12 @@ static int compare_rows(const OdDashboard *dashboard, size_t left_index, size_t 
             break;
         case OD_SERVICE_SORT_STATUS:
             comparison = left->status == right->status ? 0 : (left->status < right->status ? -1 : 1);
+            break;
+        case OD_SERVICE_SORT_CONFLICT:
+            comparison = left->conflict == right->conflict ? 0 :
+                         (left->conflict ? 1 : -1);
+            break;
+        case OD_SERVICE_SORT_COUNT:
             break;
     }
     if (comparison == 0) comparison = strcmp(left->stable_id, right->stable_id);
@@ -368,7 +424,9 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
     dashboard->refresh_seconds = 5U;
     dashboard->focused = OD_WIDGET_SERVICES;
     dashboard->conflict_sort_ascending = true;
+    dashboard->listener_sort = OD_LISTENER_SORT_PORT;
     dashboard->listener_sort_ascending = true;
+    dashboard->docker_sort = OD_DOCKER_SORT_HOST_PORT;
     dashboard->docker_sort_ascending = true;
     if (profile->service_count > 0U) {
         dashboard->services = calloc(profile->service_count, sizeof(*dashboard->services));
@@ -482,7 +540,7 @@ OdStatus od_dashboard_search_focused(OdDashboard *dashboard,
 }
 
 void od_dashboard_sort(OdDashboard *dashboard, OdServiceSort sort) {
-    if (dashboard == NULL) return;
+    if (dashboard == NULL || sort >= OD_SERVICE_SORT_COUNT) return;
     if (dashboard->sort == sort) {
         dashboard->sort_ascending = !dashboard->sort_ascending;
     } else {
@@ -493,11 +551,69 @@ void od_dashboard_sort(OdDashboard *dashboard, OdServiceSort sort) {
     (void)rebuild_visible(dashboard, &error);
 }
 
+void od_dashboard_sort_column(OdDashboard *dashboard,
+                              OdDashboardWidget widget,
+                              size_t column) {
+    if (dashboard == NULL) return;
+    if (widget == OD_WIDGET_SERVICES) {
+        if (column < (size_t)OD_SERVICE_SORT_COUNT) {
+            od_dashboard_sort(dashboard, (OdServiceSort)column);
+        }
+        return;
+    }
+    if (widget == OD_WIDGET_LISTENERS && column < (size_t)OD_LISTENER_SORT_COUNT) {
+        OdListenerSort sort = (OdListenerSort)column;
+        if (dashboard->listener_sort == sort) {
+            dashboard->listener_sort_ascending = !dashboard->listener_sort_ascending;
+        } else {
+            dashboard->listener_sort = sort;
+            dashboard->listener_sort_ascending = true;
+        }
+    } else if (widget == OD_WIDGET_DOCKER && column < (size_t)OD_DOCKER_SORT_COUNT) {
+        OdDockerSort sort = (OdDockerSort)column;
+        if (dashboard->docker_sort == sort) {
+            dashboard->docker_sort_ascending = !dashboard->docker_sort_ascending;
+        } else {
+            dashboard->docker_sort = sort;
+            dashboard->docker_sort_ascending = true;
+        }
+    } else {
+        return;
+    }
+    rebuild_secondary(dashboard, widget);
+}
+
 void od_dashboard_sort_focused(OdDashboard *dashboard) {
     if (dashboard == NULL) return;
     if (dashboard->focused == OD_WIDGET_SERVICES) {
-        OdServiceSort next = (OdServiceSort)(((unsigned)dashboard->sort + 1U) % 5U);
-        od_dashboard_sort(dashboard, next);
+        OdServiceSort next = (OdServiceSort)(
+            ((unsigned)dashboard->sort + 1U) % (unsigned)OD_SERVICE_SORT_COUNT);
+        dashboard->sort = next;
+        dashboard->sort_ascending = true;
+        OdError error;
+        (void)rebuild_visible(dashboard, &error);
+    } else if (dashboard->focused == OD_WIDGET_CONFLICTS) {
+        dashboard->conflict_sort_ascending = !dashboard->conflict_sort_ascending;
+    } else if (dashboard->focused == OD_WIDGET_LISTENERS) {
+        dashboard->listener_sort = (OdListenerSort)(
+            ((unsigned)dashboard->listener_sort + 1U) % (unsigned)OD_LISTENER_SORT_COUNT);
+        dashboard->listener_sort_ascending = true;
+    } else if (dashboard->focused == OD_WIDGET_DOCKER) {
+        dashboard->docker_sort = (OdDockerSort)(
+            ((unsigned)dashboard->docker_sort + 1U) % (unsigned)OD_DOCKER_SORT_COUNT);
+        dashboard->docker_sort_ascending = true;
+    }
+    if (dashboard->focused != OD_WIDGET_SERVICES) {
+        rebuild_secondary(dashboard, dashboard->focused);
+    }
+}
+
+void od_dashboard_reverse_sort_focused(OdDashboard *dashboard) {
+    if (dashboard == NULL) return;
+    if (dashboard->focused == OD_WIDGET_SERVICES) {
+        dashboard->sort_ascending = !dashboard->sort_ascending;
+        OdError error;
+        (void)rebuild_visible(dashboard, &error);
         return;
     }
     if (dashboard->focused == OD_WIDGET_CONFLICTS) {
@@ -759,7 +875,9 @@ void od_dashboard_restore_secondary_selection(OdDashboard *destination,
     (void)snprintf(destination->docker_search, sizeof(destination->docker_search),
                    "%s", source->docker_search);
     destination->conflict_sort_ascending = source->conflict_sort_ascending;
+    destination->listener_sort = source->listener_sort;
     destination->listener_sort_ascending = source->listener_sort_ascending;
+    destination->docker_sort = source->docker_sort;
     destination->docker_sort_ascending = source->docker_sort_ascending;
     rebuild_secondary(destination, OD_WIDGET_CONFLICTS);
     rebuild_secondary(destination, OD_WIDGET_LISTENERS);

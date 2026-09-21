@@ -779,6 +779,44 @@ static void project_display_name(const char *project_root, char *name, size_t ca
     }
 }
 
+static void run_candidate_detail(WINDOW *window,
+                                 OdCanvas *canvas,
+                                 bool use_color,
+                                 bool ascii,
+                                 const OdCandidate *candidate) {
+    size_t page = 0U;
+    size_t page_count = 1U;
+    bool done = false;
+    while (!done) {
+        OdError error;
+        if (!canvas_resize(canvas, getmaxx(window), getmaxy(window), &error)) return;
+        page_count = od_render_candidate_detail(canvas, candidate, page, ascii);
+        if (page >= page_count) page = page_count - 1U;
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) input = KEY_PPAGE;
+                if ((event.bstate & BUTTON5_PRESSED) != 0U) input = KEY_NPAGE;
+            }
+        }
+        if (termination_requested() || input == 27 || input == 'q' ||
+            input == 'Q' || input == 'd' || input == 'D') {
+            done = true;
+        } else if ((input == KEY_PPAGE || input == KEY_UP || input == 'k') && page > 0U) {
+            --page;
+        } else if ((input == KEY_NPAGE || input == KEY_DOWN || input == 'j') &&
+                   page + 1U < page_count) {
+            ++page;
+        } else if (input == KEY_HOME) {
+            page = 0U;
+        } else if (input == KEY_END) {
+            page = page_count - 1U;
+        }
+    }
+}
+
 static bool run_onboarding(WINDOW *window,
                            OdCanvas *canvas,
                            bool use_color,
@@ -853,6 +891,12 @@ static bool run_onboarding(WINDOW *window,
         } else if (input == '\n' || input == '\r') {
             od_onboarding_review_selected(&onboarding);
             (void)snprintf(status, sizeof(status), "Candidate reviewed.");
+        } else if ((input == 'd' || input == 'D') &&
+                   onboarding.selected < onboarding.candidates.count) {
+            run_candidate_detail(window, canvas, use_color, ascii,
+                                 &onboarding.candidates.items[onboarding.selected]);
+            (void)snprintf(status, sizeof(status),
+                           "Candidate details closed; review state preserved.");
         } else if (input == 'a') {
             (void)prompt_candidate(window, canvas, use_color, ascii, &onboarding,
                                    false, status, sizeof(status));
@@ -870,12 +914,17 @@ static bool run_onboarding(WINDOW *window,
             } else {
                 char name[128];
                 project_display_name(project_root, name, sizeof(name));
+                OdProfile built;
+                od_profile_init(&built);
                 OdStatus profile_status = od_onboarding_build_profile(
-                    &onboarding, name, ".ports.env", profile, &error);
+                    &onboarding, name, ".ports.env", &built, &error);
                 if (profile_status == OD_OK) {
+                    od_profile_free(profile);
+                    *profile = built;
                     accepted = true;
                     finished = true;
                 } else {
+                    od_profile_free(&built);
                     (void)snprintf(status, sizeof(status), "%s", error.message);
                 }
             }
@@ -1000,11 +1049,7 @@ static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) 
                 break;
         }
     } else if (hit->action == OD_HIT_SORT_COLUMN) {
-        if (hit->widget == OD_WIDGET_SERVICES) {
-            od_dashboard_sort(dashboard, dashboard->sort);
-        } else {
-            od_dashboard_sort_focused(dashboard);
-        }
+        od_dashboard_sort_column(dashboard, hit->widget, hit->target);
     }
 }
 
@@ -1136,6 +1181,7 @@ static OdStatus run_scan_interactive(WINDOW *window,
                                      OdCanvas *canvas,
                                      bool use_color,
                                      bool ascii,
+                                     bool reduced_motion,
                                      uint64_t generation,
                                      OdScanSnapshot *snapshot,
                                      OdError *error) {
@@ -1159,7 +1205,7 @@ static OdStatus run_scan_interactive(WINDOW *window,
                               (OdLoadingStage)atomic_load(&refresh.stage),
                               frame++,
                               elapsed > UINT32_MAX ? UINT32_MAX : (unsigned)elapsed,
-                              false, ascii, 0U);
+                              reduced_motion, ascii, 0U);
             if (cancelling) {
                 od_canvas_write(canvas, 2, (int)canvas->height - 2,
                                 "Cancelling scan safely...",
@@ -1353,11 +1399,7 @@ static void run_dashboard(WINDOW *window,
             od_dashboard_sort_focused(&dashboard);
             (void)snprintf(status, sizeof(status), "Focused table sort changed.");
         } else if (input == 'S') {
-            if (dashboard.focused == OD_WIDGET_SERVICES) {
-                od_dashboard_sort(&dashboard, dashboard.sort);
-            } else {
-                od_dashboard_sort_focused(&dashboard);
-            }
+            od_dashboard_reverse_sort_focused(&dashboard);
             (void)snprintf(status, sizeof(status), "Focused table sort direction reversed.");
         } else if (input == '?') {
             run_help(window, canvas, use_color, ascii);
@@ -1548,6 +1590,7 @@ static OdStatus review_changes_and_save(WINDOW *window,
                                         OdCanvas *canvas,
                                         bool use_color,
                                         bool ascii,
+                                        bool reduced_motion,
                                         const char *project_root,
                                         const char *profile_path,
                                         const OdProfile *profile,
@@ -1606,7 +1649,7 @@ static OdStatus review_changes_and_save(WINDOW *window,
             paint_canvas(window, canvas, use_color);
             OdScanSnapshot fresh;
             OdStatus verify_status = run_scan_interactive(
-                window, canvas, use_color, ascii,
+                window, canvas, use_color, ascii, reduced_motion,
                 snapshot->generation + 1U, &fresh, error);
             bool fresh_ready = verify_status == OD_OK;
             if (verify_status == OD_OK) {
@@ -1704,6 +1747,7 @@ static OdStatus run_resolution(WINDOW *window,
                                OdCanvas *canvas,
                                bool use_color,
                                bool ascii,
+                               bool reduced_motion,
                                const char *project_root,
                                const char *profile_path,
                                OdProfile *profile,
@@ -1730,6 +1774,7 @@ static OdStatus run_resolution(WINDOW *window,
     od_resolution_free(&resolution);
     if (status == OD_OK) {
         status = review_changes_and_save(window, canvas, use_color, ascii,
+                                         reduced_motion,
                                          project_root, profile_path, profile,
                                          import_foreign,
                                          &plan, snapshot, error);
@@ -1753,6 +1798,7 @@ static bool run_profile_editor(WINDOW *window,
                                OdCanvas *canvas,
                                bool use_color,
                                bool ascii,
+                               bool reduced_motion,
                                const char *project_root,
                                const char *profile_path,
                                OdProfile *profile,
@@ -1864,6 +1910,7 @@ static bool run_profile_editor(WINDOW *window,
             OdStatus save_status = od_profile_validate(&draft, &error);
             if (save_status == OD_OK) {
                 save_status = run_resolution(window, canvas, use_color, ascii,
+                                             reduced_motion,
                                              project_root, profile_path, &draft,
                                              snapshot, &error);
             }
@@ -2092,6 +2139,14 @@ int od_tui_run(const OpendoorOptions *options) {
         } else if (input == KEY_DOWN || input == 'j' || input == 'l') {
             selected = (selected + 1U) % count;
             menu_status(status, sizeof(status), configured, selected);
+        } else if (input == KEY_PPAGE) {
+            size_t page_size = od_menu_page_size((size_t)height, count);
+            selected = od_page_target(selected, count, page_size, -1);
+            menu_status(status, sizeof(status), configured, selected);
+        } else if (input == KEY_NPAGE) {
+            size_t page_size = od_menu_page_size((size_t)height, count);
+            selected = od_page_target(selected, count, page_size, 1);
+            menu_status(status, sizeof(status), configured, selected);
         } else if (input == '\n' || input == '\r') {
             if (selected == count - 1U) {
                 quit = true;
@@ -2119,6 +2174,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     OdError workflow_error;
                     OdStatus workflow_status = active_profile_path == NULL ? OD_ERROR_INVALID :
                         run_resolution(window, &canvas, use_color, ascii,
+                                       reduced_motion,
                                        project_root, active_profile_path, &session_profile,
                                        &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
@@ -2188,7 +2244,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     }
                     OdError workflow_error;
                     OdStatus workflow_status = run_resolution(
-                        window, &canvas, use_color, ascii,
+                        window, &canvas, use_color, ascii, reduced_motion,
                         project_root, active_profile_path, &session_profile,
                         &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
@@ -2216,7 +2272,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     OdScanSnapshot fresh;
                     OdError refresh_error;
                     OdStatus refresh_status = run_scan_interactive(
-                        window, &canvas, use_color, ascii,
+                        window, &canvas, use_color, ascii, reduced_motion,
                         scan.snapshot.generation + 1U, &fresh, &refresh_error);
                     if (refresh_status == OD_OK) {
                         od_scan_snapshot_free(&scan.snapshot);
@@ -2244,6 +2300,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     char editor_result[256] =
                         "Profile editor closed; no files were changed.";
                     (void)run_profile_editor(window, &canvas, use_color, ascii,
+                                             reduced_motion,
                                              project_root, active_profile_path,
                                              &session_profile, &scan.snapshot,
                                              editor_result, sizeof(editor_result));

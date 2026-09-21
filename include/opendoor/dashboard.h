@@ -41,10 +41,33 @@ typedef enum {
 typedef enum {
     OD_SERVICE_SORT_NAME,
     OD_SERVICE_SORT_GROUP,
+    OD_SERVICE_SORT_VARIABLE,
     OD_SERVICE_SORT_PREFERRED,
     OD_SERVICE_SORT_SELECTED,
-    OD_SERVICE_SORT_STATUS
+    OD_SERVICE_SORT_STATUS,
+    OD_SERVICE_SORT_CONFLICT,
+    OD_SERVICE_SORT_COUNT
 } OdServiceSort;
+
+typedef enum {
+    OD_LISTENER_SORT_PORT,
+    OD_LISTENER_SORT_PROTOCOL,
+    OD_LISTENER_SORT_BIND,
+    OD_LISTENER_SORT_PROCESS,
+    OD_LISTENER_SORT_PID,
+    OD_LISTENER_SORT_USER,
+    OD_LISTENER_SORT_SOURCE,
+    OD_LISTENER_SORT_COUNT
+} OdListenerSort;
+
+typedef enum {
+    OD_DOCKER_SORT_CONTAINER,
+    OD_DOCKER_SORT_HOST_PORT,
+    OD_DOCKER_SORT_CONTAINER_PORT,
+    OD_DOCKER_SORT_PROTOCOL,
+    OD_DOCKER_SORT_PROJECT,
+    OD_DOCKER_SORT_COUNT
+} OdDockerSort;
 
 typedef struct {
     size_t managed;
@@ -86,6 +109,7 @@ typedef struct {
     size_t *listener_order;
     size_t listener_visible_count;
     char listener_search[128];
+    OdListenerSort listener_sort;
     bool listener_sort_ascending;
     size_t docker_selected;
     size_t docker_page_start;
@@ -93,6 +117,7 @@ typedef struct {
     size_t *docker_order;
     size_t docker_visible_count;
     char docker_search[128];
+    OdDockerSort docker_sort;
     bool docker_sort_ascending;
     const OdScanSnapshot *snapshot;
     OdDashboardSummary summary;
@@ -134,7 +159,11 @@ OdStatus od_dashboard_search_focused(OdDashboard *dashboard,
                                      const char *query,
                                      OdError *error);
 void od_dashboard_sort(OdDashboard *dashboard, OdServiceSort sort);
+void od_dashboard_sort_column(OdDashboard *dashboard,
+                              OdDashboardWidget widget,
+                              size_t column);
 void od_dashboard_sort_focused(OdDashboard *dashboard);
+void od_dashboard_reverse_sort_focused(OdDashboard *dashboard);
 void od_dashboard_move(OdDashboard *dashboard, int rows);
 void od_dashboard_move_page(OdDashboard *dashboard, int pages);
 void od_dashboard_home(OdDashboard *dashboard);

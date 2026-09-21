@@ -56,6 +56,10 @@ void od_render_onboarding(OdCanvas *canvas,
                           const OdOnboarding *onboarding,
                           bool ascii,
                           const char *status);
+size_t od_render_candidate_detail(OdCanvas *canvas,
+                                  const OdCandidate *candidate,
+                                  size_t page,
+                                  bool ascii);
 void od_render_dashboard(OdCanvas *canvas,
                          OdDashboard *dashboard,
                          bool ascii,

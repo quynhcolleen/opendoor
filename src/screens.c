@@ -196,8 +196,11 @@ void od_render_onboarding(OdCanvas *canvas,
     int box_height = (int)canvas->height - 8;
     od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
                   OD_ROLE_FOCUSED_BORDER);
+    const bool wide_table = box_width >= 110;
     od_canvas_write(canvas, box_x + 2, box_y + 1,
-                    "USE REVIEW CONFIDENCE   NAME                 VARIABLE                 PORT",
+                    wide_table ?
+                        "USE REVIEW CONFIDENCE NAME             SOURCE               VARIABLE              PORT GROUP" :
+                        "USE REVIEW CONFIDENCE   NAME                 VARIABLE                 PORT",
                     (size_t)(box_width - 4), OD_ROLE_MUTED, 1U);
 
     size_t start = od_onboarding_page_start(onboarding);
@@ -209,10 +212,21 @@ void od_render_onboarding(OdCanvas *canvas,
                                  (candidate->confidence == OD_CONFIDENCE_LIKELY ? "Likely" : "Possible");
         const char *use = candidate->selected ? (ascii ? "[x]" : "[✓]") : "[ ]";
         const char *review = onboarding->reviewed[index] ? (ascii ? "yes" : "✓") : "—";
+        const char *source = candidate->sources.count == 0U ? "unknown" :
+                             candidate->sources.items[0];
         char row[320];
-        (void)snprintf(row, sizeof(row), "%-3s %-6s %-12s %-20.20s %-24.24s %5u",
-                       use, review, confidence, candidate->name, candidate->variable,
-                       (unsigned)candidate->port);
+        if (wide_table) {
+            (void)snprintf(row, sizeof(row),
+                           "%-3s %-6s %-10s %-16.16s %-20.20s %-20.20s %5u %-12.12s",
+                           use, review, confidence, candidate->name, source,
+                           candidate->variable, (unsigned)candidate->port,
+                           candidate->group);
+        } else {
+            (void)snprintf(row, sizeof(row),
+                           "%-3s %-6s %-12s %-20.20s %-24.24s %5u",
+                           use, review, confidence, candidate->name,
+                           candidate->variable, (unsigned)candidate->port);
+        }
         int row_y = box_y + 2 + (int)(index - start);
         bool selected = index == onboarding->selected;
         od_canvas_write(canvas, box_x + 2, row_y, row, (size_t)(box_width - 4),
@@ -235,8 +249,40 @@ void od_render_onboarding(OdCanvas *canvas,
                         canvas->width - 4U, OD_ROLE_WARNING, 0U);
     }
     od_canvas_write(canvas, 1, (int)canvas->height - 1,
-                    "Up/Down Select  PgUp/PgDn Page  Space Use  Enter Review  e Edit  a Add  s Continue  Esc Back",
+                    "Up/Down Select  PgUp/PgDn Page  Space Use  Enter Review  d Details  e Edit  a Add  s Continue  Esc Back",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
+}
+
+static const char *dashboard_sort_name(const OdDashboard *dashboard,
+                                       OdDashboardWidget widget) {
+    static const char *const service_names[] = {
+        "name", "group", "variable", "preferred", "port", "status", "conflict"
+    };
+    static const char *const listener_names[] = {
+        "port", "protocol", "bind", "process", "pid", "user", "source"
+    };
+    static const char *const docker_names[] = {
+        "container", "host", "container-port", "protocol", "project"
+    };
+    if (widget == OD_WIDGET_SERVICES && dashboard->sort < OD_SERVICE_SORT_COUNT) {
+        return service_names[(size_t)dashboard->sort];
+    }
+    if (widget == OD_WIDGET_LISTENERS &&
+        dashboard->listener_sort < OD_LISTENER_SORT_COUNT) {
+        return listener_names[(size_t)dashboard->listener_sort];
+    }
+    if (widget == OD_WIDGET_DOCKER && dashboard->docker_sort < OD_DOCKER_SORT_COUNT) {
+        return docker_names[(size_t)dashboard->docker_sort];
+    }
+    return "preferred";
+}
+
+static bool dashboard_sort_ascending(const OdDashboard *dashboard,
+                                     OdDashboardWidget widget) {
+    if (widget == OD_WIDGET_SERVICES) return dashboard->sort_ascending;
+    if (widget == OD_WIDGET_LISTENERS) return dashboard->listener_sort_ascending;
+    if (widget == OD_WIDGET_DOCKER) return dashboard->docker_sort_ascending;
+    return dashboard->conflict_sort_ascending;
 }
 
 void od_render_dashboard(OdCanvas *canvas,
@@ -306,12 +352,24 @@ void od_render_dashboard(OdCanvas *canvas,
         }                                                                          \
     } while (0)
 
+#define ADD_COLUMN_HIT(TEXT, LABEL, X, Y, WIDGET, TARGET)                         \
+    do {                                                                          \
+        const char *column__ = strstr((TEXT), (LABEL));                           \
+        if (column__ != NULL) {                                                    \
+            ADD_HIT((X) + (int)(column__ - (TEXT)), (Y),                          \
+                    (int)strlen(LABEL), 1, OD_HIT_SORT_COLUMN,                    \
+                    (WIDGET), (size_t)(TARGET));                                  \
+        }                                                                          \
+    } while (0)
+
 #define DRAW_TITLE(X, Y, W, WIDGET)                                                \
     do {                                                                          \
         char title__[96];                                                          \
-        (void)snprintf(title__, sizeof(title__), "%s%s",                          \
+        (void)snprintf(title__, sizeof(title__), "%s%s  sort:%s%c",              \
                        widget_names[(size_t)(WIDGET)],                              \
-                       dashboard->focused == (WIDGET) ? "  [focused]" : "");      \
+                       dashboard->focused == (WIDGET) ? "  [focused]" : "",       \
+                       dashboard_sort_name(dashboard, (WIDGET)),                   \
+                       dashboard_sort_ascending(dashboard, (WIDGET)) ? '^' : 'v'); \
         od_canvas_write(canvas, (X) + 2, (Y), title__,                             \
                         (size_t)((W) > 4 ? (W) - 4 : 0),                           \
                         dashboard->focused == (WIDGET) ? OD_ROLE_PRIMARY :         \
@@ -352,8 +410,22 @@ void od_render_dashboard(OdCanvas *canvas,
         od_canvas_write(canvas, (X) + 2, (Y) + 2, columns__,                       \
                         (size_t)(inner_width__ > 0 ? inner_width__ : 0),            \
                         OD_ROLE_MUTED, 1U);                                        \
-        ADD_HIT((X) + 2, (Y) + 2, (W) - 4, 1, OD_HIT_SORT_COLUMN,                 \
-                OD_WIDGET_SERVICES, (size_t)dashboard->sort);                      \
+        ADD_COLUMN_HIT(columns__, "SERVICE", (X) + 2, (Y) + 2,                   \
+                       OD_WIDGET_SERVICES, OD_SERVICE_SORT_NAME);                  \
+        if (inner_width__ >= 72)                                                   \
+            ADD_COLUMN_HIT(columns__, "GROUP", (X) + 2, (Y) + 2,                 \
+                           OD_WIDGET_SERVICES, OD_SERVICE_SORT_GROUP);             \
+        ADD_COLUMN_HIT(columns__, "VARIABLE", (X) + 2, (Y) + 2,                  \
+                       OD_WIDGET_SERVICES, OD_SERVICE_SORT_VARIABLE);              \
+        ADD_COLUMN_HIT(columns__, "PREF", (X) + 2, (Y) + 2,                      \
+                       OD_WIDGET_SERVICES, OD_SERVICE_SORT_PREFERRED);             \
+        ADD_COLUMN_HIT(columns__, "PORT", (X) + 2, (Y) + 2,                      \
+                       OD_WIDGET_SERVICES, OD_SERVICE_SORT_SELECTED);              \
+        ADD_COLUMN_HIT(columns__, "STATUS", (X) + 2, (Y) + 2,                    \
+                       OD_WIDGET_SERVICES, OD_SERVICE_SORT_STATUS);                \
+        ADD_COLUMN_HIT(columns__, inner_width__ >= 72 ? "CONFLICT" : "CFL",      \
+                       (X) + 2, (Y) + 2, OD_WIDGET_SERVICES,                       \
+                       OD_SERVICE_SORT_CONFLICT);                                  \
         size_t end__ = dashboard->page_start + rows__;                            \
         if (end__ > dashboard->visible_count) end__ = dashboard->visible_count;   \
         for (size_t visible__ = dashboard->page_start; visible__ < end__;          \
@@ -474,8 +546,22 @@ void od_render_dashboard(OdCanvas *canvas,
         od_canvas_write(canvas, (X) + 2, (Y) + 2, listener_columns__,              \
                         (size_t)(listener_inner__ > 0 ? listener_inner__ : 0),      \
                         OD_ROLE_MUTED, 1U);                                        \
-        ADD_HIT((X) + 2, (Y) + 2, (W) - 4, 1, OD_HIT_SORT_COLUMN,                 \
-                OD_WIDGET_LISTENERS, 0U);                                         \
+        ADD_COLUMN_HIT(listener_columns__, "PORT", (X) + 2, (Y) + 2,             \
+                       OD_WIDGET_LISTENERS, OD_LISTENER_SORT_PORT);                \
+        ADD_COLUMN_HIT(listener_columns__, "PROTO", (X) + 2, (Y) + 2,            \
+                       OD_WIDGET_LISTENERS, OD_LISTENER_SORT_PROTOCOL);            \
+        ADD_COLUMN_HIT(listener_columns__, "BIND", (X) + 2, (Y) + 2,             \
+                       OD_WIDGET_LISTENERS, OD_LISTENER_SORT_BIND);                \
+        ADD_COLUMN_HIT(listener_columns__, "PROCESS", (X) + 2, (Y) + 2,          \
+                       OD_WIDGET_LISTENERS, OD_LISTENER_SORT_PROCESS);             \
+        if (listener_inner__ >= 72) {                                              \
+            ADD_COLUMN_HIT(listener_columns__, "PID", (X) + 2, (Y) + 2,           \
+                           OD_WIDGET_LISTENERS, OD_LISTENER_SORT_PID);             \
+            ADD_COLUMN_HIT(listener_columns__, "USER", (X) + 2, (Y) + 2,          \
+                           OD_WIDGET_LISTENERS, OD_LISTENER_SORT_USER);            \
+            ADD_COLUMN_HIT(listener_columns__, "SOURCE", (X) + 2, (Y) + 2,        \
+                           OD_WIDGET_LISTENERS, OD_LISTENER_SORT_SOURCE);          \
+        }                                                                          \
         size_t start__ = dashboard->listener_page_start;                          \
         if (start__ >= dashboard->listener_visible_count) start__ = 0U;             \
         for (size_t offset__ = 0U; offset__ < capacity__ &&                        \
@@ -540,8 +626,25 @@ void od_render_dashboard(OdCanvas *canvas,
         od_canvas_write(canvas, (X) + 2, (Y) + 2, docker_columns__,                \
                         (size_t)(docker_inner__ > 0 ? docker_inner__ : 0),          \
                         OD_ROLE_MUTED, 1U);                                        \
-        ADD_HIT((X) + 2, (Y) + 2, (W) - 4, 1, OD_HIT_SORT_COLUMN,                 \
-                OD_WIDGET_DOCKER, 0U);                                            \
+        ADD_COLUMN_HIT(docker_columns__,                                           \
+                       docker_inner__ >= 72 ? "CONTAINER        " :                \
+                                                "CONTAINER          ",             \
+                       (X) + 2, (Y) + 2, OD_WIDGET_DOCKER,                         \
+                       OD_DOCKER_SORT_CONTAINER);                                  \
+        ADD_COLUMN_HIT(docker_columns__, "HOST", (X) + 2, (Y) + 2,               \
+                       OD_WIDGET_DOCKER, OD_DOCKER_SORT_HOST_PORT);                \
+        const char *container_port__ = strstr(docker_columns__ + 1, "CONTAINER"); \
+        if (container_port__ != NULL)                                              \
+            ADD_HIT((X) + 2 + (int)(container_port__ - docker_columns__),          \
+                    (Y) + 2, 9, 1, OD_HIT_SORT_COLUMN, OD_WIDGET_DOCKER,           \
+                    OD_DOCKER_SORT_CONTAINER_PORT);                                \
+        ADD_COLUMN_HIT(docker_columns__,                                           \
+                       docker_inner__ >= 72 ? "PROTOCOL" : "PROTO",              \
+                       (X) + 2, (Y) + 2, OD_WIDGET_DOCKER,                         \
+                       OD_DOCKER_SORT_PROTOCOL);                                   \
+        if (docker_inner__ >= 72)                                                  \
+            ADD_COLUMN_HIT(docker_columns__, "PROJECT", (X) + 2, (Y) + 2,         \
+                           OD_WIDGET_DOCKER, OD_DOCKER_SORT_PROJECT);              \
         size_t start__ = dashboard->docker_page_start;                            \
         if (start__ >= dashboard->docker_visible_count) start__ = 0U;              \
         for (size_t offset__ = 0U; offset__ < capacity__ &&                        \
@@ -603,7 +706,7 @@ void od_render_dashboard(OdCanvas *canvas,
     if (dashboard->expanded) {
         DRAW_WIDGET(dashboard->focused, 1, content_y, (int)canvas->width - 2,
                     content_height);
-    } else if (canvas->height >= 21U && canvas->width >= 120U) {
+    } else if (content_height >= 18 && canvas->width >= 120U) {
         int available_width = (int)canvas->width - 3;
         int service_width = (available_width * 2) / 3;
         int secondary_x = 2 + service_width;
@@ -617,7 +720,7 @@ void od_render_dashboard(OdCanvas *canvas,
                        secondary_width, second_height);
         DRAW_DOCKER(secondary_x, content_y + first_height + second_height,
                     secondary_width, third_height);
-    } else if (canvas->height >= 21U && canvas->width >= 80U) {
+    } else if (content_height >= 16 && canvas->width >= 80U) {
         int primary_height = (content_height * 2) / 3;
         int secondary_height = content_height - primary_height;
         OdDashboardWidget secondary = dashboard->focused == OD_WIDGET_SERVICES ?
@@ -653,6 +756,7 @@ void od_render_dashboard(OdCanvas *canvas,
 #undef DRAW_BOX
 #undef DRAW_SCROLL_CONTROLS
 #undef DRAW_TITLE
+#undef ADD_COLUMN_HIT
 #undef ADD_HIT
 }
 
@@ -661,27 +765,62 @@ static const OdServiceRow *selected_conflict(const OdDashboard *dashboard) {
     return &dashboard->services[dashboard->conflict_order[dashboard->conflict_selected]];
 }
 
-static void append_detail(char *text,
-                          size_t capacity,
-                          size_t *used,
+typedef struct {
+    char *text;
+    size_t length;
+    size_t capacity;
+    bool failed;
+} OdDetailText;
+
+static void append_detail(OdDetailText *detail,
                           const char *label,
                           const char *value) {
-    if (*used >= capacity) return;
-    int count = snprintf(text + *used, capacity - *used, "%s: %s\n", label,
-                         value == NULL || value[0] == '\0' ? "—" : value);
-    if (count < 0) return;
-    size_t added = (size_t)count;
-    *used += added < capacity - *used ? added : capacity - *used;
+    if (detail->failed) return;
+    const char *display = value == NULL || value[0] == '\0' ? "—" : value;
+    int count = snprintf(NULL, 0, "%s: %s\n", label, display);
+    if (count < 0) {
+        detail->failed = true;
+        return;
+    }
+    size_t required = detail->length + (size_t)count + 1U;
+    if (required > detail->capacity) {
+        size_t capacity = detail->capacity == 0U ? 256U : detail->capacity;
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2U) {
+                detail->failed = true;
+                return;
+            }
+            capacity *= 2U;
+        }
+        char *grown = realloc(detail->text, capacity);
+        if (grown == NULL) {
+            detail->failed = true;
+            return;
+        }
+        detail->text = grown;
+        detail->capacity = capacity;
+    }
+    (void)snprintf(detail->text + detail->length,
+                   detail->capacity - detail->length,
+                   "%s: %s\n", label, display);
+    detail->length += (size_t)count;
 }
 
-static void append_detail_number(char *text,
-                                 size_t capacity,
-                                 size_t *used,
+static void append_detail_number(OdDetailText *detail,
                                  const char *label,
                                  unsigned long long value) {
     char number[48];
     (void)snprintf(number, sizeof(number), "%llu", value);
-    append_detail(text, capacity, used, label, number);
+    append_detail(detail, label, number);
+}
+
+static char *finish_detail(OdDetailText *detail) {
+    if (detail->failed) {
+        free(detail->text);
+        return NULL;
+    }
+    if (detail->text == NULL) detail->text = calloc(1U, 1U);
+    return detail->text;
 }
 
 static size_t detail_chunk(const char *text, size_t length, size_t width) {
@@ -712,13 +851,10 @@ static size_t wrapped_detail_rows(const char *text, size_t width) {
     return rows;
 }
 
-static void build_dashboard_detail(const OdDashboard *dashboard,
-                                   char *title,
-                                   size_t title_capacity,
-                                   char *text,
-                                   size_t text_capacity) {
-    size_t used = 0U;
-    text[0] = '\0';
+static char *build_dashboard_detail(const OdDashboard *dashboard,
+                                    char *title,
+                                    size_t title_capacity) {
+    OdDetailText detail = {0};
     if (dashboard->focused == OD_WIDGET_SERVICES ||
         dashboard->focused == OD_WIDGET_CONFLICTS) {
         const OdServiceRow *row = dashboard->focused == OD_WIDGET_SERVICES ?
@@ -727,85 +863,82 @@ static void build_dashboard_detail(const OdDashboard *dashboard,
                        dashboard->focused == OD_WIDGET_SERVICES ?
                            "Service details" : "Conflict details");
         if (row == NULL) {
-            append_detail(text, text_capacity, &used, "Selection", "No row selected");
-            return;
+            append_detail(&detail, "Selection", "No row selected");
+            return finish_detail(&detail);
         }
-        append_detail(text, text_capacity, &used, "Stable ID", row->stable_id);
-        append_detail(text, text_capacity, &used, "Service", row->service);
-        append_detail(text, text_capacity, &used, "Group", row->group);
-        append_detail(text, text_capacity, &used, "Variable", row->variable);
-        append_detail_number(text, text_capacity, &used, "Preferred port",
-                             row->preferred_port);
-        append_detail_number(text, text_capacity, &used, "Selected port",
-                             row->selected_port);
-        append_detail(text, text_capacity, &used, "Status",
+        append_detail(&detail, "Stable ID", row->stable_id);
+        append_detail(&detail, "Service", row->service);
+        append_detail(&detail, "Group", row->group);
+        append_detail(&detail, "Variable", row->variable);
+        append_detail_number(&detail, "Preferred port", row->preferred_port);
+        append_detail_number(&detail, "Selected port", row->selected_port);
+        append_detail(&detail, "Status",
                       od_service_status_name(row->status));
-        append_detail(text, text_capacity, &used, "Conflict",
+        append_detail(&detail, "Conflict",
                       row->conflict ? row->conflict_detail : "None");
-        return;
+        return finish_detail(&detail);
     }
     if (dashboard->focused == OD_WIDGET_LISTENERS) {
         (void)snprintf(title, title_capacity, "Listener details");
         if (dashboard->listener_selected >= dashboard->listener_visible_count) {
-            append_detail(text, text_capacity, &used, "Selection", "No row selected");
-            return;
+            append_detail(&detail, "Selection", "No row selected");
+            return finish_detail(&detail);
         }
         const OdEndpoint *endpoint =
             &dashboard->snapshot->endpoints[
                 dashboard->listener_order[dashboard->listener_selected]];
-        append_detail(text, text_capacity, &used, "Stable ID", endpoint->stable_id);
-        append_detail(text, text_capacity, &used, "Protocol",
+        append_detail(&detail, "Stable ID", endpoint->stable_id);
+        append_detail(&detail, "Protocol",
                       endpoint->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP");
-        append_detail(text, text_capacity, &used, "Local address", endpoint->local_address);
-        append_detail_number(text, text_capacity, &used, "Local port", endpoint->local_port);
-        append_detail(text, text_capacity, &used, "Remote address", endpoint->remote_address);
-        append_detail_number(text, text_capacity, &used, "Remote port", endpoint->remote_port);
-        append_detail(text, text_capacity, &used, "Process", endpoint->process);
-        append_detail_number(text, text_capacity, &used, "PID",
+        append_detail(&detail, "Local address", endpoint->local_address);
+        append_detail_number(&detail, "Local port", endpoint->local_port);
+        append_detail(&detail, "Remote address", endpoint->remote_address);
+        append_detail_number(&detail, "Remote port", endpoint->remote_port);
+        append_detail(&detail, "Process", endpoint->process);
+        append_detail_number(&detail, "PID",
                              (unsigned long long)endpoint->pid);
-        append_detail(text, text_capacity, &used, "User", endpoint->user);
-        append_detail_number(text, text_capacity, &used, "UID",
+        append_detail(&detail, "User", endpoint->user);
+        append_detail_number(&detail, "UID",
                              (unsigned long long)endpoint->uid);
-        append_detail_number(text, text_capacity, &used, "Socket inode", endpoint->inode);
-        append_detail(text, text_capacity, &used, "Executable", endpoint->executable);
-        append_detail(text, text_capacity, &used, "Command", endpoint->command);
-        append_detail(text, text_capacity, &used, "Ownership",
+        append_detail_number(&detail, "Socket inode", endpoint->inode);
+        append_detail(&detail, "Executable", endpoint->executable);
+        append_detail(&detail, "Command", endpoint->command);
+        append_detail(&detail, "Ownership",
                       endpoint->permission_limited ?
                           "Process details limited by permissions" : "Resolved");
-        return;
+        return finish_detail(&detail);
     }
     (void)snprintf(title, title_capacity, "Docker mapping details");
     if (dashboard->docker_selected >= dashboard->docker_visible_count) {
-        append_detail(text, text_capacity, &used, "Selection", "No row selected");
-        return;
+        append_detail(&detail, "Selection", "No row selected");
+        return finish_detail(&detail);
     }
     const OdDockerMapping *mapping =
         &dashboard->snapshot->docker_mappings[
             dashboard->docker_order[dashboard->docker_selected]];
-    append_detail(text, text_capacity, &used, "Container", mapping->container);
-    append_detail(text, text_capacity, &used, "Container ID", mapping->container_id);
-    append_detail(text, text_capacity, &used, "Compose project", mapping->project);
-    append_detail(text, text_capacity, &used, "Compose service", mapping->service);
-    append_detail(text, text_capacity, &used, "Bind address", mapping->bind_address);
-    append_detail_number(text, text_capacity, &used, "Host port", mapping->host_port);
-    append_detail_number(text, text_capacity, &used, "Container port",
+    append_detail(&detail, "Container", mapping->container);
+    append_detail(&detail, "Container ID", mapping->container_id);
+    append_detail(&detail, "Compose project", mapping->project);
+    append_detail(&detail, "Compose service", mapping->service);
+    append_detail(&detail, "Bind address", mapping->bind_address);
+    append_detail_number(&detail, "Host port", mapping->host_port);
+    append_detail_number(&detail, "Container port",
                          mapping->container_port);
-    append_detail(text, text_capacity, &used, "Protocol",
+    append_detail(&detail, "Protocol",
                   mapping->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP");
+    return finish_detail(&detail);
 }
 
-size_t od_render_dashboard_detail(OdCanvas *canvas,
-                                  const OdDashboard *dashboard,
-                                  size_t page,
-                                  bool ascii) {
+static size_t render_detail_document(OdCanvas *canvas,
+                                     const char *title,
+                                     const char *detail_text,
+                                     size_t page,
+                                     bool ascii) {
     od_canvas_clear(canvas, OD_ROLE_DEFAULT);
     if (canvas->width < 60U || canvas->height < 18U) {
         od_render_resize_required(canvas);
         return 1U;
     }
-    char title[96];
-    char detail[8192];
-    build_dashboard_detail(dashboard, title, sizeof(title), detail, sizeof(detail));
     od_canvas_write(canvas, 2, 1, title, canvas->width - 4U, OD_ROLE_PRIMARY, 1U);
     od_canvas_write(canvas, 2, 2,
                     "Full selected-row values • content wraps inside this viewport",
@@ -818,7 +951,7 @@ size_t od_render_dashboard_detail(OdCanvas *canvas,
                   OD_ROLE_FOCUSED_BORDER);
     size_t line_width = (size_t)(box_width - 4);
     size_t page_size = box_height > 3 ? (size_t)(box_height - 3) : 1U;
-    size_t row_count = wrapped_detail_rows(detail, line_width);
+    size_t row_count = wrapped_detail_rows(detail_text, line_width);
     size_t page_count = row_count == 0U ? 1U : (row_count + page_size - 1U) / page_size;
     size_t current_page = page < page_count ? page : page_count - 1U;
     size_t first_row = current_page * page_size;
@@ -826,7 +959,7 @@ size_t od_render_dashboard_detail(OdCanvas *canvas,
     char *line = malloc(line_width + 1U);
     if (line != NULL) {
         size_t row = 0U;
-        const char *cursor = detail;
+        const char *cursor = detail_text;
         while (*cursor != '\0' && row < final_row) {
             const char *newline = strchr(cursor, '\n');
             size_t length = newline == NULL ? strlen(cursor) : (size_t)(newline - cursor);
@@ -857,6 +990,58 @@ size_t od_render_dashboard_detail(OdCanvas *canvas,
     od_canvas_write(canvas, 1, (int)canvas->height - 1,
                     "PgUp/PgDn Page  Up/Down Page  Home/End  Esc Back",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
+    return page_count;
+}
+
+size_t od_render_dashboard_detail(OdCanvas *canvas,
+                                  const OdDashboard *dashboard,
+                                  size_t page,
+                                  bool ascii) {
+    char title[96];
+    char *detail = build_dashboard_detail(dashboard, title, sizeof(title));
+    const char *detail_text = detail == NULL ?
+        "Detail content could not be allocated.\n" : detail;
+    size_t page_count = render_detail_document(canvas, title, detail_text, page, ascii);
+    free(detail);
+    return page_count;
+}
+
+size_t od_render_candidate_detail(OdCanvas *canvas,
+                                  const OdCandidate *candidate,
+                                  size_t page,
+                                  bool ascii) {
+    OdDetailText detail = {0};
+    if (candidate == NULL) {
+        append_detail(&detail, "Selection", "No candidate selected");
+    } else {
+        const char *confidence = candidate->confidence == OD_CONFIDENCE_CONFIRMED ?
+            "Confirmed" : (candidate->confidence == OD_CONFIDENCE_LIKELY ?
+                                "Likely" : "Possible");
+        const char *protocols = candidate->protocols ==
+                                    (OD_PROTOCOL_TCP | OD_PROTOCOL_UDP) ?
+                                    "TCP, UDP" :
+                                (candidate->protocols == OD_PROTOCOL_UDP ? "UDP" : "TCP");
+        append_detail(&detail, "Stable ID", candidate->stable_id);
+        append_detail(&detail, "Name", candidate->name);
+        append_detail(&detail, "Confidence", confidence);
+        append_detail(&detail, "Group", candidate->group);
+        append_detail(&detail, "Variable", candidate->variable);
+        append_detail_number(&detail, "Port", candidate->port);
+        append_detail(&detail, "Protocols", protocols);
+        append_detail(&detail, "Selected for management",
+                      candidate->selected ? "Yes" : "No");
+        for (size_t index = 0U; index < candidate->sources.count; ++index) {
+            char label[48];
+            (void)snprintf(label, sizeof(label), "Source %zu", index + 1U);
+            append_detail(&detail, label, candidate->sources.items[index]);
+        }
+    }
+    char *text = finish_detail(&detail);
+    const char *display = text == NULL ?
+        "Detail content could not be allocated.\n" : text;
+    size_t page_count = render_detail_document(canvas, "Discovery candidate details",
+                                               display, page, ascii);
+    free(text);
     return page_count;
 }
 
