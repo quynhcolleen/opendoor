@@ -49,6 +49,8 @@ add_library(opendoor_core
   src/tui.c
   src/onboarding.c
   src/dashboard.c
+  src/persistence.c
+  src/resolution.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(opendoor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
@@ -89,6 +91,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_dashboard PRIVATE opendoor_core)
   target_compile_options(test_dashboard PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME dashboard_contracts COMMAND test_dashboard)
+  add_executable(test_persistence tests/test_persistence.c)
+  target_link_libraries(test_persistence PRIVATE opendoor_core)
+  target_compile_options(test_persistence PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME persistence_contracts COMMAND test_persistence)
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)

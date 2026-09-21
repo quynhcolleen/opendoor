@@ -562,3 +562,135 @@ void od_render_dashboard(OdCanvas *canvas,
 #undef DRAW_TITLE
 #undef ADD_HIT
 }
+
+void od_render_conflict_resolution(OdCanvas *canvas,
+                                   const OdResolution *resolution,
+                                   bool ascii,
+                                   const char *status) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "Resolve conflict", canvas->width - 4U,
+                    OD_ROLE_PRIMARY, 1U);
+    const OdResolutionItem *item = od_resolution_current(resolution);
+    if (item == NULL) {
+        od_canvas_write_centered(canvas, (int)canvas->height / 2,
+                                 "Every conflict has been reviewed",
+                                 OD_ROLE_SUCCESS, 1U);
+    } else {
+        char progress[96];
+        (void)snprintf(progress, sizeof(progress), "Conflict %zu of %zu",
+                       resolution->current + 1U, resolution->count);
+        od_canvas_write(canvas, 2, 2, progress, canvas->width - 4U,
+                        OD_ROLE_MUTED, 0U);
+        int box_x = 2;
+        int box_y = 4;
+        int box_width = (int)canvas->width - 4;
+        int box_height = (int)canvas->height - 9;
+        od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                      OD_ROLE_FOCUSED_BORDER);
+        const OdAllocation *allocation =
+            &resolution->plan->items[item->allocation_index];
+        char line[320];
+        (void)snprintf(line, sizeof(line), "Service: %s", item->service);
+        od_canvas_write(canvas, box_x + 2, box_y + 2, line,
+                        (size_t)(box_width - 4), OD_ROLE_DEFAULT, 1U);
+        (void)snprintf(line, sizeof(line), "Requested port: %u",
+                       (unsigned)item->original_port);
+        od_canvas_write(canvas, box_x + 2, box_y + 4, line,
+                        (size_t)(box_width - 4), OD_ROLE_WARNING, 0U);
+        (void)snprintf(line, sizeof(line), "Occupied by: %s", item->owner);
+        od_canvas_write(canvas, box_x + 2, box_y + 5, line,
+                        (size_t)(box_width - 4), OD_ROLE_DANGER, 0U);
+        (void)snprintf(line, sizeof(line), "Recommended free port: %u",
+                       (unsigned)allocation->new_port);
+        od_canvas_write(canvas, box_x + 2, box_y + 7, line,
+                        (size_t)(box_width - 4), OD_ROLE_SUCCESS, 1U);
+    }
+    if (status != NULL) {
+        od_canvas_write(canvas, 2, (int)canvas->height - 2, status,
+                        canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    }
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "Enter Accept  e Edit port  s Skip  Esc Cancel",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+}
+
+static const OdService *screen_find_service(const OdProfile *profile, const char *id) {
+    for (size_t index = 0U; index < profile->service_count; ++index) {
+        if (strcmp(profile->services[index].id, id) == 0) return &profile->services[index];
+    }
+    return NULL;
+}
+
+void od_render_change_review(OdCanvas *canvas,
+                             const OdProfile *profile,
+                             const OdAllocationPlan *plan,
+                             size_t selected,
+                             bool ascii,
+                             const char *status) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "Review assignment changes",
+                    canvas->width - 4U, OD_ROLE_PRIMARY, 1U);
+    char summary[128];
+    (void)snprintf(summary, sizeof(summary),
+                   "%zu managed service(s) • no files change until you confirm",
+                   plan->count);
+    od_canvas_write(canvas, 2, 2, summary, canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    int box_x = 1;
+    int box_y = 4;
+    int box_width = (int)canvas->width - 2;
+    int box_height = (int)canvas->height - 8;
+    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                  OD_ROLE_FOCUSED_BORDER);
+    od_canvas_write(canvas, box_x + 2, box_y + 1,
+                    "SERVICE                    OLD     NEW  REASON",
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 1U);
+    size_t page_size = box_height > 4 ? (size_t)(box_height - 4) : 1U;
+    if (plan->count > 0U && selected >= plan->count) selected = plan->count - 1U;
+    size_t page_start = (selected / page_size) * page_size;
+    size_t end = page_start + page_size;
+    if (end > plan->count) end = plan->count;
+    for (size_t index = page_start; index < end; ++index) {
+        const OdAllocation *allocation = &plan->items[index];
+        const OdService *service = screen_find_service(profile, allocation->service_id);
+        const char *reason = allocation->new_port == 0U ? "SKIPPED" :
+            (allocation->reason == OD_ALLOC_PRESERVED ? "SAVED" :
+             (allocation->reason == OD_ALLOC_REASSIGNED ? "REASSIGNED" : "PREFERRED"));
+        char row[320];
+        char old_port[16];
+        char new_port[16];
+        (void)snprintf(old_port, sizeof(old_port), allocation->old_port == 0U ? "-" : "%u",
+                       (unsigned)allocation->old_port);
+        (void)snprintf(new_port, sizeof(new_port), allocation->new_port == 0U ? "-" : "%u",
+                       (unsigned)allocation->new_port);
+        (void)snprintf(row, sizeof(row), "%-26.26s %7s %7s  %-10.10s",
+                       service == NULL ? allocation->service_id : service->name,
+                       old_port, new_port, reason);
+        bool is_selected = index == selected;
+        od_canvas_write(canvas, box_x + 2, box_y + 2 + (int)(index - page_start),
+                        row, (size_t)(box_width - 4),
+                        is_selected ? OD_ROLE_SELECTED :
+                            (allocation->new_port == 0U ? OD_ROLE_WARNING : OD_ROLE_DEFAULT),
+                        is_selected ? 2U : 0U);
+    }
+    char page[80];
+    (void)snprintf(page, sizeof(page), "Page %zu/%zu",
+                   plan->count == 0U ? 0U : page_start / page_size + 1U,
+                   plan->count == 0U ? 0U : (plan->count + page_size - 1U) / page_size);
+    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page,
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+    if (status != NULL) {
+        od_canvas_write(canvas, 2, (int)canvas->height - 3, status,
+                        canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    }
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "Up/Down Select  PgUp/PgDn Page  Enter Save  Esc Cancel",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+}

@@ -4,6 +4,7 @@
 #include "opendoor/ui.h"
 #include "opendoor/onboarding.h"
 #include "opendoor/dashboard.h"
+#include "opendoor/resolution.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -42,6 +43,16 @@ void od_render_dashboard(OdCanvas *canvas,
                          bool ascii,
                          OdHitMap *hit_map,
                          const char *status);
+void od_render_conflict_resolution(OdCanvas *canvas,
+                                   const OdResolution *resolution,
+                                   bool ascii,
+                                   const char *status);
+void od_render_change_review(OdCanvas *canvas,
+                             const OdProfile *profile,
+                             const OdAllocationPlan *plan,
+                             size_t selected,
+                             bool ascii,
+                             const char *status);
 const char *const *od_banner_lines(void);
 size_t od_banner_line_count(void);
 

@@ -7,6 +7,8 @@
 #include "opendoor/docker.h"
 #include "opendoor/discovery.h"
 #include "opendoor/onboarding.h"
+#include "opendoor/persistence.h"
+#include "opendoor/resolution.h"
 #include "opendoor/screens.h"
 #include "opendoor/scan.h"
 #include "opendoor/theme.h"
@@ -354,18 +356,49 @@ static bool run_onboarding(WINDOW *window,
     return accepted;
 }
 
-static bool create_dashboard(const OdProfile *profile,
-                             const OdScanSnapshot *snapshot,
-                             OdDashboard *dashboard,
-                             OdAllocationPlan *plan,
-                             OdError *error) {
+static bool assignment_path(const char *project_root,
+                            const OdProfile *profile,
+                            char *path,
+                            size_t capacity) {
+    if (profile->assignment_file == NULL || profile->assignment_file[0] == '/' ||
+        strstr(profile->assignment_file, "..") != NULL) return false;
+    int count = snprintf(path, capacity, "%s%s%s", project_root,
+                         project_root[0] != '\0' &&
+                         project_root[strlen(project_root) - 1U] == '/' ? "" : "/",
+                         profile->assignment_file);
+    return count >= 0 && (size_t)count < capacity;
+}
+
+static OdStatus load_saved_assignments(const char *project_root,
+                                       const OdProfile *profile,
+                                       OdAssignments *assignments,
+                                       OdError *error) {
+    od_assignments_init(assignments);
+    char path[4096];
+    if (!assignment_path(project_root, profile, path, sizeof(path))) {
+        od_error_set(error, OD_ERROR_INVALID, "assignment path is unsafe or too long");
+        return OD_ERROR_INVALID;
+    }
+    struct stat information;
+    if (lstat(path, &information) != 0 && errno == ENOENT) {
+        od_error_clear(error);
+        return OD_OK;
+    }
+    return od_assignments_load_file(path, assignments, error);
+}
+
+static OdStatus create_allocation_plan(const OdProfile *profile,
+                                       const OdScanSnapshot *snapshot,
+                                       const OdAssignments *saved,
+                                       OdAllocationPlan *plan,
+                                       OdError *error) {
     size_t occupied_count = snapshot->endpoint_count + snapshot->docker_mapping_count;
     OdOccupiedPort *occupied = NULL;
     if (occupied_count > 0U) {
         occupied = calloc(occupied_count, sizeof(*occupied));
         if (occupied == NULL) {
             od_error_set(error, OD_ERROR_MEMORY, "unable to prepare occupied ports");
-            return false;
+            return OD_ERROR_MEMORY;
         }
     }
     size_t output = 0U;
@@ -382,8 +415,19 @@ static bool create_dashboard(const OdProfile *profile,
         };
     }
     OdStatus allocation_status = od_allocate(profile, occupied, occupied_count,
-                                              NULL, plan, error);
+                                              saved, plan, error);
     free(occupied);
+    return allocation_status;
+}
+
+static bool create_dashboard(const OdProfile *profile,
+                             const OdScanSnapshot *snapshot,
+                             const OdAssignments *saved,
+                             OdDashboard *dashboard,
+                             OdAllocationPlan *plan,
+                             OdError *error) {
+    OdStatus allocation_status = create_allocation_plan(profile, snapshot, saved,
+                                                        plan, error);
     if (allocation_status != OD_OK) return false;
     OdStatus dashboard_status = od_dashboard_init(dashboard, profile, snapshot, plan, error);
     if (dashboard_status != OD_OK) {
@@ -430,12 +474,21 @@ static void run_dashboard(WINDOW *window,
                           OdCanvas *canvas,
                           bool use_color,
                           bool ascii,
+                          const char *project_root,
                           const OdProfile *profile,
                           const OdScanSnapshot *snapshot) {
     OdDashboard dashboard;
     OdAllocationPlan plan = {0};
     OdError error;
-    if (!create_dashboard(profile, snapshot, &dashboard, &plan, &error)) return;
+    OdAssignments saved;
+    OdStatus saved_status = load_saved_assignments(project_root, profile, &saved, &error);
+    if (saved_status != OD_OK && saved_status != OD_ERROR_FOREIGN) return;
+    if (!create_dashboard(profile, snapshot,
+                          saved_status == OD_OK ? &saved : NULL,
+                          &dashboard, &plan, &error)) {
+        od_assignments_free(&saved);
+        return;
+    }
     OdHitMap hit_map;
     od_hitmap_init(&hit_map);
     char status[256];
@@ -514,6 +567,258 @@ static void run_dashboard(WINDOW *window,
     od_hitmap_free(&hit_map);
     od_dashboard_free(&dashboard);
     od_allocation_plan_free(&plan);
+    od_assignments_free(&saved);
+}
+
+static OdStatus scan_now(uint64_t generation,
+                         OdScanSnapshot *snapshot,
+                         OdError *error) {
+    od_scan_snapshot_init(snapshot, generation);
+    OdStatus status = od_scan_host(snapshot, error);
+    if (status == OD_OK) {
+        status = od_docker_scan("docker", 2500U, 4U * 1024U * 1024U,
+                                snapshot, error);
+    }
+    if (status != OD_OK) od_scan_snapshot_free(snapshot);
+    return status;
+}
+
+static bool parse_port_text(const char *text, uint16_t *port) {
+    errno = 0;
+    char *end = NULL;
+    unsigned long numeric = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || numeric == 0UL || numeric > 65535UL) {
+        return false;
+    }
+    *port = (uint16_t)numeric;
+    return true;
+}
+
+static OdStatus review_conflicts(WINDOW *window,
+                                 OdCanvas *canvas,
+                                 bool use_color,
+                                 bool ascii,
+                                 OdResolution *resolution,
+                                 OdError *error) {
+    char status[256] = "Choose explicitly; nothing is saved during review.";
+    while (!od_resolution_done(resolution)) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, error)) return error->code;
+        od_render_conflict_resolution(canvas, resolution, ascii, status);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == 27 || input == 'q' || input == 'Q') return OD_ERROR_CANCELLED;
+        if (input == '\n' || input == '\r' || input == 'a' || input == 'A') {
+            od_resolution_accept(resolution);
+            (void)snprintf(status, sizeof(status), "Recommendation accepted.");
+        } else if (input == 's' || input == 'S') {
+            od_resolution_skip(resolution);
+            (void)snprintf(status, sizeof(status),
+                           "Service skipped; it will not be written to the assignment file.");
+        } else if (input == 'e' || input == 'E') {
+            const OdResolutionItem *item = od_resolution_current(resolution);
+            if (item == NULL) continue;
+            const OdAllocation *allocation =
+                &resolution->plan->items[item->allocation_index];
+            char port_text[16];
+            (void)snprintf(port_text, sizeof(port_text), "%u",
+                           (unsigned)allocation->new_port);
+            if (prompt_text(window, canvas, use_color, ascii,
+                            "Choose a replacement port", "Port number",
+                            port_text, sizeof(port_text))) {
+                uint16_t port;
+                if (!parse_port_text(port_text, &port)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "Port must be a number from 1 to 65535.");
+                } else if (od_resolution_edit(resolution, port, error) != OD_OK) {
+                    (void)snprintf(status, sizeof(status), "%s", error->message);
+                } else {
+                    (void)snprintf(status, sizeof(status),
+                                   "Replacement changed to port %u; Enter accepts it.",
+                                   (unsigned)port);
+                }
+            }
+        } else if (input == KEY_RESIZE) {
+            continue;
+        }
+    }
+    od_error_clear(error);
+    return OD_OK;
+}
+
+static OdStatus review_changes_and_save(WINDOW *window,
+                                        OdCanvas *canvas,
+                                        bool use_color,
+                                        bool ascii,
+                                        const char *project_root,
+                                        const char *profile_path,
+                                        const OdProfile *profile,
+                                        bool import_foreign,
+                                        OdAllocationPlan *plan,
+                                        OdScanSnapshot *snapshot,
+                                        OdError *error) {
+    size_t selected = 0U;
+    char status[256] = "Review the complete diff before saving.";
+    while (true) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, error)) return error->code;
+        od_render_change_review(canvas, profile, plan, selected, ascii, status);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        size_t page_size = height > 12 ? (size_t)(height - 12) : 1U;
+        if (input == 27 || input == 'q' || input == 'Q') return OD_ERROR_CANCELLED;
+        if ((input == KEY_UP || input == 'k') && selected > 0U) {
+            --selected;
+        } else if ((input == KEY_DOWN || input == 'j') && selected + 1U < plan->count) {
+            ++selected;
+        } else if (input == KEY_PPAGE) {
+            selected = selected > page_size ? selected - page_size : 0U;
+        } else if (input == KEY_NPAGE && plan->count > 0U) {
+            size_t maximum = plan->count - 1U;
+            selected = selected > maximum - (selected > maximum ? 0U : selected) ? maximum :
+                       selected + page_size;
+            if (selected > maximum) selected = maximum;
+        } else if (input == KEY_HOME) {
+            selected = 0U;
+        } else if (input == KEY_END && plan->count > 0U) {
+            selected = plan->count - 1U;
+        } else if (input == '\n' || input == '\r' || input == 's' || input == 'S') {
+            (void)snprintf(status, sizeof(status),
+                           "Rescanning and probing ports before the atomic save...");
+            od_render_change_review(canvas, profile, plan, selected, ascii, status);
+            paint_canvas(window, canvas, use_color);
+            OdScanSnapshot fresh;
+            OdStatus verify_status = scan_now(snapshot->generation + 1U, &fresh, error);
+            bool fresh_ready = verify_status == OD_OK;
+            if (verify_status == OD_OK) {
+                verify_status = od_plan_validate_snapshot(profile, plan, &fresh, error);
+            }
+            if (verify_status == OD_OK) {
+                verify_status = od_plan_probe_bindings(profile, plan, error);
+            }
+            if (verify_status != OD_OK) {
+                if (fresh_ready) {
+                    od_scan_snapshot_free(snapshot);
+                    *snapshot = fresh;
+                }
+                return verify_status;
+            }
+            verify_status = import_foreign ?
+                od_project_save_importing_foreign(project_root, profile_path,
+                                                   profile, plan, error) :
+                od_project_save(project_root, profile_path, profile, plan, error);
+            if (verify_status != OD_OK) {
+                od_scan_snapshot_free(&fresh);
+                (void)snprintf(status, sizeof(status), "%s", error->message);
+                continue;
+            }
+            od_scan_snapshot_free(snapshot);
+            *snapshot = fresh;
+            od_error_clear(error);
+            return OD_OK;
+        } else if (input == KEY_RESIZE) {
+            continue;
+        }
+    }
+}
+
+static bool set_assignment_file(OdProfile *profile,
+                                const char *value,
+                                OdError *error) {
+    if (value[0] == '\0' || value[0] == '/' || strstr(value, "..") != NULL) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "alternate output must be a safe project-relative path");
+        return false;
+    }
+    size_t length = strlen(value) + 1U;
+    char *copy = malloc(length);
+    if (copy == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to store alternate output path");
+        return false;
+    }
+    memcpy(copy, value, length);
+    free(profile->assignment_file);
+    profile->assignment_file = copy;
+    return true;
+}
+
+static OdStatus choose_foreign_file_policy(WINDOW *window,
+                                           OdCanvas *canvas,
+                                           bool use_color,
+                                           bool ascii,
+                                           const char *project_root,
+                                           OdProfile *profile,
+                                           OdAssignments *saved,
+                                           bool *import_foreign,
+                                           OdError *error) {
+    char choice[24] = "cancel";
+    if (!prompt_text(window, canvas, use_color, ascii,
+                     "Foreign assignment file detected",
+                     "Type import, alternate, or cancel",
+                     choice, sizeof(choice))) return OD_ERROR_CANCELLED;
+    if (strcmp(choice, "cancel") == 0) return OD_ERROR_CANCELLED;
+    char path[4096];
+    if (!assignment_path(project_root, profile, path, sizeof(path))) {
+        od_error_set(error, OD_ERROR_INVALID, "assignment path is unsafe or too long");
+        return OD_ERROR_INVALID;
+    }
+    if (strcmp(choice, "import") == 0) {
+        OdStatus status = od_assignments_import_file(path, saved, error);
+        if (status == OD_OK) *import_foreign = true;
+        return status;
+    }
+    if (strcmp(choice, "alternate") == 0) {
+        char alternate[256] = ".ports.opendoor.env";
+        if (!prompt_text(window, canvas, use_color, ascii,
+                         "Choose alternate assignment output",
+                         "Project-relative file path",
+                         alternate, sizeof(alternate))) return OD_ERROR_CANCELLED;
+        if (!set_assignment_file(profile, alternate, error)) return error->code;
+        return load_saved_assignments(project_root, profile, saved, error);
+    }
+    od_error_set(error, OD_ERROR_INVALID,
+                 "choose import, alternate, or cancel for the foreign file");
+    return OD_ERROR_INVALID;
+}
+
+static OdStatus run_resolution(WINDOW *window,
+                               OdCanvas *canvas,
+                               bool use_color,
+                               bool ascii,
+                               const char *project_root,
+                               const char *profile_path,
+                               OdProfile *profile,
+                               OdScanSnapshot *snapshot,
+                               OdError *error) {
+    OdAssignments saved;
+    OdStatus status = load_saved_assignments(project_root, profile, &saved, error);
+    bool import_foreign = false;
+    if (status == OD_ERROR_FOREIGN) {
+        status = choose_foreign_file_policy(window, canvas, use_color, ascii,
+                                            project_root, profile, &saved,
+                                            &import_foreign, error);
+    }
+    if (status != OD_OK) return status;
+    OdAllocationPlan plan = {0};
+    status = create_allocation_plan(profile, snapshot, &saved, &plan, error);
+    od_assignments_free(&saved);
+    if (status != OD_OK) return status;
+    OdResolution resolution;
+    status = od_resolution_init(&resolution, profile, snapshot, &plan, error);
+    if (status == OD_OK) {
+        status = review_conflicts(window, canvas, use_color, ascii, &resolution, error);
+    }
+    od_resolution_free(&resolution);
+    if (status == OD_OK) {
+        status = review_changes_and_save(window, canvas, use_color, ascii,
+                                         project_root, profile_path, profile,
+                                         import_foreign,
+                                         &plan, snapshot, error);
+    }
+    od_allocation_plan_free(&plan);
+    return status;
 }
 
 int od_tui_run(const OpendoorOptions *options) {
@@ -575,6 +880,10 @@ int od_tui_run(const OpendoorOptions *options) {
     }
 
     bool configured = profile_exists(options);
+    const char *project_root = options->project_path == NULL ? "." : options->project_path;
+    char default_profile_path[4096];
+    const char *active_profile_path = resolved_profile_path(
+        options, default_profile_path, sizeof(default_profile_path));
     OdProfile session_profile;
     od_profile_init(&session_profile);
     bool session_profile_ready = false;
@@ -632,14 +941,31 @@ int od_tui_run(const OpendoorOptions *options) {
             if (selected == count - 1U) {
                 quit = true;
             } else if (!configured && selected == 0U) {
-                const char *root = options->project_path == NULL ? "." : options->project_path;
                 if (run_onboarding(window, &canvas, use_color, options->force_ascii,
-                                   root, &session_profile)) {
+                                   project_root, &session_profile)) {
                     configured = true;
                     session_profile_ready = true;
                     selected = 0U;
-                    (void)snprintf(status, sizeof(status),
-                                   "Candidate review complete • profile ready for conflict resolution.");
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    OdError workflow_error;
+                    OdStatus workflow_status = active_profile_path == NULL ? OD_ERROR_INVALID :
+                        run_resolution(window, &canvas, use_color, options->force_ascii,
+                                       project_root, active_profile_path, &session_profile,
+                                       &scan.snapshot, &workflow_error);
+                    if (workflow_status == OD_OK) {
+                        (void)snprintf(status, sizeof(status),
+                                       "Profile and assignments saved atomically.");
+                    } else if (workflow_status == OD_ERROR_CANCELLED) {
+                        (void)snprintf(status, sizeof(status),
+                                       "Save cancelled; no assignment changes were written.");
+                    } else {
+                        (void)snprintf(status, sizeof(status), "%s",
+                            active_profile_path == NULL ? "Profile path is too long." :
+                                                          workflow_error.message);
+                    }
                 } else {
                     (void)snprintf(status, sizeof(status),
                                    "Discovery review cancelled; no files were changed.");
@@ -657,8 +983,59 @@ int od_tui_run(const OpendoorOptions *options) {
                         scan_joined = true;
                     }
                     run_dashboard(window, &canvas, use_color, options->force_ascii,
-                                  &session_profile, &scan.snapshot);
+                                  project_root, &session_profile, &scan.snapshot);
                     menu_status(status, sizeof(status), configured, selected);
+                }
+            } else if (configured && selected == 1U) {
+                if (!session_profile_ready || active_profile_path == NULL) {
+                    (void)snprintf(status, sizeof(status),
+                                   "No valid project profile is available.");
+                } else if (!atomic_load(&scan.done)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "The startup scan is still running; try again in a moment.");
+                } else {
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    OdError workflow_error;
+                    OdStatus workflow_status = run_resolution(
+                        window, &canvas, use_color, options->force_ascii,
+                        project_root, active_profile_path, &session_profile,
+                        &scan.snapshot, &workflow_error);
+                    if (workflow_status == OD_OK) {
+                        (void)snprintf(status, sizeof(status),
+                                       "Assignments verified and saved atomically.");
+                    } else if (workflow_status == OD_ERROR_CANCELLED) {
+                        (void)snprintf(status, sizeof(status),
+                                       "Conflict review cancelled; no files were changed.");
+                    } else {
+                        (void)snprintf(status, sizeof(status), "%s", workflow_error.message);
+                    }
+                }
+            } else if (configured && selected == 2U) {
+                if (!atomic_load(&scan.done)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "The startup scan is still running; try again in a moment.");
+                } else {
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    OdScanSnapshot fresh;
+                    OdError refresh_error;
+                    OdStatus refresh_status = scan_now(scan.snapshot.generation + 1U,
+                                                       &fresh, &refresh_error);
+                    if (refresh_status == OD_OK) {
+                        od_scan_snapshot_free(&scan.snapshot);
+                        scan.snapshot = fresh;
+                        (void)snprintf(status, sizeof(status),
+                                       "Scan #%llu complete • %zu warning(s)",
+                                       (unsigned long long)scan.snapshot.generation,
+                                       scan.snapshot.warning_count);
+                    } else {
+                        (void)snprintf(status, sizeof(status), "%s", refresh_error.message);
+                    }
                 }
             } else {
                 menu_status(status, sizeof(status), configured, selected);

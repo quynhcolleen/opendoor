@@ -97,7 +97,11 @@ static OdStatus append_assignment(OdAssignments *assignments,
     return OD_OK;
 }
 
-OdStatus od_assignments_parse(const char *text, size_t length, OdAssignments *assignments, OdError *error) {
+static OdStatus parse_assignments(const char *text,
+                                  size_t length,
+                                  OdAssignments *assignments,
+                                  bool require_marker,
+                                  OdError *error) {
     if (text == NULL || assignments == NULL || length > OD_DOTENV_MAX_BYTES) {
         od_error_set(error, OD_ERROR_INVALID, "assignment input is missing or too large");
         return OD_ERROR_INVALID;
@@ -162,7 +166,8 @@ OdStatus od_assignments_parse(const char *text, size_t length, OdAssignments *as
         status = append_assignment(assignments, variable, (uint16_t)numeric, error);
     }
     free(buffer);
-    if (status == OD_OK && !assignments->compatible_marker && !assignments->opendoor_marker) {
+    if (status == OD_OK && require_marker &&
+        !assignments->compatible_marker && !assignments->opendoor_marker) {
         od_error_set(error, OD_ERROR_FOREIGN, "assignment file has no OpenDoor-compatible marker");
         status = OD_ERROR_FOREIGN;
     }
@@ -172,6 +177,20 @@ OdStatus od_assignments_parse(const char *text, size_t length, OdAssignments *as
         od_error_clear(error);
     }
     return status;
+}
+
+OdStatus od_assignments_parse(const char *text,
+                              size_t length,
+                              OdAssignments *assignments,
+                              OdError *error) {
+    return parse_assignments(text, length, assignments, true, error);
+}
+
+OdStatus od_assignments_import(const char *text,
+                               size_t length,
+                               OdAssignments *assignments,
+                               OdError *error) {
+    return parse_assignments(text, length, assignments, false, error);
 }
 
 OdStatus od_assignments_render(const OdAssignments *assignments,
