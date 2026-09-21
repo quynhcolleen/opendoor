@@ -16,6 +16,13 @@
 
 typedef struct _win_st WINDOW;
 typedef unsigned long mmask_t;
+typedef struct {
+    short id;
+    int x;
+    int y;
+    int z;
+    mmask_t bstate;
+} MEVENT;
 
 WINDOW *initscr(void);
 int endwin(void);
@@ -38,7 +45,9 @@ int use_default_colors(void);
 int has_colors(void);
 int init_pair(short pair, short foreground, short background);
 mmask_t mousemask(mmask_t newmask, mmask_t *oldmask);
+int getmouse(MEVENT *event);
 
+#define OK 0
 #define ERR (-1)
 #define KEY_DOWN 0402
 #define KEY_UP 0403
@@ -52,10 +61,13 @@ mmask_t mousemask(mmask_t newmask, mmask_t *oldmask);
 #define KEY_RESIZE 0632
 #define ALL_MOUSE_EVENTS ((mmask_t)0x1fffffffUL)
 #define REPORT_MOUSE_POSITION ((mmask_t)0x10000000UL)
+#define BUTTON1_CLICKED ((mmask_t)0x00000004UL)
+#define BUTTON1_DOUBLE_CLICKED ((mmask_t)0x00000008UL)
+#define BUTTON4_PRESSED ((mmask_t)0x00200000UL)
+#define BUTTON5_PRESSED ((mmask_t)0x04000000UL)
 #define A_REVERSE 0x00040000
 #define A_BOLD 0x00200000
 #define COLOR_PAIR(number) ((number) << 8)
 #endif
 
 #endif
-

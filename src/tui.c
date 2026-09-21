@@ -1,6 +1,9 @@
 #include "opendoor/tui.h"
 
 #include "curses_compat.h"
+#include "opendoor/allocation.h"
+#include "opendoor/config.h"
+#include "opendoor/dashboard.h"
 #include "opendoor/docker.h"
 #include "opendoor/discovery.h"
 #include "opendoor/onboarding.h"
@@ -91,15 +94,22 @@ static bool initialize_colors(const OdTheme *theme, bool no_color) {
     return true;
 }
 
-static bool profile_exists(const OpendoorOptions *options) {
-    const char *path = options->profile_path;
-    char default_path[4096];
-    if (path == NULL) {
+static const char *resolved_profile_path(const OpendoorOptions *options,
+                                         char *default_path,
+                                         size_t capacity) {
+    if (options->profile_path != NULL) return options->profile_path;
+    {
         const char *root = options->project_path == NULL ? "." : options->project_path;
-        int count = snprintf(default_path, sizeof(default_path), "%s/.opendoor/project.toml", root);
-        if (count < 0 || (size_t)count >= sizeof(default_path)) return false;
-        path = default_path;
+        int count = snprintf(default_path, capacity, "%s/.opendoor/project.toml", root);
+        if (count < 0 || (size_t)count >= capacity) return NULL;
     }
+    return default_path;
+}
+
+static bool profile_exists(const OpendoorOptions *options) {
+    char default_path[4096];
+    const char *path = resolved_profile_path(options, default_path, sizeof(default_path));
+    if (path == NULL) return false;
     struct stat status;
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
@@ -344,6 +354,168 @@ static bool run_onboarding(WINDOW *window,
     return accepted;
 }
 
+static bool create_dashboard(const OdProfile *profile,
+                             const OdScanSnapshot *snapshot,
+                             OdDashboard *dashboard,
+                             OdAllocationPlan *plan,
+                             OdError *error) {
+    size_t occupied_count = snapshot->endpoint_count + snapshot->docker_mapping_count;
+    OdOccupiedPort *occupied = NULL;
+    if (occupied_count > 0U) {
+        occupied = calloc(occupied_count, sizeof(*occupied));
+        if (occupied == NULL) {
+            od_error_set(error, OD_ERROR_MEMORY, "unable to prepare occupied ports");
+            return false;
+        }
+    }
+    size_t output = 0U;
+    for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {
+        occupied[output++] = (OdOccupiedPort){
+            snapshot->endpoints[index].local_port,
+            snapshot->endpoints[index].protocol
+        };
+    }
+    for (size_t index = 0U; index < snapshot->docker_mapping_count; ++index) {
+        occupied[output++] = (OdOccupiedPort){
+            snapshot->docker_mappings[index].host_port,
+            snapshot->docker_mappings[index].protocol
+        };
+    }
+    OdStatus allocation_status = od_allocate(profile, occupied, occupied_count,
+                                              NULL, plan, error);
+    free(occupied);
+    if (allocation_status != OD_OK) return false;
+    OdStatus dashboard_status = od_dashboard_init(dashboard, profile, snapshot, plan, error);
+    if (dashboard_status != OD_OK) {
+        od_allocation_plan_free(plan);
+        return false;
+    }
+    return true;
+}
+
+static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) {
+    dashboard->focused = hit->widget;
+    if (hit->action == OD_HIT_TOGGLE_EXPAND) {
+        od_dashboard_toggle_expand(dashboard);
+    } else if (hit->action == OD_HIT_SELECT_ROW) {
+        switch (hit->widget) {
+            case OD_WIDGET_SERVICES:
+                if (hit->target < dashboard->visible_count) {
+                    dashboard->selected_visible = hit->target;
+                    od_dashboard_move(dashboard, 0);
+                }
+                break;
+            case OD_WIDGET_CONFLICTS:
+                dashboard->conflict_selected = hit->target;
+                od_dashboard_move_focused(dashboard, 0);
+                break;
+            case OD_WIDGET_LISTENERS:
+                dashboard->listener_selected = hit->target;
+                od_dashboard_move_focused(dashboard, 0);
+                break;
+            case OD_WIDGET_DOCKER:
+                dashboard->docker_selected = hit->target;
+                od_dashboard_move_focused(dashboard, 0);
+                break;
+            case OD_WIDGET_COUNT:
+                break;
+        }
+    } else if (hit->action == OD_HIT_SORT_COLUMN &&
+               hit->widget == OD_WIDGET_SERVICES) {
+        od_dashboard_sort(dashboard, dashboard->sort);
+    }
+}
+
+static void run_dashboard(WINDOW *window,
+                          OdCanvas *canvas,
+                          bool use_color,
+                          bool ascii,
+                          const OdProfile *profile,
+                          const OdScanSnapshot *snapshot) {
+    OdDashboard dashboard;
+    OdAllocationPlan plan = {0};
+    OdError error;
+    if (!create_dashboard(profile, snapshot, &dashboard, &plan, &error)) return;
+    OdHitMap hit_map;
+    od_hitmap_init(&hit_map);
+    char status[256];
+    (void)snprintf(status, sizeof(status), "Live scan ready • %zu warning(s)",
+                   snapshot->warning_count);
+    bool done = false;
+    while (!done) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, &error)) break;
+        od_render_dashboard(canvas, &dashboard, ascii, &hit_map, status);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == 27 || input == 'q' || input == 'Q') {
+            done = true;
+        } else if (input == KEY_UP || input == 'k') {
+            od_dashboard_move_focused(&dashboard, -1);
+        } else if (input == KEY_DOWN || input == 'j') {
+            od_dashboard_move_focused(&dashboard, 1);
+        } else if (input == KEY_PPAGE) {
+            od_dashboard_move_focused_page(&dashboard, -1);
+        } else if (input == KEY_NPAGE) {
+            od_dashboard_move_focused_page(&dashboard, 1);
+        } else if (input == KEY_HOME) {
+            od_dashboard_home_focused(&dashboard);
+        } else if (input == KEY_END) {
+            od_dashboard_end_focused(&dashboard);
+        } else if (input == '\t' || input == KEY_RIGHT || input == 'l') {
+            od_dashboard_focus_next(&dashboard, 1);
+        } else if (input == KEY_LEFT || input == 'h') {
+            od_dashboard_focus_next(&dashboard, -1);
+        } else if (input == 'e' || input == 'E' || input == '\n' || input == '\r') {
+            od_dashboard_toggle_expand(&dashboard);
+        } else if (input == '/') {
+            char query[128];
+            (void)snprintf(query, sizeof(query), "%s", dashboard.search);
+            if (prompt_text(window, canvas, use_color, ascii,
+                            "Search services", "Name, group, variable, or status",
+                            query, sizeof(query))) {
+                if (od_dashboard_search(&dashboard, query, &error) == OD_OK) {
+                    (void)snprintf(status, sizeof(status),
+                                   query[0] == '\0' ? "Search cleared." :
+                                                      "Search applied: %.200s",
+                                   query);
+                } else {
+                    (void)snprintf(status, sizeof(status), "%s", error.message);
+                }
+            }
+        } else if (input == 's') {
+            OdServiceSort next = (OdServiceSort)(((unsigned)dashboard.sort + 1U) % 5U);
+            od_dashboard_sort(&dashboard, next);
+            (void)snprintf(status, sizeof(status), "Services sorted by column %u.",
+                           (unsigned)next + 1U);
+        } else if (input == 'S') {
+            od_dashboard_sort(&dashboard, dashboard.sort);
+            (void)snprintf(status, sizeof(status), "Service sort direction reversed.");
+        } else if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    od_dashboard_move_focused(&dashboard, -3);
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    od_dashboard_move_focused(&dashboard, 3);
+                } else if ((event.bstate & (BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED)) != 0U) {
+                    const OdHitRegion *hit = od_hitmap_at(&hit_map, event.x, event.y);
+                    if (hit != NULL) select_mouse_target(&dashboard, hit);
+                }
+            }
+        } else if (input == 'r' || input == 'R') {
+            (void)snprintf(status, sizeof(status),
+                           "Return to the main menu to start a fresh scan.");
+        } else if (input == KEY_RESIZE) {
+            continue;
+        }
+    }
+    od_hitmap_free(&hit_map);
+    od_dashboard_free(&dashboard);
+    od_allocation_plan_free(&plan);
+}
+
 int od_tui_run(const OpendoorOptions *options) {
     (void)setlocale(LC_ALL, "");
     StartupScan scan = {0};
@@ -366,6 +538,7 @@ int od_tui_run(const OpendoorOptions *options) {
     (void)cbreak();
     (void)curs_set(0);
     (void)keypad(window, true);
+    (void)mousemask(ALL_MOUSE_EVENTS, NULL);
     wtimeout(window, 80);
     const OdTheme *theme = od_theme_by_name("midnight");
     bool use_color = initialize_colors(theme, options->no_color);
@@ -405,10 +578,27 @@ int od_tui_run(const OpendoorOptions *options) {
     OdProfile session_profile;
     od_profile_init(&session_profile);
     bool session_profile_ready = false;
+    char profile_error[256] = {0};
+    if (configured) {
+        char default_path[4096];
+        const char *path = resolved_profile_path(options, default_path, sizeof(default_path));
+        OdError load_error;
+        if (path != NULL && od_profile_load(path, &session_profile, &load_error) == OD_OK) {
+            session_profile_ready = true;
+        } else {
+            configured = false;
+            (void)snprintf(profile_error, sizeof(profile_error), "%s",
+                           path == NULL ? "Profile path is too long." : load_error.message);
+        }
+    }
+    bool scan_joined = false;
     size_t selected = 0U;
     bool quit = false;
     char status[256];
     menu_status(status, sizeof(status), configured, selected);
+    if (profile_error[0] != '\0') {
+        (void)snprintf(status, sizeof(status), "Profile not loaded: %.220s", profile_error);
+    }
     while (!quit) {
         int width = getmaxx(window);
         int height = getmaxy(window);
@@ -454,6 +644,22 @@ int od_tui_run(const OpendoorOptions *options) {
                     (void)snprintf(status, sizeof(status),
                                    "Discovery review cancelled; no files were changed.");
                 }
+            } else if (configured && selected == 0U) {
+                if (!session_profile_ready) {
+                    (void)snprintf(status, sizeof(status),
+                                   "No valid project profile is available.");
+                } else if (!atomic_load(&scan.done)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "The startup scan is still running; try again in a moment.");
+                } else {
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    run_dashboard(window, &canvas, use_color, options->force_ascii,
+                                  &session_profile, &scan.snapshot);
+                    menu_status(status, sizeof(status), configured, selected);
+                }
             } else {
                 menu_status(status, sizeof(status), configured, selected);
             }
@@ -463,7 +669,7 @@ int od_tui_run(const OpendoorOptions *options) {
     }
     od_canvas_free(&canvas);
     (void)endwin();
-    (void)pthread_join(scan.thread, NULL);
+    if (!scan_joined) (void)pthread_join(scan.thread, NULL);
     od_scan_snapshot_free(&scan.snapshot);
     if (session_profile_ready) od_profile_free(&session_profile);
     return 0;
