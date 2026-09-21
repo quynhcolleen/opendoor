@@ -46,11 +46,12 @@ def start(binary: str, project: str, config: str) -> tuple[subprocess.Popen[byte
         "XDG_CONFIG_HOME": config,
     })
     process = subprocess.Popen(
-        [binary, "--ascii", "--no-color", "--reduced-motion", "--project", project],
+        [binary, "--ascii", "--no-color", "--reduced-motion"],
         stdin=slave,
         stdout=slave,
         stderr=slave,
         env=environment,
+        cwd=project,
         start_new_session=True,
     )
     os.close(slave)
