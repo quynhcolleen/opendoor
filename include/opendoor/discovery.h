@@ -37,6 +37,15 @@ OdStatus od_discover_compose_text(const char *path,
                                   const char *text,
                                   OdCandidateList *list,
                                   OdError *error);
+OdStatus od_discover_compose_config_json(const char *path,
+                                         const char *text,
+                                         OdCandidateList *list,
+                                         OdError *error);
+OdStatus od_discover_compose_cli(const char *binary,
+                                 const char *project_root,
+                                 unsigned timeout_milliseconds,
+                                 OdCandidateList *list,
+                                 OdError *error);
 OdStatus od_discover_dotenv_text(const char *path,
                                  const char *text,
                                  OdCandidateList *list,

@@ -163,8 +163,9 @@ OdStatus od_allocate(const OdProfile *profile,
             status = OD_ERROR_EXHAUSTED;
             break;
         }
-        OdAllocationReason reason = selected == service->preferred_port ?
-                                    OD_ALLOC_PREFERRED : OD_ALLOC_REASSIGNED;
+        OdAllocationReason reason =
+            (old_port != 0U && old_port != selected) || selected != service->preferred_port ?
+                OD_ALLOC_REASSIGNED : OD_ALLOC_PREFERRED;
         status = fill_allocation(&plan->items[index], service, old_port, selected, reason, error);
         if (status == OD_OK) {
             used[selected] = true;

@@ -19,10 +19,10 @@ typedef enum {
 } OdServiceStatus;
 
 typedef struct {
-    char stable_id[64];
-    char service[128];
-    char group[96];
-    char variable[128];
+    const char *stable_id;
+    const char *service;
+    const char *group;
+    const char *variable;
     uint16_t preferred_port;
     uint16_t selected_port;
     OdServiceStatus status;
@@ -62,7 +62,7 @@ typedef struct {
     size_t *visible_order;
     size_t visible_count;
     size_t selected_visible;
-    char selected_id[64];
+    const char *selected_id;
     size_t page_start;
     size_t page_size;
     char search[128];
@@ -73,12 +73,24 @@ typedef struct {
     size_t conflict_selected;
     size_t conflict_page_start;
     size_t conflict_page_size;
+    size_t *conflict_order;
+    size_t conflict_visible_count;
+    char conflict_search[128];
+    bool conflict_sort_ascending;
     size_t listener_selected;
     size_t listener_page_start;
     size_t listener_page_size;
+    size_t *listener_order;
+    size_t listener_visible_count;
+    char listener_search[128];
+    bool listener_sort_ascending;
     size_t docker_selected;
     size_t docker_page_start;
     size_t docker_page_size;
+    size_t *docker_order;
+    size_t docker_visible_count;
+    char docker_search[128];
+    bool docker_sort_ascending;
     const OdScanSnapshot *snapshot;
     OdDashboardSummary summary;
 } OdDashboard;
@@ -115,7 +127,11 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
 void od_dashboard_free(OdDashboard *dashboard);
 const char *od_service_status_name(OdServiceStatus status);
 OdStatus od_dashboard_search(OdDashboard *dashboard, const char *query, OdError *error);
+OdStatus od_dashboard_search_focused(OdDashboard *dashboard,
+                                     const char *query,
+                                     OdError *error);
 void od_dashboard_sort(OdDashboard *dashboard, OdServiceSort sort);
+void od_dashboard_sort_focused(OdDashboard *dashboard);
 void od_dashboard_move(OdDashboard *dashboard, int rows);
 void od_dashboard_move_page(OdDashboard *dashboard, int pages);
 void od_dashboard_home(OdDashboard *dashboard);
@@ -131,6 +147,8 @@ void od_dashboard_move_focused(OdDashboard *dashboard, int rows);
 void od_dashboard_move_focused_page(OdDashboard *dashboard, int pages);
 void od_dashboard_home_focused(OdDashboard *dashboard);
 void od_dashboard_end_focused(OdDashboard *dashboard);
+void od_dashboard_restore_secondary_selection(OdDashboard *destination,
+                                              const OdDashboard *source);
 void od_hitmap_init(OdHitMap *map);
 void od_hitmap_free(OdHitMap *map);
 const OdHitRegion *od_hitmap_at(const OdHitMap *map, int x, int y);

@@ -1,8 +1,11 @@
 #include "opendoor/app.h"
+#include "opendoor/config.h"
 #include "opendoor/tui.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static bool has_value(int index, int argc) {
@@ -76,6 +79,37 @@ int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options) {
 }
 
 int opendoor_run(const OpendoorOptions *options) {
+    const char *project = options->project_path == NULL ? "." : options->project_path;
+    struct stat project_status;
+    if (stat(project, &project_status) != 0 || !S_ISDIR(project_status.st_mode)) {
+        fprintf(stderr, "opendoor: invalid project directory: %s\n", project);
+        return 3;
+    }
+    char default_profile[4096];
+    const char *profile_path = options->profile_path;
+    if (profile_path == NULL) {
+        int count = snprintf(default_profile, sizeof(default_profile), "%s%s.opendoor/project.toml",
+                             project, project[0] != '\0' &&
+                             project[strlen(project) - 1U] == '/' ? "" : "/");
+        if (count < 0 || (size_t)count >= sizeof(default_profile)) {
+            fputs("opendoor: project profile path is too long\n", stderr);
+            return 3;
+        }
+        profile_path = default_profile;
+    }
+    struct stat profile_status;
+    if (lstat(profile_path, &profile_status) == 0 || options->profile_path != NULL) {
+        OdProfile profile;
+        OdError error;
+        if (od_profile_load(profile_path, &profile, &error) != OD_OK) {
+            fprintf(stderr, "opendoor: %s\n", error.message);
+            return 3;
+        }
+        od_profile_free(&profile);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "opendoor: unable to inspect profile: %s\n", strerror(errno));
+        return 3;
+    }
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         fputs("opendoor: an interactive terminal is required\n", stderr);
         return 4;

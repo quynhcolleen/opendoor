@@ -50,6 +50,8 @@ void od_render_loading(OdCanvas *canvas,
                        bool ascii,
                        size_t warning_count);
 void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii);
+size_t od_menu_page_size(size_t viewport_height, size_t item_count);
+size_t od_menu_page_start(size_t selected, size_t page_size);
 void od_render_onboarding(OdCanvas *canvas,
                           const OdOnboarding *onboarding,
                           bool ascii,

@@ -78,6 +78,15 @@ static void test_process_owner_fixture_and_permission_limit(void) {
         (void)fputs("fixture-api\n", comm);
         (void)fclose(comm);
     }
+    (void)snprintf(path, sizeof(path), "%s/123/cmdline", root);
+    FILE *command = fopen(path, "wb");
+    CHECK(command != NULL);
+    if (command != NULL) {
+        const char arguments[] = "fixture-api\0" "--port\0" "3000\0";
+        CHECK(fwrite(arguments, 1U, sizeof(arguments) - 1U, command) ==
+              sizeof(arguments) - 1U);
+        (void)fclose(command);
+    }
     OdScanSnapshot snapshot;
     OdError error;
     od_scan_snapshot_init(&snapshot, 2U);
@@ -90,6 +99,7 @@ static void test_process_owner_fixture_and_permission_limit(void) {
     CHECK(od_resolve_process_owners(root, &snapshot, &error) == OD_OK);
     CHECK(snapshot.endpoints[0].pid == 123);
     CHECK(strcmp(snapshot.endpoints[0].process, "fixture-api") == 0);
+    CHECK(strcmp(snapshot.endpoints[0].command, "fixture-api --port 3000") == 0);
 
     CHECK(chmod(fd_dir, 0000) == 0);
     snapshot.endpoints[0].pid = 0;
@@ -103,6 +113,8 @@ static void test_process_owner_fixture_and_permission_limit(void) {
     (void)unlink(path);
     (void)rmdir(fd_dir);
     (void)snprintf(path, sizeof(path), "%s/123/comm", root);
+    (void)unlink(path);
+    (void)snprintf(path, sizeof(path), "%s/123/cmdline", root);
     (void)unlink(path);
     (void)rmdir(process_dir);
     (void)rmdir(root);
@@ -129,6 +141,71 @@ static void test_docker_json_lines(void) {
     CHECK(snapshot.docker_mappings[2].protocol == OD_PROTOCOL_UDP);
     CHECK(od_docker_parse_ps_json_lines("{bad json}\n", 11U, &snapshot, &error) == OD_ERROR_INVALID);
     od_scan_snapshot_free(&snapshot);
+}
+
+static void test_docker_ranges_and_long_port_lists(void) {
+    const char *range =
+        "{\"ID\":\"range\",\"Names\":\"range-api\","
+        "\"Ports\":\"0.0.0.0:8000-8003->9000-9003/tcp\",\"Labels\":\"\"}\n";
+    OdScanSnapshot snapshot;
+    OdError error;
+    od_scan_snapshot_init(&snapshot, 1U);
+    CHECK(od_docker_parse_ps_json_lines(range, strlen(range), &snapshot, &error) == OD_OK);
+    CHECK(snapshot.docker_mapping_count == 4U);
+    if (snapshot.docker_mapping_count == 4U) {
+        CHECK(snapshot.docker_mappings[0].host_port == 8000U);
+        CHECK(snapshot.docker_mappings[3].host_port == 8003U);
+        CHECK(snapshot.docker_mappings[3].container_port == 9003U);
+    }
+    od_scan_snapshot_free(&snapshot);
+
+    size_t capacity = 20000U;
+    char *line = calloc(capacity, 1U);
+    CHECK(line != NULL);
+    if (line == NULL) return;
+    size_t used = (size_t)snprintf(line, capacity,
+        "{\"ID\":\"long\",\"Names\":\"many\",\"Ports\":\"");
+    for (unsigned index = 0U; index < 180U; ++index) {
+        int count = snprintf(line + used, capacity - used,
+                             "%s0.0.0.0:%u->80/tcp",
+                             index == 0U ? "" : ", ", 10000U + index);
+        CHECK(count > 0 && (size_t)count < capacity - used);
+        used += (size_t)count;
+    }
+    used += (size_t)snprintf(line + used, capacity - used, "\",\"Labels\":\"\"}\n");
+    od_scan_snapshot_init(&snapshot, 1U);
+    CHECK(od_docker_parse_ps_json_lines(line, used, &snapshot, &error) == OD_OK);
+    CHECK(snapshot.docker_mapping_count == 180U);
+    od_scan_snapshot_free(&snapshot);
+    free(line);
+}
+
+static void test_docker_timeout_includes_child_reaping(void) {
+    char template[] = "/tmp/opendoor-docker-timeout-XXXXXX";
+    int descriptor = mkstemp(template);
+    CHECK(descriptor >= 0);
+    if (descriptor < 0) return;
+    const char script[] = "#!/bin/sh\nexec 1>&- 2>&-\nsleep 1\n";
+    CHECK(write(descriptor, script, sizeof(script) - 1U) ==
+          (ssize_t)(sizeof(script) - 1U));
+    CHECK(close(descriptor) == 0);
+    CHECK(chmod(template, 0700) == 0);
+
+    OdScanSnapshot snapshot;
+    OdError error;
+    od_scan_snapshot_init(&snapshot, 1U);
+    struct timespec started;
+    struct timespec finished;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
+    CHECK(od_docker_scan(template, 25U, 4096U, &snapshot, &error) == OD_OK);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &finished) == 0);
+    double elapsed = (double)(finished.tv_sec - started.tv_sec) +
+                     (double)(finished.tv_nsec - started.tv_nsec) / 1000000000.0;
+    CHECK(elapsed < 0.5);
+    CHECK(!snapshot.docker_available);
+    CHECK(snapshot.warning_count == 1U);
+    od_scan_snapshot_free(&snapshot);
+    (void)unlink(template);
 }
 
 static void test_docker_absent_is_nonfatal(void) {
@@ -274,6 +351,60 @@ static void test_project_discovery_and_merge(void) {
     od_candidate_list_free(&make_candidates);
 }
 
+static void test_compose_literals_normalized_config_and_cli(void) {
+    const char *literal =
+        "services:\n"
+        "  api:\n"
+        "    ports:\n"
+        "      - \"3000:80\"\n";
+    const char *normalized =
+        "{\"services\":{\"web\":{\"ports\":["
+        "{\"target\":80,\"published\":\"5173\",\"protocol\":\"tcp\"},"
+        "{\"target\":53,\"published\":\"5353\",\"protocol\":\"udp\"}]}}}";
+    OdCandidateList candidates;
+    OdError error;
+    od_candidate_list_init(&candidates);
+    CHECK(od_discover_compose_text("compose.yaml", literal, &candidates, &error) == OD_OK);
+    CHECK(candidates.count == 1U);
+    if (candidates.count == 1U) {
+        CHECK(candidates.items[0].port == 3000U);
+        CHECK(strcmp(candidates.items[0].variable, "API_PORT") == 0);
+    }
+    CHECK(od_discover_compose_config_json("compose-config", normalized,
+                                           &candidates, &error) == OD_OK);
+    CHECK(candidates.count == 3U);
+    if (candidates.count == 3U) {
+        CHECK(candidates.items[1].port == 5173U);
+        CHECK(candidates.items[1].protocols == OD_PROTOCOL_TCP);
+        CHECK(candidates.items[2].port == 5353U);
+        CHECK(candidates.items[2].protocols == OD_PROTOCOL_UDP);
+    }
+    od_candidate_list_free(&candidates);
+
+    char root[] = "/tmp/opendoor-compose-cli-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char script_path[512];
+    (void)snprintf(script_path, sizeof(script_path), "%s/docker", root);
+    FILE *script = fopen(script_path, "wb");
+    CHECK(script != NULL);
+    if (script != NULL) {
+        (void)fputs("#!/bin/sh\n"
+                    "test \"$1 $2 $3 $4\" = \"compose config --format json\" || exit 2\n"
+                    "test \"$5\" = \"--no-interpolate\" || exit 2\n"
+                    "printf '%s' '{\"services\":{\"worker\":{\"ports\":[{\"target\":90,\"published\":\"9090\",\"protocol\":\"tcp\"}]}}}'\n",
+                    script);
+        (void)fclose(script);
+    }
+    CHECK(chmod(script_path, 0700) == 0);
+    od_candidate_list_init(&candidates);
+    CHECK(od_discover_compose_cli(script_path, root, 500U,
+                                  &candidates, &error) == OD_OK);
+    CHECK(candidates.count == 1U && candidates.items[0].port == 9090U);
+    od_candidate_list_free(&candidates);
+    (void)unlink(script_path);
+    (void)rmdir(root);
+}
+
 static void test_project_directory_discovery(void) {
     char root[] = "/tmp/opendoor-project-XXXXXX";
     CHECK(mkdtemp(root) != NULL);
@@ -334,16 +465,53 @@ static void test_project_directory_discovery(void) {
     (void)rmdir(root);
 }
 
+static void test_project_discovery_skips_foreign_ports_env(void) {
+    char root[] = "/tmp/opendoor-foreign-ports-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char path[512];
+    (void)snprintf(path, sizeof(path), "%s/.ports.env", root);
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("FOREIGN_PORT=7000\n", file);
+        (void)fclose(file);
+    }
+    OdCandidateList candidates;
+    OdError error;
+    od_candidate_list_init(&candidates);
+    CHECK(od_discover_project(root, &candidates, &error) == OD_OK);
+    CHECK(candidates.count == 0U);
+    od_candidate_list_free(&candidates);
+
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("PORTS_CONFIGURED=1\nAPI_PORT=7000\n", file);
+        (void)fclose(file);
+    }
+    od_candidate_list_init(&candidates);
+    CHECK(od_discover_project(root, &candidates, &error) == OD_OK);
+    CHECK(candidates.count == 1U);
+    if (candidates.count == 1U) CHECK(candidates.items[0].port == 7000U);
+    od_candidate_list_free(&candidates);
+    (void)unlink(path);
+    (void)rmdir(root);
+}
+
 int main(void) {
     test_proc_tcp_udp_ipv4_ipv6_and_deduplication();
     test_socket_inode_target();
     test_process_owner_fixture_and_permission_limit();
     test_docker_json_lines();
+    test_docker_ranges_and_long_port_lists();
+    test_docker_timeout_includes_child_reaping();
     test_docker_absent_is_nonfatal();
     test_many_docker_containers();
     test_many_proc_sockets_stay_interactive();
     test_project_discovery_and_merge();
+    test_compose_literals_normalized_config_and_cli();
     test_project_directory_discovery();
+    test_project_discovery_skips_foreign_ports_env();
     if (failures != 0) {
         fprintf(stderr, "%d discovery checks failed\n", failures);
         return 1;

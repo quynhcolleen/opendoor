@@ -30,13 +30,56 @@ static size_t valid_utf8_length(const char *text, size_t available) {
     return 0U;
 }
 
+static uint32_t utf8_codepoint(const char *text, size_t length) {
+    const unsigned char *bytes = (const unsigned char *)text;
+    if (length == 1U) return bytes[0];
+    if (length == 2U) return ((uint32_t)(bytes[0] & 0x1fU) << 6U) |
+                              (uint32_t)(bytes[1] & 0x3fU);
+    if (length == 3U) return ((uint32_t)(bytes[0] & 0x0fU) << 12U) |
+                              ((uint32_t)(bytes[1] & 0x3fU) << 6U) |
+                              (uint32_t)(bytes[2] & 0x3fU);
+    return ((uint32_t)(bytes[0] & 0x07U) << 18U) |
+           ((uint32_t)(bytes[1] & 0x3fU) << 12U) |
+           ((uint32_t)(bytes[2] & 0x3fU) << 6U) |
+           (uint32_t)(bytes[3] & 0x3fU);
+}
+
+static size_t codepoint_columns(uint32_t codepoint) {
+    if ((codepoint >= 0x0300U && codepoint <= 0x036fU) ||
+        (codepoint >= 0x1ab0U && codepoint <= 0x1affU) ||
+        (codepoint >= 0x1dc0U && codepoint <= 0x1dffU) ||
+        (codepoint >= 0x20d0U && codepoint <= 0x20ffU) ||
+        (codepoint >= 0xfe00U && codepoint <= 0xfe0fU) ||
+        (codepoint >= 0xfe20U && codepoint <= 0xfe2fU) ||
+        (codepoint >= 0xe0100U && codepoint <= 0xe01efU) || codepoint == 0x200dU) {
+        return 0U;
+    }
+    if (codepoint >= 0x1100U &&
+        (codepoint <= 0x115fU || codepoint == 0x2329U || codepoint == 0x232aU ||
+         (codepoint >= 0x2e80U && codepoint <= 0xa4cfU && codepoint != 0x303fU) ||
+         (codepoint >= 0xac00U && codepoint <= 0xd7a3U) ||
+         (codepoint >= 0xf900U && codepoint <= 0xfaffU) ||
+         (codepoint >= 0xfe10U && codepoint <= 0xfe19U) ||
+         (codepoint >= 0xfe30U && codepoint <= 0xfe6fU) ||
+         (codepoint >= 0xff00U && codepoint <= 0xff60U) ||
+         (codepoint >= 0xffe0U && codepoint <= 0xffe6U) ||
+         (codepoint >= 0x1f300U && codepoint <= 0x1faffU) ||
+         (codepoint >= 0x20000U && codepoint <= 0x3fffdU))) return 2U;
+    return 1U;
+}
+
 static size_t text_columns(const char *text) {
     size_t columns = 0U;
     size_t total = strlen(text);
     for (size_t index = 0U; index < total && text[index] != '\n';) {
         size_t length = valid_utf8_length(text + index, total - index);
-        index += length == 0U ? 1U : length;
-        ++columns;
+        if (length == 0U) {
+            ++index;
+            ++columns;
+        } else {
+            columns += codepoint_columns(utf8_codepoint(text + index, length));
+            index += length;
+        }
     }
     return columns;
 }
@@ -111,18 +154,52 @@ void od_canvas_write(OdCanvas *canvas,
     size_t index = 0U;
     size_t total = strlen(text);
     while (index < total && text[index] != '\n' && column < maximum_columns) {
-        int destination_x = x + (int)column;
-        if (destination_x >= (int)canvas->width) break;
         size_t length = valid_utf8_length(text + index, total - index);
-        if (length == 0U) length = 1U;
+        size_t width = 1U;
+        if (length == 0U) {
+            length = 1U;
+        } else {
+            width = codepoint_columns(utf8_codepoint(text + index, length));
+        }
+        if (width == 0U) {
+            if (column > 0U) {
+                int previous_x = x + (int)column - 1;
+                while (previous_x >= x) {
+                    OdCell *previous = &canvas->cells[(size_t)y * canvas->width +
+                                                     (size_t)previous_x];
+                    size_t used = strlen(previous->glyph);
+                    if (used > 0U) {
+                        if (used + length < sizeof(previous->glyph)) {
+                            memcpy(previous->glyph + used, text + index, length);
+                            previous->glyph[used + length] = '\0';
+                        }
+                        break;
+                    }
+                    --previous_x;
+                }
+            }
+            index += length;
+            continue;
+        }
+        int destination_x = x + (int)column;
+        if (destination_x >= (int)canvas->width ||
+            width > maximum_columns - column ||
+            (width == 2U && destination_x + 1 >= (int)canvas->width)) break;
         if (destination_x >= 0) {
             char glyph[OD_CELL_BYTES] = {0};
             if (length >= sizeof(glyph)) length = 1U;
             memcpy(glyph, text + index, length);
             od_canvas_put(canvas, destination_x, y, glyph, role, attributes);
+            if (width == 2U) {
+                OdCell *continuation_cell =
+                    &canvas->cells[(size_t)y * canvas->width + (size_t)(destination_x + 1)];
+                continuation_cell->glyph[0] = '\0';
+                continuation_cell->role = role;
+                continuation_cell->attributes = attributes;
+            }
         }
         index += length;
-        ++column;
+        column += width;
     }
 }
 
@@ -135,6 +212,20 @@ void od_canvas_write_centered(OdCanvas *canvas,
     size_t columns = text_columns(text);
     int x = columns >= canvas->width ? 0 : (int)((canvas->width - columns) / 2U);
     od_canvas_write(canvas, x, y, text, canvas->width, role, attributes);
+}
+
+size_t od_page_target(size_t selected, size_t count, size_t page_size, int pages) {
+    if (count == 0U) return 0U;
+    if (selected >= count) selected = count - 1U;
+    if (page_size == 0U || pages == 0) return selected;
+    unsigned magnitude = pages < 0 ? (unsigned)(-(long long)pages) : (unsigned)pages;
+    size_t distance = page_size;
+    if (magnitude > 1U) {
+        distance = distance > SIZE_MAX / magnitude ? SIZE_MAX : distance * magnitude;
+    }
+    if (pages < 0) return distance > selected ? 0U : selected - distance;
+    size_t remaining = count - 1U - selected;
+    return selected + (distance > remaining ? remaining : distance);
 }
 
 void od_canvas_box(OdCanvas *canvas,

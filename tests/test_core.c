@@ -203,6 +203,36 @@ static void test_allocation(void) {
     od_profile_free(&profile);
 }
 
+static void test_conflicting_saved_port_is_a_reassignment(void) {
+    OdProfile profile;
+    OdError error;
+    od_profile_init(&profile);
+    profile.project_name = strdup("saved conflict");
+    profile.assignment_file = strdup(".ports.env");
+    profile.port_min = 3000U;
+    profile.port_max = 3010U;
+    OdService service = make_service("api", "API_PORT", 3000U);
+    CHECK(od_profile_add_service(&profile, &service, &error) == OD_OK);
+
+    OdAssignments saved;
+    od_assignments_init(&saved);
+    saved.items = calloc(1U, sizeof(*saved.items));
+    saved.count = 1U;
+    saved.items[0].variable = strdup("API_PORT");
+    saved.items[0].port = 3001U;
+    OdOccupiedPort occupied = {3001U, OD_PROTOCOL_TCP};
+    OdAllocationPlan plan = {0};
+    CHECK(od_allocate(&profile, &occupied, 1U, &saved, &plan, &error) == OD_OK);
+    CHECK(plan.count == 1U);
+    CHECK(plan.items[0].old_port == 3001U);
+    CHECK(plan.items[0].new_port == 3000U);
+    CHECK(plan.items[0].reason == OD_ALLOC_REASSIGNED);
+
+    od_allocation_plan_free(&plan);
+    od_assignments_free(&saved);
+    od_profile_free(&profile);
+}
+
 static void test_allocation_exhaustion(void) {
     OdProfile profile;
     OdError error;
@@ -247,7 +277,7 @@ static void test_allocation_preferred_reserved_duplicate_and_stale(void) {
     CHECK(plan.count == 2U);
     CHECK(plan.items[0].old_port == 4999U);
     CHECK(plan.items[0].new_port == 5000U);
-    CHECK(plan.items[0].reason == OD_ALLOC_PREFERRED);
+    CHECK(plan.items[0].reason == OD_ALLOC_REASSIGNED);
     CHECK(plan.items[1].old_port == 5001U);
     CHECK(plan.items[1].new_port == 5003U);
     CHECK(plan.items[1].reason == OD_ALLOC_REASSIGNED);
@@ -308,6 +338,7 @@ int main(void) {
     test_settings();
     test_dotenv_contract();
     test_allocation();
+    test_conflicting_saved_port_is_a_reassignment();
     test_allocation_exhaustion();
     test_allocation_preferred_reserved_duplicate_and_stale();
     test_large_congested_allocation_stays_interactive();

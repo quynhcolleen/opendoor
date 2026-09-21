@@ -87,6 +87,15 @@ void od_render_loading(OdCanvas *canvas,
                              "Esc Skip animation", OD_ROLE_MUTED, 0U);
 }
 
+size_t od_menu_page_size(size_t viewport_height, size_t item_count) {
+    size_t available = viewport_height > 14U ? viewport_height - 14U : 1U;
+    return available < item_count ? available : item_count;
+}
+
+size_t od_menu_page_start(size_t selected, size_t page_size) {
+    return page_size == 0U ? 0U : selected / page_size * page_size;
+}
+
 void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii) {
     static const char *const first_run[] = {
         "Discover this project",
@@ -124,20 +133,31 @@ void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii) {
                                           sizeof(first_run) / sizeof(first_run[0]);
     int box_width = 50;
     if ((size_t)box_width > canvas->width - 4U) box_width = (int)canvas->width - 4;
-    int box_height = (int)item_count + 4;
+    size_t visible_count = od_menu_page_size(canvas->height, item_count);
+    size_t page_start = od_menu_page_start(view->selected_item, visible_count);
+    size_t page_end = page_start + visible_count;
+    if (page_end > item_count) page_end = item_count;
+    int box_height = (int)visible_count + 4;
     int box_x = ((int)canvas->width - box_width) / 2;
-    int box_y = 9;
+    int box_y = 8;
     od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
                   OD_ROLE_FOCUSED_BORDER);
-    for (size_t index = 0U; index < item_count; ++index) {
+    for (size_t index = page_start; index < page_end; ++index) {
         char line[96];
         bool selected = index == view->selected_item;
         (void)snprintf(line, sizeof(line), "%s %s", selected ? ">" : " ", items[index]);
-        od_canvas_write(canvas, box_x + 2, box_y + 2 + (int)index, line,
+        od_canvas_write(canvas, box_x + 2,
+                        box_y + 2 + (int)(index - page_start), line,
                         (size_t)(box_width - 4),
                         selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
                         selected ? 1U : 0U);
     }
+    char page[64];
+    size_t page_count = (item_count + visible_count - 1U) / visible_count;
+    (void)snprintf(page, sizeof(page), "Menu page %zu/%zu",
+                   page_start / visible_count + 1U, page_count);
+    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page,
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
     if (view->status != NULL) {
         od_canvas_write(canvas, 1, (int)canvas->height - 2, view->status,
                         canvas->width - 2U, OD_ROLE_MUTED, 0U);
@@ -392,17 +412,12 @@ void od_render_dashboard(OdCanvas *canvas,
         size_t rows__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                         \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_CONFLICTS, rows__); \
         size_t conflict_ordinal__ = 0U;                                            \
-        size_t total__ = 0U;                                                       \
-        for (size_t count_index__ = 0U; count_index__ < dashboard->service_count; \
-             ++count_index__) {                                                    \
-            if (dashboard->services[count_index__].conflict) ++total__;            \
-        }                                                                          \
+        size_t total__ = dashboard->conflict_visible_count;                        \
         size_t end__ = dashboard->conflict_page_start + rows__;                   \
         if (end__ > total__) end__ = total__;                                      \
-        for (size_t row_index__ = 0U; row_index__ < dashboard->service_count;     \
-             ++row_index__) {                                                      \
-            const OdServiceRow *row__ = &dashboard->services[row_index__];          \
-            if (!row__->conflict) continue;                                        \
+        for (size_t visible__ = 0U; visible__ < total__; ++visible__) {             \
+            const OdServiceRow *row__ =                                             \
+                &dashboard->services[dashboard->conflict_order[visible__]];         \
             if (conflict_ordinal__ < dashboard->conflict_page_start ||             \
                 conflict_ordinal__ >= end__) {                                     \
                 ++conflict_ordinal__;                                              \
@@ -443,11 +458,12 @@ void od_render_dashboard(OdCanvas *canvas,
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_LISTENERS,          \
                                           capacity__);                             \
         size_t start__ = dashboard->listener_page_start;                          \
-        if (start__ >= dashboard->snapshot->endpoint_count) start__ = 0U;          \
+        if (start__ >= dashboard->listener_visible_count) start__ = 0U;             \
         for (size_t offset__ = 0U; offset__ < capacity__ &&                        \
-             start__ + offset__ < dashboard->snapshot->endpoint_count; ++offset__) {\
+             start__ + offset__ < dashboard->listener_visible_count; ++offset__) { \
             const OdEndpoint *endpoint__ =                                         \
-                &dashboard->snapshot->endpoints[start__ + offset__];               \
+                &dashboard->snapshot->endpoints[                                   \
+                    dashboard->listener_order[start__ + offset__]];                \
             char line__[384];                                                      \
             (void)snprintf(line__, sizeof(line__), "%s %s:%u  %s%s%ld",          \
                 endpoint__->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP",          \
@@ -466,11 +482,13 @@ void od_render_dashboard(OdCanvas *canvas,
             ADD_HIT((X) + 1, line_y__, (W) - 2, 1, OD_HIT_SELECT_ROW,              \
                     OD_WIDGET_LISTENERS, start__ + offset__);                      \
         }                                                                          \
-        if (dashboard->snapshot->endpoint_count == 0U)                             \
-            od_canvas_write(canvas, (X) + 2, (Y) + 2, "No host listeners found",  \
+        if (dashboard->listener_visible_count == 0U)                               \
+            od_canvas_write(canvas, (X) + 2, (Y) + 2,                              \
+                            dashboard->listener_search[0] == '\0' ?                \
+                                "No host listeners found" : "No listeners match",\
                             (size_t)((W) > 4 ? (W) - 4 : 0), OD_ROLE_MUTED, 0U);   \
         char page__[64];                                                           \
-        size_t total__ = dashboard->snapshot->endpoint_count;                      \
+        size_t total__ = dashboard->listener_visible_count;                        \
         (void)snprintf(page__, sizeof(page__), "Page %zu/%zu  %zu listener(s)",   \
             total__ == 0U ? 0U : start__ / capacity__ + 1U,                       \
             total__ == 0U ? 0U : (total__ + capacity__ - 1U) / capacity__, total__);\
@@ -485,12 +503,13 @@ void od_render_dashboard(OdCanvas *canvas,
         size_t capacity__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                     \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_DOCKER, capacity__);\
         size_t start__ = dashboard->docker_page_start;                            \
-        if (start__ >= dashboard->snapshot->docker_mapping_count) start__ = 0U;    \
+        if (start__ >= dashboard->docker_visible_count) start__ = 0U;              \
         for (size_t offset__ = 0U; offset__ < capacity__ &&                        \
-             start__ + offset__ < dashboard->snapshot->docker_mapping_count;       \
+             start__ + offset__ < dashboard->docker_visible_count;                 \
              ++offset__) {                                                         \
             const OdDockerMapping *mapping__ =                                     \
-                &dashboard->snapshot->docker_mappings[start__ + offset__];          \
+                &dashboard->snapshot->docker_mappings[                             \
+                    dashboard->docker_order[start__ + offset__]];                  \
             char line__[320];                                                      \
             (void)snprintf(line__, sizeof(line__), "%s  %s:%u -> %u/%s",         \
                 mapping__->container,                                              \
@@ -507,13 +526,15 @@ void od_render_dashboard(OdCanvas *canvas,
             ADD_HIT((X) + 1, line_y__, (W) - 2, 1, OD_HIT_SELECT_ROW,              \
                     OD_WIDGET_DOCKER, start__ + offset__);                         \
         }                                                                          \
-        if (dashboard->snapshot->docker_mapping_count == 0U)                       \
+        if (dashboard->docker_visible_count == 0U)                                 \
             od_canvas_write(canvas, (X) + 2, (Y) + 2,                              \
-                            dashboard->snapshot->docker_available ?                \
-                                "No published Docker ports" : "Docker unavailable",\
+                            dashboard->docker_search[0] != '\0' ?                  \
+                                "No Docker mappings match" :                      \
+                                (dashboard->snapshot->docker_available ?           \
+                                    "No published Docker ports" : "Docker unavailable"),\
                             (size_t)((W) > 4 ? (W) - 4 : 0), OD_ROLE_MUTED, 0U);   \
         char page__[64];                                                           \
-        size_t total__ = dashboard->snapshot->docker_mapping_count;                \
+        size_t total__ = dashboard->docker_visible_count;                          \
         (void)snprintf(page__, sizeof(page__), "Page %zu/%zu  %zu mapping(s)",    \
             total__ == 0U ? 0U : start__ / capacity__ + 1U,                       \
             total__ == 0U ? 0U : (total__ + capacity__ - 1U) / capacity__, total__);\
@@ -535,7 +556,7 @@ void od_render_dashboard(OdCanvas *canvas,
     if (dashboard->expanded) {
         DRAW_WIDGET(dashboard->focused, 1, content_y, (int)canvas->width - 2,
                     content_height);
-    } else if (canvas->width >= 120U) {
+    } else if (canvas->height >= 21U && canvas->width >= 120U) {
         int available_width = (int)canvas->width - 3;
         int service_width = (available_width * 2) / 3;
         int secondary_x = 2 + service_width;
@@ -549,7 +570,7 @@ void od_render_dashboard(OdCanvas *canvas,
                        secondary_width, second_height);
         DRAW_DOCKER(secondary_x, content_y + first_height + second_height,
                     secondary_width, third_height);
-    } else if (canvas->width >= 80U) {
+    } else if (canvas->height >= 21U && canvas->width >= 80U) {
         int primary_height = (content_height * 2) / 3;
         int secondary_height = content_height - primary_height;
         OdDashboardWidget secondary = dashboard->focused == OD_WIDGET_SERVICES ?
@@ -589,13 +610,8 @@ void od_render_dashboard(OdCanvas *canvas,
 }
 
 static const OdServiceRow *selected_conflict(const OdDashboard *dashboard) {
-    size_t ordinal = 0U;
-    for (size_t index = 0U; index < dashboard->service_count; ++index) {
-        if (!dashboard->services[index].conflict) continue;
-        if (ordinal == dashboard->conflict_selected) return &dashboard->services[index];
-        ++ordinal;
-    }
-    return NULL;
+    if (dashboard->conflict_selected >= dashboard->conflict_visible_count) return NULL;
+    return &dashboard->services[dashboard->conflict_order[dashboard->conflict_selected]];
 }
 
 static void append_detail(char *text,
@@ -683,12 +699,13 @@ static void build_dashboard_detail(const OdDashboard *dashboard,
     }
     if (dashboard->focused == OD_WIDGET_LISTENERS) {
         (void)snprintf(title, title_capacity, "Listener details");
-        if (dashboard->listener_selected >= dashboard->snapshot->endpoint_count) {
+        if (dashboard->listener_selected >= dashboard->listener_visible_count) {
             append_detail(text, text_capacity, &used, "Selection", "No row selected");
             return;
         }
         const OdEndpoint *endpoint =
-            &dashboard->snapshot->endpoints[dashboard->listener_selected];
+            &dashboard->snapshot->endpoints[
+                dashboard->listener_order[dashboard->listener_selected]];
         append_detail(text, text_capacity, &used, "Stable ID", endpoint->stable_id);
         append_detail(text, text_capacity, &used, "Protocol",
                       endpoint->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP");
@@ -711,12 +728,13 @@ static void build_dashboard_detail(const OdDashboard *dashboard,
         return;
     }
     (void)snprintf(title, title_capacity, "Docker mapping details");
-    if (dashboard->docker_selected >= dashboard->snapshot->docker_mapping_count) {
+    if (dashboard->docker_selected >= dashboard->docker_visible_count) {
         append_detail(text, text_capacity, &used, "Selection", "No row selected");
         return;
     }
     const OdDockerMapping *mapping =
-        &dashboard->snapshot->docker_mappings[dashboard->docker_selected];
+        &dashboard->snapshot->docker_mappings[
+            dashboard->docker_order[dashboard->docker_selected]];
     append_detail(text, text_capacity, &used, "Container", mapping->container);
     append_detail(text, text_capacity, &used, "Container ID", mapping->container_id);
     append_detail(text, text_capacity, &used, "Compose project", mapping->project);
@@ -916,7 +934,7 @@ void od_render_conflict_resolution(OdCanvas *canvas,
                         canvas->width - 4U, OD_ROLE_MUTED, 0U);
     }
     od_canvas_write(canvas, 1, (int)canvas->height - 1,
-                    "Enter Accept  e Edit port  s Skip  Esc Cancel",
+                    "[Accept Enter] [Edit e] [Skip s] [Cancel Esc]",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
 }
 
@@ -993,7 +1011,7 @@ void od_render_change_review(OdCanvas *canvas,
                         canvas->width - 4U, OD_ROLE_MUTED, 0U);
     }
     od_canvas_write(canvas, 1, (int)canvas->height - 1,
-                    "Up/Down Select  PgUp/PgDn Page  Enter Save  Esc Cancel",
+                    "[Save Enter] [Cancel Esc]  Up/Down Select  PgUp/PgDn Page",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
 }
 

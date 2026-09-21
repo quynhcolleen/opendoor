@@ -30,3 +30,18 @@ $binary </dev/null >/dev/null 2>&1
 status=$?
 set -e
 [[ $status -eq 4 ]]
+
+set +e
+$binary --profile /definitely/missing/opendoor-profile.toml </dev/null >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 3 ]]
+
+invalid_profile=$(mktemp /tmp/opendoor-invalid-profile-XXXXXX)
+printf '%s\n' 'schema_version = 99' >"$invalid_profile"
+set +e
+$binary --profile "$invalid_profile" </dev/null >/dev/null 2>&1
+status=$?
+set -e
+rm -f "$invalid_profile"
+[[ $status -eq 3 ]]

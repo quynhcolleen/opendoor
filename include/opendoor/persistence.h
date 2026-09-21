@@ -37,5 +37,7 @@ OdStatus od_project_save_importing_foreign(const char *project_root,
 OdStatus od_project_reset_assignments(const char *project_root,
                                       const OdProfile *profile,
                                       OdError *error);
+bool od_assignment_appears_ignored(const char *project_root,
+                                   const char *relative_path);
 
 #endif

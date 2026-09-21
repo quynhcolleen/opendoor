@@ -98,6 +98,18 @@ static bool parse_decimal_port(const char *value, uint16_t *port) {
     return true;
 }
 
+static bool parse_port_range(char *value, uint16_t *first, uint16_t *last) {
+    char *dash = strchr(value, '-');
+    if (dash == NULL) {
+        if (!parse_decimal_port(value, first)) return false;
+        *last = *first;
+        return true;
+    }
+    *dash = '\0';
+    return parse_decimal_port(value, first) && parse_decimal_port(dash + 1, last) &&
+           *last >= *first;
+}
+
 static OdStatus add_mapping(OdScanSnapshot *snapshot,
                             const OdDockerMapping *mapping,
                             OdError *error) {
@@ -227,18 +239,35 @@ static OdStatus parse_port_entry(char *entry,
             ++bind;
         }
     }
-    OdDockerMapping mapping = {0};
-    if (!parse_decimal_port(host_port_text, &mapping.host_port) ||
-        !parse_decimal_port(container, &mapping.container_port)) {
+    uint16_t host_first;
+    uint16_t host_last;
+    uint16_t container_first;
+    uint16_t container_last;
+    if (!parse_port_range(host_port_text, &host_first, &host_last) ||
+        !parse_port_range(container, &container_first, &container_last)) {
         return OD_OK;
     }
-    mapping.protocol = protocol;
-    (void)snprintf(mapping.bind_address, sizeof(mapping.bind_address), "%s", bind);
-    (void)snprintf(mapping.container_id, sizeof(mapping.container_id), "%s", id);
-    (void)snprintf(mapping.container, sizeof(mapping.container), "%s", name);
-    (void)snprintf(mapping.project, sizeof(mapping.project), "%s", project);
-    (void)snprintf(mapping.service, sizeof(mapping.service), "%s", service);
-    return add_mapping(snapshot, &mapping, error);
+    unsigned host_count = (unsigned)host_last - (unsigned)host_first + 1U;
+    unsigned container_count = (unsigned)container_last - (unsigned)container_first + 1U;
+    if (host_count != container_count) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "Docker published and container port ranges differ");
+        return OD_ERROR_INVALID;
+    }
+    OdStatus status = OD_OK;
+    for (unsigned offset = 0U; offset < host_count && status == OD_OK; ++offset) {
+        OdDockerMapping mapping = {0};
+        mapping.host_port = (uint16_t)((unsigned)host_first + offset);
+        mapping.container_port = (uint16_t)((unsigned)container_first + offset);
+        mapping.protocol = protocol;
+        (void)snprintf(mapping.bind_address, sizeof(mapping.bind_address), "%s", bind);
+        (void)snprintf(mapping.container_id, sizeof(mapping.container_id), "%s", id);
+        (void)snprintf(mapping.container, sizeof(mapping.container), "%s", name);
+        (void)snprintf(mapping.project, sizeof(mapping.project), "%s", project);
+        (void)snprintf(mapping.service, sizeof(mapping.service), "%s", service);
+        status = add_mapping(snapshot, &mapping, error);
+    }
+    return status;
 }
 
 static OdStatus parse_json_line(char *line, OdScanSnapshot *snapshot, OdError *error) {
@@ -253,11 +282,17 @@ static OdStatus parse_json_line(char *line, OdScanSnapshot *snapshot, OdError *e
     }
     char id[80] = {0};
     char name[128] = {0};
-    char ports[2048] = {0};
+    size_t line_length = strlen(line);
+    char *ports = calloc(line_length + 1U, 1U);
     char labels[4096] = {0};
+    if (ports == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to retain Docker port mappings");
+        return OD_ERROR_MEMORY;
+    }
     if (!json_string_field(line, tokens, token_count, "ID", id, sizeof(id)) ||
         !json_string_field(line, tokens, token_count, "Names", name, sizeof(name)) ||
-        !json_string_field(line, tokens, token_count, "Ports", ports, sizeof(ports))) {
+        !json_string_field(line, tokens, token_count, "Ports", ports, line_length + 1U)) {
+        free(ports);
         od_error_set(error, OD_ERROR_INVALID, "Docker JSON row is missing required fields");
         return OD_ERROR_INVALID;
     }
@@ -273,6 +308,7 @@ static OdStatus parse_json_line(char *line, OdScanSnapshot *snapshot, OdError *e
          entry = strtok_r(NULL, ",", &save)) {
         status = parse_port_entry(entry, id, name, project, service, snapshot, error);
     }
+    free(ports);
     return status;
 }
 
@@ -414,7 +450,28 @@ OdStatus od_docker_scan(const char *binary,
         (void)kill(child, SIGKILL);
     }
     int child_status = 0;
-    while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+    bool reaped = false;
+    while (!reaped) {
+        pid_t waited = waitpid(child, &child_status, WNOHANG);
+        if (waited == child) {
+            reaped = true;
+            break;
+        }
+        if (waited < 0 && errno != EINTR) {
+            reaped = true;
+            break;
+        }
+        if (!timed_out && monotonic_milliseconds() >= deadline) {
+            timed_out = true;
+            (void)kill(child, SIGTERM);
+            (void)kill(child, SIGKILL);
+        }
+        struct timespec pause = {0, 5000000L};
+        (void)nanosleep(&pause, NULL);
+    }
+    if (timed_out && !reaped) {
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+        }
     }
     output[length] = '\0';
     if (timed_out) {

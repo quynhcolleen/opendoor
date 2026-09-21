@@ -149,6 +149,105 @@ static void test_selection_survives_sort_search_and_pages(void) {
     od_profile_free(&profile);
 }
 
+static void test_dashboard_shows_conflicting_saved_port_not_proposal(void) {
+    OdProfile profile;
+    OdScanSnapshot snapshot;
+    OdAllocationPlan plan;
+    make_dashboard_inputs(&profile, &snapshot, &plan);
+    plan.items[0].old_port = 3001U;
+    plan.items[0].new_port = 3002U;
+    plan.items[0].reason = OD_ALLOC_REASSIGNED;
+    snapshot.endpoints[0].local_port = 3001U;
+
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_dashboard_init(&dashboard, &profile, &snapshot, &plan, &error) == OD_OK);
+    CHECK(dashboard.services[0].selected_port == 3001U);
+    CHECK(dashboard.services[0].status == OD_SERVICE_IN_USE);
+    CHECK(dashboard.services[0].conflict);
+    CHECK(dashboard.summary.conflicts >= 1U);
+
+    od_dashboard_free(&dashboard);
+    od_allocation_plan_free(&plan);
+    od_scan_snapshot_free(&snapshot);
+    od_profile_free(&profile);
+}
+
+static void test_secondary_selection_restores_by_stable_identity(void) {
+    OdProfile old_profile;
+    OdScanSnapshot old_snapshot;
+    OdAllocationPlan old_plan;
+    make_dashboard_inputs(&old_profile, &old_snapshot, &old_plan);
+    (void)strcpy(old_snapshot.endpoints[0].stable_id, "listener-a");
+    (void)strcpy(old_snapshot.endpoints[1].stable_id, "listener-b");
+    (void)strcpy(old_snapshot.endpoints[2].stable_id, "listener-c");
+    OdDashboard old_dashboard;
+    OdError error;
+    CHECK(od_dashboard_init(&old_dashboard, &old_profile, &old_snapshot,
+                            &old_plan, &error) == OD_OK);
+    old_dashboard.listener_selected = 2U;
+    old_dashboard.listener_page_size = 2U;
+
+    OdProfile new_profile;
+    OdScanSnapshot new_snapshot;
+    OdAllocationPlan new_plan;
+    make_dashboard_inputs(&new_profile, &new_snapshot, &new_plan);
+    OdEndpoint temporary = new_snapshot.endpoints[0];
+    new_snapshot.endpoints[0] = new_snapshot.endpoints[2];
+    new_snapshot.endpoints[2] = temporary;
+    (void)strcpy(new_snapshot.endpoints[0].stable_id, "listener-c");
+    (void)strcpy(new_snapshot.endpoints[1].stable_id, "listener-b");
+    (void)strcpy(new_snapshot.endpoints[2].stable_id, "listener-a");
+    OdDashboard new_dashboard;
+    CHECK(od_dashboard_init(&new_dashboard, &new_profile, &new_snapshot,
+                            &new_plan, &error) == OD_OK);
+    od_dashboard_restore_secondary_selection(&new_dashboard, &old_dashboard);
+    CHECK(new_dashboard.listener_selected < new_dashboard.listener_visible_count);
+    CHECK(new_dashboard.listener_order[new_dashboard.listener_selected] == 0U);
+    CHECK(strcmp(new_snapshot.endpoints[
+                     new_dashboard.listener_order[new_dashboard.listener_selected]].stable_id,
+                 "listener-c") == 0);
+
+    od_dashboard_free(&new_dashboard);
+    od_allocation_plan_free(&new_plan);
+    od_scan_snapshot_free(&new_snapshot);
+    od_profile_free(&new_profile);
+    od_dashboard_free(&old_dashboard);
+    od_allocation_plan_free(&old_plan);
+    od_scan_snapshot_free(&old_snapshot);
+    od_profile_free(&old_profile);
+}
+
+static void test_search_and_sort_follow_focused_widget(void) {
+    OdProfile profile;
+    OdScanSnapshot snapshot;
+    OdAllocationPlan plan;
+    make_dashboard_inputs(&profile, &snapshot, &plan);
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_dashboard_init(&dashboard, &profile, &snapshot, &plan, &error) == OD_OK);
+
+    dashboard.focused = OD_WIDGET_LISTENERS;
+    CHECK(od_dashboard_search_focused(&dashboard, "foreign-api", &error) == OD_OK);
+    CHECK(dashboard.listener_visible_count == 1U);
+    CHECK(dashboard.listener_order[0] == 0U);
+    CHECK(dashboard.visible_count == profile.service_count);
+    CHECK(od_dashboard_search_focused(&dashboard, "", &error) == OD_OK);
+    od_dashboard_sort_focused(&dashboard);
+    CHECK(dashboard.listener_order[0] == 2U);
+
+    dashboard.focused = OD_WIDGET_DOCKER;
+    CHECK(od_dashboard_search_focused(&dashboard, "demo-db", &error) == OD_OK);
+    CHECK(dashboard.docker_visible_count == 1U);
+    CHECK(od_dashboard_search_focused(&dashboard, "does-not-exist", &error) == OD_OK);
+    CHECK(dashboard.docker_visible_count == 0U);
+
+    od_dashboard_free(&dashboard);
+    od_allocation_plan_free(&plan);
+    od_scan_snapshot_free(&snapshot);
+    od_profile_free(&profile);
+}
+
 static size_t count_newlines(const char *text) {
     size_t count = 0U;
     for (size_t index = 0U; text[index] != '\0'; ++index) {
@@ -202,6 +301,9 @@ static void test_responsive_dashboard_snapshots_and_focus(void) {
         return;
     }
     render_and_check(&dashboard, 132U, 32U, "Host listeners", "Live scan ready");
+    dashboard.focused = OD_WIDGET_LISTENERS;
+    render_and_check(&dashboard, 120U, 18U, "127.0.0.1:4000", "Short viewport");
+    dashboard.focused = OD_WIDGET_SERVICES;
     render_and_check(&dashboard, 100U, 26U, "Services", "Medium layout");
     dashboard.focused = OD_WIDGET_DOCKER;
     render_and_check(&dashboard, 70U, 22U, "Docker mappings", "Compact layout");
@@ -248,6 +350,14 @@ static void test_detail_view_wraps_full_values_across_internal_pages(void) {
     memcpy(snapshot.endpoints[0].executable + marker_offset, marker, sizeof(marker));
     (void)strcpy(snapshot.endpoints[0].command,
                  "server --listen 0.0.0.0 --port 3000 --mode integration");
+    char long_service_name[320];
+    memset(long_service_name, 'n', sizeof(long_service_name) - 1U);
+    long_service_name[0] = 'A';
+    memcpy(long_service_name + sizeof(long_service_name) - 18U,
+           "FULL-SERVICE-TAIL", 18U);
+    long_service_name[sizeof(long_service_name) - 1U] = '\0';
+    free(profile.services[0].name);
+    profile.services[0].name = duplicate(long_service_name);
 
     OdDashboard dashboard;
     OdError error;
@@ -279,6 +389,22 @@ static void test_detail_view_wraps_full_values_across_internal_pages(void) {
         free(rendered);
     }
     CHECK(marker_prefix_found && marker_suffix_found);
+
+    dashboard.focused = OD_WIDGET_SERVICES;
+    od_dashboard_home(&dashboard);
+    pages = od_render_dashboard_detail(&canvas, &dashboard, 0U, true);
+    bool full_service_marker_found = false;
+    bool full_service_tail_found = false;
+    for (size_t page = 0U; page < pages; ++page) {
+        (void)od_render_dashboard_detail(&canvas, &dashboard, page, true);
+        char *rendered = od_canvas_to_text(&canvas, &error);
+        if (rendered != NULL && strstr(rendered, "FULL-") != NULL)
+            full_service_marker_found = true;
+        if (rendered != NULL && strstr(rendered, "TAIL") != NULL)
+            full_service_tail_found = true;
+        free(rendered);
+    }
+    CHECK(full_service_marker_found && full_service_tail_found);
     od_canvas_free(&canvas);
     od_dashboard_free(&dashboard);
     od_allocation_plan_free(&plan);
@@ -317,6 +443,9 @@ static void test_profile_editor_is_paginated_inside_one_viewport(void) {
 
 int main(void) {
     test_selection_survives_sort_search_and_pages();
+    test_dashboard_shows_conflicting_saved_port_not_proposal();
+    test_secondary_selection_restores_by_stable_identity();
+    test_search_and_sort_follow_focused_widget();
     test_responsive_dashboard_snapshots_and_focus();
     test_detail_view_wraps_full_values_across_internal_pages();
     test_profile_editor_is_paginated_inside_one_viewport();

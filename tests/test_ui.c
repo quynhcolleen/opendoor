@@ -62,6 +62,18 @@ static void test_main_menu_snapshot(void) {
         free(text);
     }
     od_canvas_free(&canvas);
+
+    CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
+    view = (OdMenuView){"demo", true, 6U, "Quit without changes"};
+    od_render_main_menu(&canvas, &view, true);
+    text = od_canvas_to_text(&canvas, &error);
+    CHECK(text != NULL && newline_count(text) == 18U);
+    CHECK(text != NULL && strstr(text, "> Quit") != NULL);
+    CHECK(text != NULL && strstr(text, "Menu page 2/2") != NULL);
+    CHECK(text != NULL && strstr(text, "Quit without changes") != NULL);
+    CHECK(text != NULL && strstr(text, "Up/Down Navigate") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
 }
 
 static void test_loading_and_resize_snapshots(void) {
@@ -122,6 +134,23 @@ static void test_terminal_text_is_sanitized(void) {
     od_canvas_free(&canvas);
 }
 
+static void test_wide_and_combining_text_respects_terminal_columns(void) {
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 8U, 2U, &error) == OD_OK);
+    od_canvas_clear(&canvas, OD_ROLE_DEFAULT);
+    od_canvas_write(&canvas, 0, 0, "A界B", 8U, OD_ROLE_DEFAULT, 0U);
+    CHECK(strcmp(canvas.cells[0].glyph, "A") == 0);
+    CHECK(strcmp(canvas.cells[1].glyph, "界") == 0);
+    CHECK(canvas.cells[2].glyph[0] == '\0');
+    CHECK(strcmp(canvas.cells[3].glyph, "B") == 0);
+
+    od_canvas_write(&canvas, 0, 1, "e\xcc\x81x", 8U, OD_ROLE_DEFAULT, 0U);
+    CHECK(strcmp(canvas.cells[0 + canvas.width].glyph, "e\xcc\x81") == 0);
+    CHECK(strcmp(canvas.cells[1 + canvas.width].glyph, "x") == 0);
+    od_canvas_free(&canvas);
+}
+
 static void test_midnight_theme(void) {
     const OdTheme *theme = od_theme_by_name("midnight");
     CHECK(theme != NULL);
@@ -133,13 +162,23 @@ static void test_midnight_theme(void) {
     CHECK(theme->foreground[OD_ROLE_DANGER] == 1);
 }
 
+static void test_page_target_clamps_without_skipping_rows(void) {
+    CHECK(od_page_target(60U, 100U, 12U, 1) == 72U);
+    CHECK(od_page_target(96U, 100U, 12U, 1) == 99U);
+    CHECK(od_page_target(5U, 100U, 12U, -1) == 0U);
+    CHECK(od_page_target(24U, 100U, 12U, -1) == 12U);
+    CHECK(od_page_target(0U, 0U, 12U, 1) == 0U);
+}
+
 int main(void) {
     test_canvas_is_exactly_one_viewport();
     test_main_menu_snapshot();
     test_loading_and_resize_snapshots();
     test_unicode_and_ascii_boxes();
     test_terminal_text_is_sanitized();
+    test_wide_and_combining_text_respects_terminal_columns();
     test_midnight_theme();
+    test_page_target_clamps_without_skipping_rows();
     if (failures != 0) {
         fprintf(stderr, "%d UI checks failed\n", failures);
         return 1;

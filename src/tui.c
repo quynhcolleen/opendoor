@@ -37,6 +37,10 @@ typedef struct {
     atomic_int stage;
     atomic_bool done;
     atomic_size_t warning_count;
+    const char *project_root;
+    OdCandidateList candidates;
+    OdError discovery_error;
+    OdStatus discovery_status;
     OdScanSnapshot snapshot;
     OdError error;
     OdStatus status;
@@ -121,6 +125,9 @@ static uint64_t monotonic_milliseconds(void) {
 static void *startup_scan_main(void *argument) {
     StartupScan *scan = argument;
     atomic_store(&scan->stage, OD_LOAD_PROJECT_FILES);
+    scan->discovery_status = od_discover_project(scan->project_root,
+                                                 &scan->candidates,
+                                                 &scan->discovery_error);
     atomic_store(&scan->stage, OD_LOAD_KERNEL_SOCKETS);
     scan->status = od_scan_host(&scan->snapshot, &scan->error);
     atomic_store(&scan->warning_count, scan->snapshot.warning_count);
@@ -149,6 +156,7 @@ static void paint_canvas(WINDOW *window, const OdCanvas *canvas, bool use_color)
     for (size_t y = 0U; y < canvas->height; ++y) {
         for (size_t x = 0U; x < canvas->width; ++x) {
             const OdCell *cell = &canvas->cells[y * canvas->width + x];
+            if (cell->glyph[0] == '\0') continue;
             (void)wattrset(window, canvas_attributes(cell, use_color));
             (void)wmove(window, (int)y, (int)x);
             (void)waddnstr(window, cell->glyph, -1);
@@ -268,7 +276,7 @@ static bool prompt_text(WINDOW *window,
         if (termination_requested()) return false;
         if (input == 27) return false;
         if (input == '\n' || input == '\r') return true;
-        if (input == 127 || input == 8) {
+        if (input == KEY_BACKSPACE || input == 127 || input == 8) {
             if (length > 0U) value[--length] = '\0';
         } else if (input >= 0 && input <= 255 && isprint((unsigned char)input) &&
                    length + 1U < capacity) {
@@ -696,24 +704,16 @@ static bool run_onboarding(WINDOW *window,
                            bool use_color,
                            bool ascii,
                            const char *project_root,
+                           const OdCandidateList *discovered,
                            OdProfile *profile) {
-    OdCandidateList candidates;
     OdError error;
-    od_candidate_list_init(&candidates);
-    OdStatus discovery_status = od_discover_project(project_root, &candidates, &error);
-    if (discovery_status != OD_OK) {
-        od_candidate_list_free(&candidates);
-        return false;
-    }
     int height = getmaxy(window);
     size_t page_size = height > 14 ? (size_t)(height - 12) : 1U;
     OdOnboarding onboarding;
-    if (od_onboarding_init(&onboarding, &candidates, page_size,
+    if (od_onboarding_init(&onboarding, discovered, page_size,
                            1024U, 65535U, &error) != OD_OK) {
-        od_candidate_list_free(&candidates);
         return false;
     }
-    od_candidate_list_free(&candidates);
     char status[256] = "Review every candidate before continuing.";
     bool finished = false;
     bool accepted = false;
@@ -927,6 +927,8 @@ static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) 
 
 static OdStatus scan_now(uint64_t generation,
                          OdScanSnapshot *snapshot,
+                         const atomic_bool *cancel,
+                         atomic_int *stage,
                          OdError *error);
 
 static bool apply_dashboard_snapshot(const char *project_root,
@@ -955,16 +957,14 @@ static bool apply_dashboard_snapshot(const char *project_root,
         return false;
     }
 
-    char selected_id[64];
     char search[128];
-    (void)snprintf(selected_id, sizeof(selected_id), "%s", dashboard->selected_id);
+    const char *selected_id = dashboard->selected_id;
     (void)snprintf(search, sizeof(search), "%s", dashboard->search);
     OdServiceSort sort = dashboard->sort;
     bool ascending = dashboard->sort_ascending;
     OdDashboardWidget focused = dashboard->focused;
     bool expanded = dashboard->expanded;
-    (void)snprintf(new_dashboard.selected_id, sizeof(new_dashboard.selected_id), "%s",
-                   selected_id);
+    new_dashboard.selected_id = selected_id;
     if (od_dashboard_search(&new_dashboard, search, &error) != OD_OK) {
         od_dashboard_free(&new_dashboard);
         od_allocation_plan_free(&new_plan);
@@ -974,6 +974,7 @@ static bool apply_dashboard_snapshot(const char *project_root,
     }
     if (sort != OD_SERVICE_SORT_NAME) od_dashboard_sort(&new_dashboard, sort);
     if (!ascending) od_dashboard_sort(&new_dashboard, sort);
+    od_dashboard_restore_secondary_selection(&new_dashboard, dashboard);
     new_dashboard.focused = focused;
     new_dashboard.expanded = expanded;
 
@@ -995,6 +996,8 @@ static bool apply_dashboard_snapshot(const char *project_root,
 typedef struct {
     pthread_t thread;
     atomic_bool done;
+    atomic_bool cancel;
+    atomic_int stage;
     bool active;
     OdScanSnapshot snapshot;
     OdError error;
@@ -1004,7 +1007,8 @@ typedef struct {
 static void *dashboard_refresh_main(void *argument) {
     DashboardRefresh *refresh = argument;
     refresh->status = scan_now(refresh->snapshot.generation,
-                               &refresh->snapshot, &refresh->error);
+                               &refresh->snapshot, &refresh->cancel,
+                               &refresh->stage, &refresh->error);
     atomic_store(&refresh->done, true);
     return NULL;
 }
@@ -1016,6 +1020,8 @@ static bool dashboard_refresh_start(DashboardRefresh *refresh,
     *refresh = (DashboardRefresh){0};
     od_scan_snapshot_init(&refresh->snapshot, generation);
     atomic_init(&refresh->done, false);
+    atomic_init(&refresh->cancel, false);
+    atomic_init(&refresh->stage, OD_LOAD_KERNEL_SOCKETS);
     if (pthread_create(&refresh->thread, NULL, dashboard_refresh_main, refresh) != 0) {
         od_scan_snapshot_free(&refresh->snapshot);
         od_error_set(error, OD_ERROR_IO, "unable to start background refresh");
@@ -1023,6 +1029,59 @@ static bool dashboard_refresh_start(DashboardRefresh *refresh,
     }
     refresh->active = true;
     return true;
+}
+
+static OdStatus run_scan_interactive(WINDOW *window,
+                                     OdCanvas *canvas,
+                                     bool use_color,
+                                     bool ascii,
+                                     uint64_t generation,
+                                     OdScanSnapshot *snapshot,
+                                     OdError *error) {
+    DashboardRefresh refresh = {0};
+    if (!dashboard_refresh_start(&refresh, generation, error)) return error->code;
+    uint64_t started = monotonic_milliseconds();
+    unsigned frame = 0U;
+    bool cancelling = false;
+    while (!atomic_load(&refresh.done)) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, error)) {
+            atomic_store(&refresh.cancel, true);
+            cancelling = true;
+        } else if (width < 60 || height < 18) {
+            od_render_resize_required(canvas);
+            paint_canvas(window, canvas, use_color);
+        } else {
+            uint64_t elapsed = monotonic_milliseconds() - started;
+            od_render_loading(canvas,
+                              (OdLoadingStage)atomic_load(&refresh.stage),
+                              frame++,
+                              elapsed > UINT32_MAX ? UINT32_MAX : (unsigned)elapsed,
+                              false, ascii, 0U);
+            if (cancelling) {
+                od_canvas_write(canvas, 2, (int)canvas->height - 2,
+                                "Cancelling scan safely...",
+                                canvas->width - 4U, OD_ROLE_WARNING, 0U);
+            }
+            paint_canvas(window, canvas, use_color);
+        }
+        int input = wgetch(window);
+        if (termination_requested() || input == 27 || input == 'q' || input == 'Q') {
+            atomic_store(&refresh.cancel, true);
+            cancelling = true;
+        }
+    }
+    (void)pthread_join(refresh.thread, NULL);
+    refresh.active = false;
+    if (refresh.status == OD_OK) {
+        *snapshot = refresh.snapshot;
+        refresh.snapshot = (OdScanSnapshot){0};
+    } else {
+        *error = refresh.error;
+    }
+    od_scan_snapshot_free(&refresh.snapshot);
+    return refresh.status;
 }
 
 static void run_dashboard_detail(WINDOW *window,
@@ -1093,6 +1152,7 @@ static void run_dashboard(WINDOW *window,
                    snapshot->warning_count);
     uint64_t last_refresh = monotonic_milliseconds();
     DashboardRefresh refresh = {0};
+    bool pending_refresh = false;
     bool done = false;
     while (!done) {
         if (refresh.active && atomic_load(&refresh.done)) {
@@ -1104,10 +1164,19 @@ static void run_dashboard(WINDOW *window,
                                               &dashboard, status, sizeof(status))) {
                     od_scan_snapshot_free(&refresh.snapshot);
                 }
-            } else {
+            } else if (refresh.status != OD_ERROR_CANCELLED) {
                 (void)snprintf(status, sizeof(status), "%s", refresh.error.message);
             }
             last_refresh = monotonic_milliseconds();
+            if (pending_refresh) {
+                pending_refresh = false;
+                if (dashboard_refresh_start(&refresh, snapshot->generation + 1U, &error)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "Starting the latest requested refresh...");
+                } else {
+                    (void)snprintf(status, sizeof(status), "%s", error.message);
+                }
+            }
         }
         uint64_t now = monotonic_milliseconds();
         if (settings->auto_refresh && !refresh.active &&
@@ -1156,11 +1225,19 @@ static void run_dashboard(WINDOW *window,
                            "Details closed • selection and focus preserved.");
         } else if (input == '/') {
             char query[128];
-            (void)snprintf(query, sizeof(query), "%s", dashboard.search);
+            const char *active_query = dashboard.focused == OD_WIDGET_SERVICES ? dashboard.search :
+                (dashboard.focused == OD_WIDGET_CONFLICTS ? dashboard.conflict_search :
+                 (dashboard.focused == OD_WIDGET_LISTENERS ? dashboard.listener_search :
+                                                             dashboard.docker_search));
+            static const char *const search_titles[] = {
+                "Search services", "Search conflicts", "Search listeners", "Search Docker mappings"
+            };
+            (void)snprintf(query, sizeof(query), "%s", active_query);
             if (prompt_text(window, canvas, use_color, ascii,
-                            "Search services", "Name, group, variable, or status",
+                            search_titles[(size_t)dashboard.focused],
+                            "Search fields in the focused table",
                             query, sizeof(query))) {
-                if (od_dashboard_search(&dashboard, query, &error) == OD_OK) {
+                if (od_dashboard_search_focused(&dashboard, query, &error) == OD_OK) {
                     (void)snprintf(status, sizeof(status),
                                    query[0] == '\0' ? "Search cleared." :
                                                       "Search applied: %.200s",
@@ -1170,13 +1247,15 @@ static void run_dashboard(WINDOW *window,
                 }
             }
         } else if (input == 's') {
-            OdServiceSort next = (OdServiceSort)(((unsigned)dashboard.sort + 1U) % 5U);
-            od_dashboard_sort(&dashboard, next);
-            (void)snprintf(status, sizeof(status), "Services sorted by column %u.",
-                           (unsigned)next + 1U);
+            od_dashboard_sort_focused(&dashboard);
+            (void)snprintf(status, sizeof(status), "Focused table sort changed.");
         } else if (input == 'S') {
-            od_dashboard_sort(&dashboard, dashboard.sort);
-            (void)snprintf(status, sizeof(status), "Service sort direction reversed.");
+            if (dashboard.focused == OD_WIDGET_SERVICES) {
+                od_dashboard_sort(&dashboard, dashboard.sort);
+            } else {
+                od_dashboard_sort_focused(&dashboard);
+            }
+            (void)snprintf(status, sizeof(status), "Focused table sort direction reversed.");
         } else if (input == '?') {
             run_help(window, canvas, use_color, ascii);
             (void)snprintf(status, sizeof(status),
@@ -1195,8 +1274,10 @@ static void run_dashboard(WINDOW *window,
             }
         } else if (input == 'r' || input == 'R') {
             if (refresh.active) {
+                atomic_store(&refresh.cancel, true);
+                pending_refresh = true;
                 (void)snprintf(status, sizeof(status),
-                               "Refresh already in progress • navigation remains available.");
+                               "Cancelling the obsolete scan; latest refresh is queued.");
             } else if (dashboard_refresh_start(&refresh, snapshot->generation + 1U, &error)) {
                 (void)snprintf(status, sizeof(status),
                                "Refresh in progress • navigation remains available.");
@@ -1208,6 +1289,7 @@ static void run_dashboard(WINDOW *window,
         }
     }
     if (refresh.active) {
+        atomic_store(&refresh.cancel, true);
         (void)pthread_join(refresh.thread, NULL);
         od_scan_snapshot_free(&refresh.snapshot);
     }
@@ -1246,13 +1328,31 @@ static void run_listener_explorer(WINDOW *window,
 
 static OdStatus scan_now(uint64_t generation,
                          OdScanSnapshot *snapshot,
+                         const atomic_bool *cancel,
+                         atomic_int *stage,
                          OdError *error) {
     od_scan_snapshot_init(snapshot, generation);
+    if (cancel != NULL && atomic_load(cancel)) {
+        od_scan_snapshot_free(snapshot);
+        od_error_set(error, OD_ERROR_CANCELLED, "scan generation cancelled");
+        return OD_ERROR_CANCELLED;
+    }
+    if (stage != NULL) atomic_store(stage, OD_LOAD_KERNEL_SOCKETS);
     OdStatus status = od_scan_host(snapshot, error);
+    if (status == OD_OK && cancel != NULL && atomic_load(cancel)) {
+        status = OD_ERROR_CANCELLED;
+        od_error_set(error, status, "scan generation cancelled");
+    }
     if (status == OD_OK) {
+        if (stage != NULL) atomic_store(stage, OD_LOAD_DOCKER);
         status = od_docker_scan("docker", 2500U, 4U * 1024U * 1024U,
                                 snapshot, error);
     }
+    if (status == OD_OK && cancel != NULL && atomic_load(cancel)) {
+        status = OD_ERROR_CANCELLED;
+        od_error_set(error, status, "scan generation cancelled");
+    }
+    if (stage != NULL) atomic_store(stage, OD_LOAD_RECONCILIATION);
     if (status != OD_OK) od_scan_snapshot_free(snapshot);
     return status;
 }
@@ -1282,6 +1382,17 @@ static OdStatus review_conflicts(WINDOW *window,
         od_render_conflict_resolution(canvas, resolution, ascii, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK &&
+                (event.bstate & BUTTON1_CLICKED) != 0U &&
+                event.y == height - 1) {
+                if (event.x >= 1 && event.x < 15) input = '\n';
+                else if (event.x >= 16 && event.x < 24) input = 'e';
+                else if (event.x >= 25 && event.x < 33) input = 's';
+                else if (event.x >= 34 && event.x < 46) input = 27;
+            }
+        }
         if (termination_requested()) return OD_ERROR_CANCELLED;
         if (input == 27 || input == 'q' || input == 'Q') return OD_ERROR_CANCELLED;
         if (input == '\n' || input == '\r' || input == 'a' || input == 'A') {
@@ -1344,18 +1455,35 @@ static OdStatus review_changes_and_save(WINDOW *window,
         int input = wgetch(window);
         if (termination_requested()) return OD_ERROR_CANCELLED;
         size_t page_size = height > 12 ? (size_t)(height - 12) : 1U;
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    input = KEY_PPAGE;
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    input = KEY_NPAGE;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U) {
+                    if (event.y == height - 1) {
+                        if (event.x >= 1 && event.x < 13) input = '\n';
+                        else if (event.x >= 14 && event.x < 26) input = 27;
+                    } else if (event.y >= 6 && event.y < 6 + (int)page_size) {
+                        size_t page_start = (selected / page_size) * page_size;
+                        size_t target = page_start + (size_t)(event.y - 6);
+                        if (target < plan->count) selected = target;
+                        input = ERR;
+                    }
+                }
+            }
+        }
         if (input == 27 || input == 'q' || input == 'Q') return OD_ERROR_CANCELLED;
         if ((input == KEY_UP || input == 'k') && selected > 0U) {
             --selected;
         } else if ((input == KEY_DOWN || input == 'j') && selected + 1U < plan->count) {
             ++selected;
         } else if (input == KEY_PPAGE) {
-            selected = selected > page_size ? selected - page_size : 0U;
+            selected = od_page_target(selected, plan->count, page_size, -1);
         } else if (input == KEY_NPAGE && plan->count > 0U) {
-            size_t maximum = plan->count - 1U;
-            selected = selected > maximum - (selected > maximum ? 0U : selected) ? maximum :
-                       selected + page_size;
-            if (selected > maximum) selected = maximum;
+            selected = od_page_target(selected, plan->count, page_size, 1);
         } else if (input == KEY_HOME) {
             selected = 0U;
         } else if (input == KEY_END && plan->count > 0U) {
@@ -1366,7 +1494,9 @@ static OdStatus review_changes_and_save(WINDOW *window,
             od_render_change_review(canvas, profile, plan, selected, ascii, status);
             paint_canvas(window, canvas, use_color);
             OdScanSnapshot fresh;
-            OdStatus verify_status = scan_now(snapshot->generation + 1U, &fresh, error);
+            OdStatus verify_status = run_scan_interactive(
+                window, canvas, use_color, ascii,
+                snapshot->generation + 1U, &fresh, error);
             bool fresh_ready = verify_status == OD_OK;
             if (verify_status == OD_OK) {
                 verify_status = od_plan_validate_snapshot(profile, plan, &fresh, error);
@@ -1631,7 +1761,9 @@ static bool run_profile_editor(WINDOW *window,
                 *profile = draft;
                 draft = (OdProfile){0};
                 (void)snprintf(result, result_capacity,
-                               "Project profile and assignments saved atomically.");
+                    od_assignment_appears_ignored(project_root, profile->assignment_file) ?
+                        "Project profile and assignments saved atomically." :
+                        "Saved atomically; warning: assignment file appears unignored.");
                 saved = true;
                 done = true;
             } else if (save_status == OD_ERROR_CANCELLED) {
@@ -1648,6 +1780,7 @@ static bool run_profile_editor(WINDOW *window,
 
 int od_tui_run(const OpendoorOptions *options) {
     (void)setlocale(LC_ALL, "");
+    const char *project_root = options->project_path == NULL ? "." : options->project_path;
     OdSettings settings;
     od_settings_defaults(&settings);
     char settings_path[4096];
@@ -1685,12 +1818,15 @@ int od_tui_run(const OpendoorOptions *options) {
     SignalState signal_state;
     if (!signal_state_install(&signal_state)) return 5;
     StartupScan scan = {0};
+    scan.project_root = project_root;
+    od_candidate_list_init(&scan.candidates);
     od_scan_snapshot_init(&scan.snapshot, 1U);
     atomic_init(&scan.stage, OD_LOAD_PROJECT_FILES);
     atomic_init(&scan.done, false);
     atomic_init(&scan.warning_count, 0U);
     if (pthread_create(&scan.thread, NULL, startup_scan_main, &scan) != 0) {
         od_scan_snapshot_free(&scan.snapshot);
+        od_candidate_list_free(&scan.candidates);
         signal_state_restore(&signal_state);
         return 5;
     }
@@ -1699,6 +1835,7 @@ int od_tui_run(const OpendoorOptions *options) {
     if (window == NULL) {
         (void)pthread_join(scan.thread, NULL);
         od_scan_snapshot_free(&scan.snapshot);
+        od_candidate_list_free(&scan.candidates);
         signal_state_restore(&signal_state);
         return 5;
     }
@@ -1721,6 +1858,7 @@ int od_tui_run(const OpendoorOptions *options) {
             (void)endwin();
             (void)pthread_join(scan.thread, NULL);
             od_scan_snapshot_free(&scan.snapshot);
+            od_candidate_list_free(&scan.candidates);
             signal_state_restore(&signal_state);
             return 5;
         }
@@ -1747,7 +1885,6 @@ int od_tui_run(const OpendoorOptions *options) {
     }
 
     bool configured = profile_exists(options);
-    const char *project_root = options->project_path == NULL ? "." : options->project_path;
     char default_profile_path[4096];
     const char *active_profile_path = resolved_profile_path(
         options, default_profile_path, sizeof(default_profile_path));
@@ -1808,11 +1945,15 @@ int od_tui_run(const OpendoorOptions *options) {
                     int menu_width = 50;
                     if (menu_width > width - 4) menu_width = width - 4;
                     int menu_x = (width - menu_width) / 2;
-                    int first_row = 11;
+                    size_t item_count = menu_item_count(configured);
+                    size_t page_size = od_menu_page_size((size_t)height, item_count);
+                    size_t page_start = od_menu_page_start(selected, page_size);
+                    int first_row = 10;
                     if (event.x >= menu_x && event.x < menu_x + menu_width &&
                         event.y >= first_row &&
-                        event.y < first_row + (int)menu_item_count(configured)) {
-                        selected = (size_t)(event.y - first_row);
+                        event.y < first_row + (int)page_size &&
+                        page_start + (size_t)(event.y - first_row) < item_count) {
+                        selected = page_start + (size_t)(event.y - first_row);
                         input = '\n';
                     }
                 }
@@ -1836,8 +1977,20 @@ int od_tui_run(const OpendoorOptions *options) {
             if (selected == count - 1U) {
                 quit = true;
             } else if (!configured && selected == 0U) {
-                if (run_onboarding(window, &canvas, use_color, ascii,
-                                   project_root, &session_profile)) {
+                if (!atomic_load(&scan.done)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "Project discovery is still running; try again in a moment.");
+                } else if (scan.discovery_status != OD_OK) {
+                    (void)snprintf(status, sizeof(status), "%s",
+                                   scan.discovery_error.message);
+                } else {
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    if (run_onboarding(window, &canvas, use_color, ascii,
+                                       project_root, &scan.candidates,
+                                       &session_profile)) {
                     configured = true;
                     session_profile_ready = true;
                     selected = 0U;
@@ -1852,7 +2005,10 @@ int od_tui_run(const OpendoorOptions *options) {
                                        &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
                         (void)snprintf(status, sizeof(status),
-                                       "Profile and assignments saved atomically.");
+                            od_assignment_appears_ignored(project_root,
+                                                          session_profile.assignment_file) ?
+                                "Profile and assignments saved atomically." :
+                                "Saved atomically; warning: assignment file appears unignored.");
                     } else if (workflow_status == OD_ERROR_CANCELLED) {
                         (void)snprintf(status, sizeof(status),
                                        "Save cancelled; no assignment changes were written.");
@@ -1861,9 +2017,10 @@ int od_tui_run(const OpendoorOptions *options) {
                             active_profile_path == NULL ? "Profile path is too long." :
                                                           workflow_error.message);
                     }
-                } else {
-                    (void)snprintf(status, sizeof(status),
-                                   "Discovery review cancelled; no files were changed.");
+                    } else {
+                        (void)snprintf(status, sizeof(status),
+                                       "Discovery review cancelled; no files were changed.");
+                    }
                 }
             } else if (!configured && selected == 1U) {
                 if (!atomic_load(&scan.done)) {
@@ -1914,7 +2071,10 @@ int od_tui_run(const OpendoorOptions *options) {
                         &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
                         (void)snprintf(status, sizeof(status),
-                                       "Assignments verified and saved atomically.");
+                            od_assignment_appears_ignored(project_root,
+                                                          session_profile.assignment_file) ?
+                                "Assignments verified and saved atomically." :
+                                "Saved atomically; warning: assignment file appears unignored.");
                     } else if (workflow_status == OD_ERROR_CANCELLED) {
                         (void)snprintf(status, sizeof(status),
                                        "Conflict review cancelled; no files were changed.");
@@ -1933,8 +2093,9 @@ int od_tui_run(const OpendoorOptions *options) {
                     }
                     OdScanSnapshot fresh;
                     OdError refresh_error;
-                    OdStatus refresh_status = scan_now(scan.snapshot.generation + 1U,
-                                                       &fresh, &refresh_error);
+                    OdStatus refresh_status = run_scan_interactive(
+                        window, &canvas, use_color, ascii,
+                        scan.snapshot.generation + 1U, &fresh, &refresh_error);
                     if (refresh_status == OD_OK) {
                         od_scan_snapshot_free(&scan.snapshot);
                         scan.snapshot = fresh;
@@ -2000,6 +2161,7 @@ int od_tui_run(const OpendoorOptions *options) {
     (void)endwin();
     if (!scan_joined) (void)pthread_join(scan.thread, NULL);
     od_scan_snapshot_free(&scan.snapshot);
+    od_candidate_list_free(&scan.candidates);
     if (session_profile_ready) od_profile_free(&session_profile);
     signal_state_restore(&signal_state);
     return 0;

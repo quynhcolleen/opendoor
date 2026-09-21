@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -61,6 +62,64 @@ static OdStatus join_path(const char *root,
     (void)snprintf(*path, root_length + relative_length + (separator ? 2U : 1U),
                    separator ? "%s/%s" : "%s%s", root, relative);
     return OD_OK;
+}
+
+static OdStatus ensure_safe_assignment_parent(const char *project_root,
+                                              const char *relative,
+                                              bool create,
+                                              bool *missing,
+                                              OdError *error) {
+    if (missing != NULL) *missing = false;
+    if (project_root == NULL || !safe_relative_path(relative)) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "assignment path must be safely contained by the project");
+        return OD_ERROR_INVALID;
+    }
+    int directory = open(project_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) {
+        od_error_set(error, OD_ERROR_INVALID, "project root is not a safe directory: %s",
+                     strerror(errno));
+        return OD_ERROR_INVALID;
+    }
+    char *copy = copy_string(relative);
+    if (copy == NULL) {
+        (void)close(directory);
+        od_error_set(error, OD_ERROR_MEMORY, "unable to inspect assignment parent");
+        return OD_ERROR_MEMORY;
+    }
+    OdStatus status = OD_OK;
+    char *component = copy;
+    while (true) {
+        char *slash = strchr(component, '/');
+        if (slash == NULL) break;
+        *slash = '\0';
+        int child = openat(directory, component,
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (child < 0 && errno == ENOENT && create) {
+            if (mkdirat(directory, component, (mode_t)0777) == 0 || errno == EEXIST) {
+                child = openat(directory, component,
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            }
+        }
+        if (child < 0) {
+            if (errno == ENOENT && !create) {
+                if (missing != NULL) *missing = true;
+                status = OD_OK;
+            } else {
+                od_error_set(error, OD_ERROR_INVALID,
+                             "assignment parent component is unsafe: %s", component);
+                status = OD_ERROR_INVALID;
+            }
+            break;
+        }
+        (void)close(directory);
+        directory = child;
+        component = slash + 1;
+    }
+    free(copy);
+    (void)close(directory);
+    if (status == OD_OK) od_error_clear(error);
+    return status;
 }
 
 static OdStatus inspect_regular_target(const char *path,
@@ -430,7 +489,7 @@ static OdStatus atomic_replace(const char *path,
         (void)snprintf(temporary, capacity, "%s.tmp.%ld.%u", path, (long)getpid(), attempt);
         descriptor = open(temporary,
                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                          (mode_t)0666);
+                          enforce_mode ? mode : (mode_t)0644);
         if (descriptor >= 0 || errno != EEXIST) break;
     }
     if (descriptor < 0) {
@@ -439,11 +498,12 @@ static OdStatus atomic_replace(const char *path,
         free(temporary);
         return OD_ERROR_IO;
     }
-    OdStatus status = write_all(descriptor, data, length, error);
-    if (status == OD_OK && enforce_mode && fchmod(descriptor, mode) != 0) {
+    OdStatus status = OD_OK;
+    if (enforce_mode && fchmod(descriptor, mode) != 0) {
         od_error_set(error, OD_ERROR_IO, "unable to preserve permissions for %s", path);
         status = OD_ERROR_IO;
     }
+    if (status == OD_OK) status = write_all(descriptor, data, length, error);
     if (status == OD_OK && fsync(descriptor) != 0) {
         od_error_set(error, OD_ERROR_IO, "unable to sync temporary file for %s", path);
         status = OD_ERROR_IO;
@@ -508,16 +568,69 @@ static OdStatus preflight_backup_target(const char *path,
     return status;
 }
 
-static OdStatus replace_with_backup(const char *path,
-                                    const char *data,
-                                    size_t length,
-                                    OdError *error) {
-    bool exists;
+typedef struct {
+    bool existed;
     mode_t mode;
-    OdStatus status = inspect_regular_target(path, &exists, &mode, error);
-    if (status == OD_OK) status = backup_existing(path, exists, mode, error);
-    if (status == OD_OK) status = atomic_replace(path, data, length, mode, exists, error);
+    char *data;
+    size_t length;
+} ManagedOriginal;
+
+static void managed_original_free(ManagedOriginal *original) {
+    if (original == NULL) return;
+    free(original->data);
+    *original = (ManagedOriginal){0};
+}
+
+static OdStatus capture_original(const char *path,
+                                 ManagedOriginal *original,
+                                 OdError *error) {
+    *original = (ManagedOriginal){.mode = (mode_t)0644};
+    OdStatus status = inspect_regular_target(path, &original->existed,
+                                             &original->mode, error);
+    if (status == OD_OK && original->existed) {
+        status = read_regular_file(path, &original->data, &original->length,
+                                   &original->mode, error);
+    }
     return status;
+}
+
+static OdStatus restore_original(const char *path,
+                                 const ManagedOriginal *original,
+                                 OdError *error) {
+    if (original->existed) {
+        return atomic_replace(path, original->data, original->length,
+                              original->mode, true, error);
+    }
+    if (unlink(path) != 0 && errno != ENOENT) {
+        od_error_set(error, OD_ERROR_IO, "unable to roll back %s: %s",
+                     path, strerror(errno));
+        return OD_ERROR_IO;
+    }
+    return sync_parent(path, error);
+}
+
+static OdStatus restore_transaction(const char *profile_path,
+                                    const ManagedOriginal *profile_original,
+                                    const char *assignment_path,
+                                    const ManagedOriginal *assignment_original,
+                                    const OdError *commit_error,
+                                    OdError *error) {
+    OdError profile_error;
+    OdError assignment_error;
+    OdStatus profile_status = restore_original(profile_path, profile_original,
+                                               &profile_error);
+    OdStatus assignment_status = restore_original(assignment_path,
+                                                  assignment_original,
+                                                  &assignment_error);
+    if (profile_status != OD_OK || assignment_status != OD_OK) {
+        const char *rollback_message = profile_status != OD_OK ?
+            profile_error.message : assignment_error.message;
+        od_error_set(error, OD_ERROR_IO, "%s; rollback also failed: %s",
+                     commit_error->message, rollback_message);
+        return OD_ERROR_IO;
+    }
+    *error = *commit_error;
+    return commit_error->code;
 }
 
 static const char *profile_reference(const char *project_root, const char *profile_path) {
@@ -542,14 +655,16 @@ static OdStatus project_save_with_policy(const char *project_root,
     if (status == OD_OK) {
         status = join_path(project_root, profile->assignment_file, &assignment_path, error);
     }
-
-    bool assignment_exists = false;
-    mode_t assignment_mode;
     if (status == OD_OK) {
-        status = inspect_regular_target(assignment_path, &assignment_exists,
-                                        &assignment_mode, error);
+        status = ensure_safe_assignment_parent(project_root, profile->assignment_file,
+                                               true, NULL, error);
     }
-    if (status == OD_OK && assignment_exists) {
+
+    ManagedOriginal assignment_original = {0};
+    if (status == OD_OK) {
+        status = capture_original(assignment_path, &assignment_original, error);
+    }
+    if (status == OD_OK && assignment_original.existed) {
         OdAssignments existing;
         status = od_assignments_load_file(assignment_path, &existing, error);
         if (status == OD_ERROR_FOREIGN && import_foreign) {
@@ -557,16 +672,15 @@ static OdStatus project_save_with_policy(const char *project_root,
         }
         if (status == OD_OK) od_assignments_free(&existing);
     }
-    bool profile_exists;
-    mode_t profile_mode;
+    ManagedOriginal profile_original = {0};
     if (status == OD_OK) {
-        status = inspect_regular_target(profile_path, &profile_exists, &profile_mode, error);
+        status = capture_original(profile_path, &profile_original, error);
     }
     if (status == OD_OK) {
-        status = preflight_backup_target(profile_path, profile_exists, error);
+        status = preflight_backup_target(profile_path, profile_original.existed, error);
     }
     if (status == OD_OK) {
-        status = preflight_backup_target(assignment_path, assignment_exists, error);
+        status = preflight_backup_target(assignment_path, assignment_original.existed, error);
     }
 
     char *profile_text = NULL;
@@ -586,15 +700,39 @@ static OdStatus project_save_with_policy(const char *project_root,
     }
     if (status == OD_OK) status = ensure_parent_directories(profile_path, error);
     if (status == OD_OK) {
-        status = replace_with_backup(profile_path, profile_text, profile_length, error);
+        status = backup_existing(profile_path, profile_original.existed,
+                                 profile_original.mode, error);
     }
     if (status == OD_OK) {
-        status = replace_with_backup(assignment_path, assignment_text,
-                                     assignment_length, error);
+        status = backup_existing(assignment_path, assignment_original.existed,
+                                 assignment_original.mode, error);
+    }
+    if (status == OD_OK) {
+        status = atomic_replace(profile_path, profile_text, profile_length,
+                                profile_original.mode, profile_original.existed, error);
+        if (status != OD_OK) {
+            OdError commit_error = *error;
+            status = restore_transaction(profile_path, &profile_original,
+                                         assignment_path, &assignment_original,
+                                         &commit_error, error);
+        }
+    }
+    if (status == OD_OK) {
+        status = atomic_replace(assignment_path, assignment_text,
+                                assignment_length, assignment_original.mode,
+                                assignment_original.existed, error);
+        if (status != OD_OK) {
+            OdError commit_error = *error;
+            status = restore_transaction(profile_path, &profile_original,
+                                         assignment_path, &assignment_original,
+                                         &commit_error, error);
+        }
     }
     free(profile_text);
     free(assignment_text);
     od_assignments_free(&assignments);
+    managed_original_free(&profile_original);
+    managed_original_free(&assignment_original);
     free(assignment_path);
     if (status == OD_OK) od_error_clear(error);
     return status;
@@ -625,6 +763,16 @@ OdStatus od_project_reset_assignments(const char *project_root,
     }
     char *path = NULL;
     OdStatus status = join_path(project_root, profile->assignment_file, &path, error);
+    bool parent_missing = false;
+    if (status == OD_OK) {
+        status = ensure_safe_assignment_parent(project_root, profile->assignment_file,
+                                               false, &parent_missing, error);
+    }
+    if (status == OD_OK && parent_missing) {
+        free(path);
+        od_error_clear(error);
+        return OD_OK;
+    }
     bool exists = false;
     mode_t mode = (mode_t)0644;
     if (status == OD_OK) status = inspect_regular_target(path, &exists, &mode, error);
@@ -647,4 +795,60 @@ OdStatus od_project_reset_assignments(const char *project_root,
     free(path);
     if (status == OD_OK) od_error_clear(error);
     return status;
+}
+
+bool od_assignment_appears_ignored(const char *project_root,
+                                   const char *relative_path) {
+    if (project_root == NULL || !safe_relative_path(relative_path)) return false;
+    size_t capacity = strlen(project_root) + sizeof("/.gitignore");
+    char *path = malloc(capacity);
+    if (path == NULL) return false;
+    (void)snprintf(path, capacity, "%s%s.gitignore", project_root,
+                   project_root[0] != '\0' && project_root[strlen(project_root) - 1U] == '/' ?
+                       "" : "/");
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    free(path);
+    if (descriptor < 0) return false;
+    struct stat metadata;
+    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_size < 0 || metadata.st_size > (off_t)(1024U * 1024U)) {
+        (void)close(descriptor);
+        return false;
+    }
+    size_t length = (size_t)metadata.st_size;
+    char *text = malloc(length + 1U);
+    if (text == NULL) {
+        (void)close(descriptor);
+        return false;
+    }
+    size_t used = 0U;
+    while (used < length) {
+        ssize_t count = read(descriptor, text + used, length - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        used += (size_t)count;
+    }
+    (void)close(descriptor);
+    text[used] = '\0';
+    const char *basename = strrchr(relative_path, '/');
+    basename = basename == NULL ? relative_path : basename + 1;
+    bool ignored = false;
+    char *save = NULL;
+    for (char *line = strtok_r(text, "\n", &save); line != NULL;
+         line = strtok_r(NULL, "\n", &save)) {
+        size_t line_length = strlen(line);
+        while (line_length > 0U &&
+               (line[line_length - 1U] == '\r' || line[line_length - 1U] == ' ' ||
+                line[line_length - 1U] == '\t')) line[--line_length] = '\0';
+        if (line[0] == '\0' || line[0] == '#') continue;
+        bool negated = line[0] == '!';
+        char *pattern = line + (negated ? 1 : 0);
+        if (pattern[0] == '/') ++pattern;
+        bool matches = strchr(pattern, '/') == NULL ?
+            fnmatch(pattern, basename, 0) == 0 :
+            fnmatch(pattern, relative_path, FNM_PATHNAME) == 0;
+        if (matches) ignored = !negated;
+    }
+    free(text);
+    return ignored;
 }

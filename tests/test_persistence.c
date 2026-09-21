@@ -279,11 +279,148 @@ static void test_save_preflights_every_target_before_writing(void) {
     (void)rmdir(root);
 }
 
+static void test_assignment_parent_cannot_escape_project(void) {
+    char root_template[] = "/tmp/opendoor-confined-XXXXXX";
+    char outside_template[] = "/tmp/opendoor-outside-XXXXXX";
+    char *root = mkdtemp(root_template);
+    char *outside = mkdtemp(outside_template);
+    CHECK(root != NULL && outside != NULL);
+    if (root == NULL || outside == NULL) return;
+
+    char link_path[1024];
+    char escaped_path[1024];
+    char profile_path[1024];
+    (void)snprintf(link_path, sizeof(link_path), "%s/link", root);
+    (void)snprintf(escaped_path, sizeof(escaped_path), "%s/.ports.env", outside);
+    (void)snprintf(profile_path, sizeof(profile_path), "%s/.opendoor/project.toml", root);
+    CHECK(symlink(outside, link_path) == 0);
+
+    OdError error;
+    OdProfile profile;
+    make_profile(&profile, 4000U, &error);
+    free(profile.assignment_file);
+    profile.assignment_file = strdup("link/.ports.env");
+    OdAllocationPlan plan;
+    make_plan(&plan, 4001U);
+    CHECK(od_project_save(root, profile_path, &profile, &plan, &error) ==
+          OD_ERROR_INVALID);
+    CHECK(access(escaped_path, F_OK) != 0);
+    CHECK(access(profile_path, F_OK) != 0);
+
+    od_allocation_plan_free(&plan);
+    od_profile_free(&profile);
+    (void)unlink(link_path);
+    (void)rmdir(outside);
+    (void)rmdir(root);
+}
+
+static void test_safe_nested_assignment_parent_is_prepared_before_save(void) {
+    char template[] = "/tmp/opendoor-nested-XXXXXX";
+    char *root = mkdtemp(template);
+    CHECK(root != NULL);
+    if (root == NULL) return;
+
+    char profile_path[1024];
+    char assignment_path[1024];
+    (void)snprintf(profile_path, sizeof(profile_path), "%s/.opendoor/project.toml", root);
+    (void)snprintf(assignment_path, sizeof(assignment_path), "%s/state/.ports.env", root);
+    OdError error;
+    OdProfile profile;
+    make_profile(&profile, 4000U, &error);
+    free(profile.assignment_file);
+    profile.assignment_file = strdup("state/.ports.env");
+    OdAllocationPlan plan;
+    make_plan(&plan, 4001U);
+    CHECK(od_project_save(root, profile_path, &profile, &plan, &error) == OD_OK);
+    CHECK(access(profile_path, F_OK) == 0);
+    CHECK(access(assignment_path, F_OK) == 0);
+
+    od_allocation_plan_free(&plan);
+    od_profile_free(&profile);
+    (void)unlink(assignment_path);
+    char state_path[1024];
+    (void)snprintf(state_path, sizeof(state_path), "%s/state", root);
+    (void)rmdir(state_path);
+    cleanup_tree(root);
+}
+
+static void test_second_replace_failure_rolls_back_first_target(void) {
+    if (geteuid() == 0) {
+        puts("transaction permission-failure check skipped as root");
+        return;
+    }
+    char template[] = "/tmp/opendoor-rollback-XXXXXX";
+    char *root = mkdtemp(template);
+    CHECK(root != NULL);
+    if (root == NULL) return;
+    char profile_dir[1024];
+    char profile_path[1024];
+    char state_dir[1024];
+    char assignment_path[1024];
+    (void)snprintf(profile_dir, sizeof(profile_dir), "%s/.opendoor", root);
+    (void)snprintf(profile_path, sizeof(profile_path),
+                   "%s/.opendoor/project.toml", root);
+    (void)snprintf(state_dir, sizeof(state_dir), "%s/state", root);
+    (void)snprintf(assignment_path, sizeof(assignment_path),
+                   "%s/state/.ports.env", root);
+    CHECK(mkdir(profile_dir, 0700) == 0);
+    CHECK(mkdir(state_dir, 0500) == 0);
+    CHECK(write_text(profile_path, "original profile bytes\n"));
+
+    OdError error;
+    OdProfile profile;
+    make_profile(&profile, 4000U, &error);
+    free(profile.assignment_file);
+    profile.assignment_file = strdup("state/.ports.env");
+    OdAllocationPlan plan;
+    make_plan(&plan, 4001U);
+    CHECK(od_project_save(root, profile_path, &profile, &plan, &error) == OD_ERROR_IO);
+    char *restored = read_text(profile_path);
+    CHECK(restored != NULL && strcmp(restored, "original profile bytes\n") == 0);
+    CHECK(access(assignment_path, F_OK) != 0);
+    free(restored);
+
+    od_allocation_plan_free(&plan);
+    od_profile_free(&profile);
+    char backup_path[1024];
+    (void)snprintf(backup_path, sizeof(backup_path),
+                   "%s/.opendoor/project.toml.opendoor.bak", root);
+    (void)unlink(backup_path);
+    (void)unlink(profile_path);
+    CHECK(chmod(state_dir, 0700) == 0);
+    (void)rmdir(state_dir);
+    (void)rmdir(profile_dir);
+    (void)rmdir(root);
+}
+
+static void test_assignment_ignore_detection_is_read_only(void) {
+    char template[] = "/tmp/opendoor-ignore-XXXXXX";
+    char *root = mkdtemp(template);
+    CHECK(root != NULL);
+    if (root == NULL) return;
+    char ignore_path[1024];
+    (void)snprintf(ignore_path, sizeof(ignore_path), "%s/.gitignore", root);
+    CHECK(write_text(ignore_path, "*.env\n!important.env\nstate/.ports.local\n"));
+    CHECK(od_assignment_appears_ignored(root, ".ports.env"));
+    CHECK(!od_assignment_appears_ignored(root, "important.env"));
+    CHECK(od_assignment_appears_ignored(root, "state/.ports.local"));
+    char *unchanged = read_text(ignore_path);
+    CHECK(unchanged != NULL &&
+          strcmp(unchanged, "*.env\n!important.env\nstate/.ports.local\n") == 0);
+    free(unchanged);
+    (void)unlink(ignore_path);
+    (void)rmdir(root);
+}
+
 int main(void) {
     test_resolution_and_snapshot_validation();
     test_bind_probe_detects_changed_port();
     test_atomic_save_backup_foreign_refusal_and_reset();
     test_save_preflights_every_target_before_writing();
+    test_assignment_parent_cannot_escape_project();
+    test_safe_nested_assignment_parent_is_prepared_before_save();
+    test_second_replace_failure_rolls_back_first_target();
+    test_assignment_ignore_detection_is_read_only();
     if (failures != 0) {
         fprintf(stderr, "%d persistence checks failed\n", failures);
         return 1;

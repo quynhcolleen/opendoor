@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define OD_CELL_BYTES 5U
+#define OD_CELL_BYTES 16U
 
 typedef struct {
     char glyph[OD_CELL_BYTES];
@@ -30,9 +30,9 @@ void od_canvas_write(OdCanvas *canvas, int x, int y, const char *text,
                      size_t maximum_columns, OdThemeRole role, unsigned attributes);
 void od_canvas_write_centered(OdCanvas *canvas, int y, const char *text,
                               OdThemeRole role, unsigned attributes);
+size_t od_page_target(size_t selected, size_t count, size_t page_size, int pages);
 void od_canvas_box(OdCanvas *canvas, int x, int y, int width, int height,
                    bool ascii, OdThemeRole role);
 char *od_canvas_to_text(const OdCanvas *canvas, OdError *error);
 
 #endif
-

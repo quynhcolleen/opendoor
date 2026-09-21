@@ -544,8 +544,15 @@ static void read_process_metadata(const char *proc_root, pid_t pid, OdEndpoint *
         ssize_t command_length = read(command_fd, endpoint->command, sizeof(endpoint->command) - 1U);
         (void)close(command_fd);
         if (command_length > 0) {
-            endpoint->command[(size_t)command_length] = '\0';
-            sanitize_field(endpoint->command);
+            size_t length = (size_t)command_length;
+            for (size_t index = 0U; index < length; ++index) {
+                unsigned char character = (unsigned char)endpoint->command[index];
+                if (character < 0x20U || character == 0x7fU) {
+                    endpoint->command[index] = ' ';
+                }
+            }
+            while (length > 0U && endpoint->command[length - 1U] == ' ') --length;
+            endpoint->command[length] = '\0';
         }
     }
     struct passwd pwd;
