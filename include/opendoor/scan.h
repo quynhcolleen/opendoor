@@ -49,8 +49,10 @@ typedef struct {
     uint64_t generation;
     OdEndpoint *endpoints;
     size_t endpoint_count;
+    size_t endpoint_capacity;
     OdDockerMapping *docker_mappings;
     size_t docker_mapping_count;
+    size_t docker_mapping_capacity;
     char **warnings;
     size_t warning_count;
     bool docker_available;
@@ -72,4 +74,3 @@ OdStatus od_resolve_process_owners(const char *proc_root,
                                    OdError *error);
 
 #endif
-

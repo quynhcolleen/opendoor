@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -86,6 +87,13 @@ static void test_profile_rejects_invalid_documents(void) {
     CHECK(strstr(error.message, "duplicate service id") != NULL);
     CHECK(od_profile_parse(duplicate_variable, strlen(duplicate_variable), &profile, &error) == OD_ERROR_INVALID);
     CHECK(strstr(error.message, "duplicate variable") != NULL);
+
+    const char *unsafe_assignment =
+        "schema_version = 1\nproject_name = \"x\"\nassignment_file = \"../ports.env\"\n"
+        "port_min = 3000\nport_max = 3010\n";
+    CHECK(od_profile_parse(unsafe_assignment, strlen(unsafe_assignment),
+                           &profile, &error) == OD_ERROR_INVALID);
+    CHECK(strstr(error.message, "safe project-relative") != NULL);
 }
 
 static void test_settings(void) {
@@ -249,6 +257,51 @@ static void test_allocation_preferred_reserved_duplicate_and_stale(void) {
     od_profile_free(&profile);
 }
 
+static void test_large_congested_allocation_stays_interactive(void) {
+    enum { service_count = 1024 };
+    OdProfile profile;
+    OdError error;
+    od_profile_init(&profile);
+    profile.project_name = strdup("large allocation");
+    profile.assignment_file = strdup(".ports.env");
+    profile.port_min = 10000U;
+    profile.port_max = (uint16_t)(10000U + service_count * 2U - 1U);
+    OdOccupiedPort *occupied = calloc(service_count, sizeof(*occupied));
+    CHECK(occupied != NULL);
+    if (occupied == NULL) {
+        od_profile_free(&profile);
+        return;
+    }
+    for (size_t index = 0U; index < service_count; ++index) {
+        char id[48];
+        char variable[48];
+        (void)snprintf(id, sizeof(id), "service-%04zu", index);
+        (void)snprintf(variable, sizeof(variable), "SERVICE_%04zu_PORT", index);
+        OdService service = make_service(id, variable,
+                                         (uint16_t)(10000U + index));
+        CHECK(od_profile_add_service(&profile, &service, &error) == OD_OK);
+        occupied[index] = (OdOccupiedPort){(uint16_t)(10000U + index),
+                                           OD_PROTOCOL_TCP};
+    }
+
+    struct timespec started;
+    struct timespec finished;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
+    OdAllocationPlan plan = {0};
+    CHECK(od_allocate(&profile, occupied, service_count, NULL, &plan, &error) == OD_OK);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &finished) == 0);
+    double elapsed = (double)(finished.tv_sec - started.tv_sec) +
+                     (double)(finished.tv_nsec - started.tv_nsec) / 1000000000.0;
+    CHECK(elapsed < 2.0);
+    CHECK(plan.count == service_count);
+    CHECK(plan.items[0].new_port == 11024U);
+    CHECK(plan.items[service_count - 1U].new_port == 12047U);
+
+    od_allocation_plan_free(&plan);
+    free(occupied);
+    od_profile_free(&profile);
+}
+
 int main(void) {
     test_profile_parsing();
     test_profile_rejects_invalid_documents();
@@ -257,6 +310,7 @@ int main(void) {
     test_allocation();
     test_allocation_exhaustion();
     test_allocation_preferred_reserved_duplicate_and_stale();
+    test_large_congested_allocation_stays_interactive();
     if (failures != 0) {
         fprintf(stderr, "%d core checks failed\n", failures);
         return 1;

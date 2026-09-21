@@ -101,24 +101,94 @@ static bool parse_decimal_port(const char *value, uint16_t *port) {
 static OdStatus add_mapping(OdScanSnapshot *snapshot,
                             const OdDockerMapping *mapping,
                             OdError *error) {
-    for (size_t index = 0U; index < snapshot->docker_mapping_count; ++index) {
-        const OdDockerMapping *existing = &snapshot->docker_mappings[index];
-        if (existing->host_port == mapping->host_port &&
-            existing->container_port == mapping->container_port &&
-            existing->protocol == mapping->protocol &&
-            strcmp(existing->bind_address, mapping->bind_address) == 0 &&
-            strcmp(existing->container_id, mapping->container_id) == 0) {
-            return OD_OK;
+    if (snapshot->docker_mapping_count == snapshot->docker_mapping_capacity) {
+        size_t capacity = snapshot->docker_mapping_capacity == 0U ? 32U :
+                          snapshot->docker_mapping_capacity * 2U;
+        if (capacity <= snapshot->docker_mapping_count ||
+            capacity > SIZE_MAX / sizeof(*snapshot->docker_mappings)) {
+            od_error_set(error, OD_ERROR_MEMORY, "Docker mapping collection is too large");
+            return OD_ERROR_MEMORY;
+        }
+        OdDockerMapping *items = realloc(snapshot->docker_mappings,
+                                         capacity * sizeof(*items));
+        if (items == NULL) {
+            od_error_set(error, OD_ERROR_MEMORY, "unable to store Docker mapping");
+            return OD_ERROR_MEMORY;
+        }
+        snapshot->docker_mappings = items;
+        snapshot->docker_mapping_capacity = capacity;
+    }
+    snapshot->docker_mappings[snapshot->docker_mapping_count++] = *mapping;
+    return OD_OK;
+}
+
+static bool same_mapping(const OdDockerMapping *left,
+                         const OdDockerMapping *right) {
+    return left->host_port == right->host_port &&
+           left->container_port == right->container_port &&
+           left->protocol == right->protocol &&
+           strcmp(left->bind_address, right->bind_address) == 0 &&
+           strcmp(left->container_id, right->container_id) == 0;
+}
+
+static uint64_t mapping_hash(const OdDockerMapping *mapping) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    const char *values[] = {mapping->container_id, mapping->bind_address};
+    for (size_t value = 0U; value < sizeof(values) / sizeof(values[0]); ++value) {
+        for (size_t index = 0U; values[value][index] != '\0'; ++index) {
+            hash ^= (unsigned char)values[value][index];
+            hash *= UINT64_C(1099511628211);
         }
     }
-    OdDockerMapping *items = realloc(snapshot->docker_mappings,
-                                     (snapshot->docker_mapping_count + 1U) * sizeof(*items));
-    if (items == NULL) {
-        od_error_set(error, OD_ERROR_MEMORY, "unable to store Docker mapping");
+    hash ^= mapping->host_port;
+    hash *= UINT64_C(1099511628211);
+    hash ^= mapping->container_port;
+    hash *= UINT64_C(1099511628211);
+    hash ^= mapping->protocol;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+
+static OdStatus deduplicate_mappings(OdScanSnapshot *snapshot, OdError *error) {
+    if (snapshot->docker_mapping_count < 2U) return OD_OK;
+    if (snapshot->docker_mapping_count > SIZE_MAX / 2U) {
+        od_error_set(error, OD_ERROR_MEMORY, "Docker mapping index is too large");
         return OD_ERROR_MEMORY;
     }
-    snapshot->docker_mappings = items;
-    items[snapshot->docker_mapping_count++] = *mapping;
+    size_t table_size = 1U;
+    size_t required = snapshot->docker_mapping_count * 2U;
+    while (table_size < required) {
+        if (table_size > SIZE_MAX / 2U) {
+            od_error_set(error, OD_ERROR_MEMORY, "Docker mapping index is too large");
+            return OD_ERROR_MEMORY;
+        }
+        table_size *= 2U;
+    }
+    size_t *table = calloc(table_size, sizeof(*table));
+    if (table == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to index Docker mappings");
+        return OD_ERROR_MEMORY;
+    }
+    size_t output = 0U;
+    for (size_t index = 0U; index < snapshot->docker_mapping_count; ++index) {
+        const OdDockerMapping *mapping = &snapshot->docker_mappings[index];
+        size_t slot = (size_t)mapping_hash(mapping) & (table_size - 1U);
+        bool duplicate = false;
+        while (table[slot] != 0U) {
+            size_t existing = table[slot] - 1U;
+            if (same_mapping(&snapshot->docker_mappings[existing], mapping)) {
+                duplicate = true;
+                break;
+            }
+            slot = (slot + 1U) & (table_size - 1U);
+        }
+        if (duplicate) continue;
+        if (output != index) snapshot->docker_mappings[output] = *mapping;
+        table[slot] = output + 1U;
+        ++output;
+    }
+    snapshot->docker_mapping_count = output;
+    free(table);
     return OD_OK;
 }
 
@@ -229,6 +299,7 @@ OdStatus od_docker_parse_ps_json_lines(const char *text,
         if (line[0] != '\0') status = parse_json_line(line, snapshot, error);
     }
     free(buffer);
+    if (status == OD_OK) status = deduplicate_mappings(snapshot, error);
     if (status == OD_OK) {
         snapshot->docker_available = true;
         od_error_clear(error);

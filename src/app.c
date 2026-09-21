@@ -72,14 +72,13 @@ int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options) {
         fprintf(stderr, "opendoor: unknown option: %s\n", argument);
         return 2;
     }
-    return od_tui_run(options);
+    return 0;
 }
 
 int opendoor_run(const OpendoorOptions *options) {
-    (void)options;
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         fputs("opendoor: an interactive terminal is required\n", stderr);
         return 4;
     }
-    return 0;
+    return od_tui_run(options);
 }

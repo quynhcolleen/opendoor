@@ -19,7 +19,9 @@
 #include <locale.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -39,6 +41,72 @@ typedef struct {
     OdError error;
     OdStatus status;
 } StartupScan;
+
+typedef struct {
+    int pipe_read;
+    int pipe_write;
+    struct sigaction previous_interrupt;
+    struct sigaction previous_terminate;
+    bool installed;
+} SignalState;
+
+static volatile sig_atomic_t termination_signal = 0;
+static int signal_pipe_write = -1;
+
+static void termination_handler(int signal_number) {
+    termination_signal = signal_number;
+    if (signal_pipe_write >= 0) {
+        unsigned char value = (unsigned char)signal_number;
+        (void)write(signal_pipe_write, &value, sizeof(value));
+    }
+}
+
+static bool signal_state_install(SignalState *state) {
+    *state = (SignalState){.pipe_read = -1, .pipe_write = -1};
+    int descriptors[2];
+    if (pipe(descriptors) != 0) return false;
+    state->pipe_read = descriptors[0];
+    state->pipe_write = descriptors[1];
+    (void)fcntl(state->pipe_read, F_SETFL, O_NONBLOCK);
+    (void)fcntl(state->pipe_write, F_SETFL, O_NONBLOCK);
+    (void)fcntl(state->pipe_read, F_SETFD, FD_CLOEXEC);
+    (void)fcntl(state->pipe_write, F_SETFD, FD_CLOEXEC);
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = termination_handler;
+    (void)sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, &state->previous_interrupt) != 0) {
+        (void)close(state->pipe_read);
+        (void)close(state->pipe_write);
+        *state = (SignalState){.pipe_read = -1, .pipe_write = -1};
+        return false;
+    }
+    if (sigaction(SIGTERM, &action, &state->previous_terminate) != 0) {
+        (void)sigaction(SIGINT, &state->previous_interrupt, NULL);
+        (void)close(state->pipe_read);
+        (void)close(state->pipe_write);
+        *state = (SignalState){.pipe_read = -1, .pipe_write = -1};
+        return false;
+    }
+    termination_signal = 0;
+    signal_pipe_write = state->pipe_write;
+    state->installed = true;
+    return true;
+}
+
+static void signal_state_restore(SignalState *state) {
+    if (!state->installed) return;
+    signal_pipe_write = -1;
+    (void)sigaction(SIGINT, &state->previous_interrupt, NULL);
+    (void)sigaction(SIGTERM, &state->previous_terminate, NULL);
+    (void)close(state->pipe_read);
+    (void)close(state->pipe_write);
+    state->installed = false;
+}
+
+static bool termination_requested(void) {
+    return termination_signal != 0;
+}
 
 static uint64_t monotonic_milliseconds(void) {
     struct timespec time;
@@ -194,6 +262,7 @@ static bool prompt_text(WINDOW *window,
         }
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (termination_requested()) return false;
         if (input == 27) return false;
         if (input == '\n' || input == '\r') return true;
         if (input == 127 || input == 8) {
@@ -257,6 +326,177 @@ static bool prompt_candidate(WINDOW *window,
     return true;
 }
 
+static bool parse_port_text(const char *text, uint16_t *port);
+
+static char *duplicate_text(const char *value) {
+    size_t length = strlen(value) + 1U;
+    char *copy = malloc(length);
+    if (copy != NULL) memcpy(copy, value, length);
+    return copy;
+}
+
+static bool parse_protocols(const char *text, unsigned *protocols) {
+    if (strcmp(text, "tcp") == 0) {
+        *protocols = OD_PROTOCOL_TCP;
+        return true;
+    }
+    if (strcmp(text, "udp") == 0) {
+        *protocols = OD_PROTOCOL_UDP;
+        return true;
+    }
+    if (strcmp(text, "tcp,udp") == 0 || strcmp(text, "udp,tcp") == 0) {
+        *protocols = OD_PROTOCOL_TCP | OD_PROTOCOL_UDP;
+        return true;
+    }
+    return false;
+}
+
+static bool update_profile_service(OdProfile *profile,
+                                   size_t index,
+                                   const char *name,
+                                   const char *group,
+                                   const char *variable,
+                                   uint16_t port,
+                                   unsigned protocols,
+                                   OdError *error) {
+    OdService *service = &profile->services[index];
+    char *new_name = duplicate_text(name);
+    char *new_group = duplicate_text(group);
+    char *new_variable = duplicate_text(variable);
+    if (new_name == NULL || new_group == NULL || new_variable == NULL) {
+        free(new_name);
+        free(new_group);
+        free(new_variable);
+        od_error_set(error, OD_ERROR_MEMORY, "unable to update managed service");
+        return false;
+    }
+    char *old_name = service->name;
+    char *old_group = service->group;
+    char *old_variable = service->variable;
+    uint16_t old_port = service->preferred_port;
+    unsigned old_protocols = service->protocols;
+    service->name = new_name;
+    service->group = new_group;
+    service->variable = new_variable;
+    service->preferred_port = port;
+    service->protocols = protocols;
+    OdStatus status = od_profile_validate(profile, error);
+    if (status != OD_OK) {
+        service->name = old_name;
+        service->group = old_group;
+        service->variable = old_variable;
+        service->preferred_port = old_port;
+        service->protocols = old_protocols;
+        free(new_name);
+        free(new_group);
+        free(new_variable);
+        return false;
+    }
+    free(old_name);
+    free(old_group);
+    free(old_variable);
+    return true;
+}
+
+static bool add_profile_service(OdProfile *profile,
+                                const char *id,
+                                const char *name,
+                                const char *group,
+                                const char *variable,
+                                uint16_t port,
+                                unsigned protocols,
+                                OdError *error) {
+    char *source_item = "manual:user";
+    OdService service = {
+        .id = (char *)id,
+        .name = (char *)name,
+        .group = (char *)group,
+        .variable = (char *)variable,
+        .preferred_port = port,
+        .protocols = protocols,
+        .sources = {.items = &source_item, .count = 1U},
+        .managed = true
+    };
+    if (od_profile_add_service(profile, &service, error) != OD_OK) return false;
+    if (od_profile_validate(profile, error) == OD_OK) return true;
+    od_service_clear(&profile->services[profile->service_count - 1U]);
+    --profile->service_count;
+    return false;
+}
+
+static bool prompt_profile_service(WINDOW *window,
+                                   OdCanvas *canvas,
+                                   bool use_color,
+                                   bool ascii,
+                                   OdProfile *profile,
+                                   size_t index,
+                                   bool editing,
+                                   char *status,
+                                   size_t status_capacity) {
+    char id[128] = {0};
+    char name[128] = {0};
+    char group[128] = "default";
+    char variable[128] = {0};
+    char port_text[16] = {0};
+    char protocol_text[16] = "tcp";
+    if (editing) {
+        const OdService *service = &profile->services[index];
+        (void)snprintf(id, sizeof(id), "%s", service->id);
+        (void)snprintf(name, sizeof(name), "%s", service->name);
+        (void)snprintf(group, sizeof(group), "%s", service->group);
+        (void)snprintf(variable, sizeof(variable), "%s", service->variable);
+        (void)snprintf(port_text, sizeof(port_text), "%u",
+                       (unsigned)service->preferred_port);
+        (void)snprintf(protocol_text, sizeof(protocol_text), "%s",
+            service->protocols == (OD_PROTOCOL_TCP | OD_PROTOCOL_UDP) ? "tcp,udp" :
+            (service->protocols == OD_PROTOCOL_UDP ? "udp" : "tcp"));
+    }
+    const char *title = editing ? "Edit managed service" : "Add managed service";
+    if ((!editing && !prompt_text(window, canvas, use_color, ascii, title,
+                                  "Stable ID", id, sizeof(id))) ||
+        !prompt_text(window, canvas, use_color, ascii, title,
+                     "Display name", name, sizeof(name)) ||
+        !prompt_text(window, canvas, use_color, ascii, title,
+                     "Group", group, sizeof(group)) ||
+        !prompt_text(window, canvas, use_color, ascii, title,
+                     "Environment variable", variable, sizeof(variable)) ||
+        !prompt_text(window, canvas, use_color, ascii, title,
+                     "Preferred port", port_text, sizeof(port_text)) ||
+        !prompt_text(window, canvas, use_color, ascii, title,
+                     "Protocols: tcp, udp, or tcp,udp", protocol_text,
+                     sizeof(protocol_text))) {
+        (void)snprintf(status, status_capacity, "Edit cancelled; the draft is unchanged.");
+        return false;
+    }
+    uint16_t port = 0U;
+    unsigned protocols = 0U;
+    if (!parse_port_text(port_text, &port) ||
+        port < profile->port_min || port > profile->port_max) {
+        (void)snprintf(status, status_capacity, "Use a port from %u to %u.",
+                       (unsigned)profile->port_min, (unsigned)profile->port_max);
+        return false;
+    }
+    if (!parse_protocols(protocol_text, &protocols)) {
+        (void)snprintf(status, status_capacity,
+                       "Use tcp, udp, or tcp,udp for protocols.");
+        return false;
+    }
+    OdError error;
+    bool changed = editing ?
+        update_profile_service(profile, index, name, group, variable,
+                               port, protocols, &error) :
+        add_profile_service(profile, id, name, group, variable,
+                            port, protocols, &error);
+    if (!changed) {
+        (void)snprintf(status, status_capacity, "%s", error.message);
+        return false;
+    }
+    (void)snprintf(status, status_capacity,
+                   editing ? "Service updated in the draft; press s to save." :
+                             "Service added to the draft; press s to save.");
+    return true;
+}
+
 static void run_help(WINDOW *window,
                      OdCanvas *canvas,
                      bool use_color,
@@ -276,6 +516,27 @@ static void run_help(WINDOW *window,
         od_render_help(canvas, &help, ascii, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    input = KEY_UP;
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    input = KEY_DOWN;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U &&
+                           event.y >= 6 && event.y < height - 6) {
+                    size_t target = help.page_start + (size_t)(event.y - 6);
+                    if (target < help.visible_count) {
+                        help.selected = target;
+                        od_help_move(&help, 0);
+                    }
+                }
+            }
+        }
+        if (termination_requested()) {
+            done = true;
+            continue;
+        }
         if (input == 27 || input == 'q' || input == 'Q' || input == '?') {
             done = true;
         } else if (input == KEY_UP || input == 'k') {
@@ -367,6 +628,24 @@ static bool run_settings(WINDOW *window,
         od_render_settings(canvas, &view, ascii);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (input == KEY_MOUSE && settings->mouse) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    input = KEY_UP;
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    input = KEY_DOWN;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U &&
+                           event.y >= 6 && event.y < 12) {
+                    selected = (size_t)(event.y - 6);
+                    change_setting(&draft, selected, 1);
+                    (void)snprintf(status, sizeof(status),
+                                   "Changed locally; press s to save.");
+                    input = ERR;
+                }
+            }
+        }
+        if (termination_requested()) return false;
         if (input == 27 || input == 'q' || input == 'Q') return false;
         if (input == KEY_UP || input == 'k') {
             selected = selected == 0U ? 5U : selected - 1U;
@@ -443,6 +722,34 @@ static bool run_onboarding(WINDOW *window,
         od_render_onboarding(canvas, &onboarding, ascii, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    input = KEY_UP;
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    input = KEY_DOWN;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U &&
+                           event.y >= 6) {
+                    size_t target = od_onboarding_page_start(&onboarding) +
+                                    (size_t)(event.y - 6);
+                    if (target < onboarding.candidates.count &&
+                        target < od_onboarding_page_start(&onboarding) +
+                                 onboarding.page_size) {
+                        onboarding.selected = target;
+                        if (event.x >= 3 && event.x <= 6) {
+                            input = ' ';
+                        } else {
+                            input = ERR;
+                        }
+                    }
+                }
+            }
+        }
+        if (termination_requested()) {
+            finished = true;
+            continue;
+        }
         if (input == 27 || input == 'q') {
             finished = true;
         } else if (input == KEY_UP || input == 'k') {
@@ -578,7 +885,13 @@ static bool create_dashboard(const OdProfile *profile,
 
 static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) {
     dashboard->focused = hit->widget;
-    if (hit->action == OD_HIT_TOGGLE_EXPAND) {
+    if (hit->action == OD_HIT_FOCUS_WIDGET) {
+        dashboard->expanded = false;
+    } else if (hit->action == OD_HIT_SCROLL_UP) {
+        od_dashboard_move_focused(dashboard, -1);
+    } else if (hit->action == OD_HIT_SCROLL_DOWN) {
+        od_dashboard_move_focused(dashboard, 1);
+    } else if (hit->action == OD_HIT_TOGGLE_EXPAND) {
         od_dashboard_toggle_expand(dashboard);
     } else if (hit->action == OD_HIT_SELECT_ROW) {
         switch (hit->widget) {
@@ -613,35 +926,28 @@ static OdStatus scan_now(uint64_t generation,
                          OdScanSnapshot *snapshot,
                          OdError *error);
 
-static bool refresh_dashboard(const char *project_root,
-                              const OdProfile *profile,
-                              OdScanSnapshot *snapshot,
-                              OdAssignments *saved,
-                              OdAllocationPlan *plan,
-                              OdDashboard *dashboard,
-                              char *status,
-                              size_t status_capacity) {
+static bool apply_dashboard_snapshot(const char *project_root,
+                                     const OdProfile *profile,
+                                     OdScanSnapshot *snapshot,
+                                     OdScanSnapshot *fresh,
+                                     OdAssignments *saved,
+                                     OdAllocationPlan *plan,
+                                     OdDashboard *dashboard,
+                                     char *status,
+                                     size_t status_capacity) {
     OdError error;
-    OdScanSnapshot fresh;
-    OdStatus scan_status = scan_now(snapshot->generation + 1U, &fresh, &error);
-    if (scan_status != OD_OK) {
-        (void)snprintf(status, status_capacity, "%s", error.message);
-        return false;
-    }
     OdAssignments new_saved;
     OdStatus saved_status = load_saved_assignments(project_root, profile, &new_saved, &error);
     if (saved_status != OD_OK && saved_status != OD_ERROR_FOREIGN) {
-        od_scan_snapshot_free(&fresh);
         (void)snprintf(status, status_capacity, "%s", error.message);
         return false;
     }
     OdAllocationPlan new_plan = {0};
     OdDashboard new_dashboard;
-    if (!create_dashboard(profile, &fresh,
+    if (!create_dashboard(profile, fresh,
                           saved_status == OD_OK ? &new_saved : NULL,
                           &new_dashboard, &new_plan, &error)) {
         od_assignments_free(&new_saved);
-        od_scan_snapshot_free(&fresh);
         (void)snprintf(status, status_capacity, "%s", error.message);
         return false;
     }
@@ -660,7 +966,6 @@ static bool refresh_dashboard(const char *project_root,
         od_dashboard_free(&new_dashboard);
         od_allocation_plan_free(&new_plan);
         od_assignments_free(&new_saved);
-        od_scan_snapshot_free(&fresh);
         (void)snprintf(status, status_capacity, "%s", error.message);
         return false;
     }
@@ -673,7 +978,8 @@ static bool refresh_dashboard(const char *project_root,
     od_allocation_plan_free(plan);
     od_assignments_free(saved);
     od_scan_snapshot_free(snapshot);
-    *snapshot = fresh;
+    *snapshot = *fresh;
+    *fresh = (OdScanSnapshot){0};
     new_dashboard.snapshot = snapshot;
     *dashboard = new_dashboard;
     *plan = new_plan;
@@ -681,6 +987,79 @@ static bool refresh_dashboard(const char *project_root,
     (void)snprintf(status, status_capacity, "Scan #%llu complete • %zu warning(s)",
                    (unsigned long long)snapshot->generation, snapshot->warning_count);
     return true;
+}
+
+typedef struct {
+    pthread_t thread;
+    atomic_bool done;
+    bool active;
+    OdScanSnapshot snapshot;
+    OdError error;
+    OdStatus status;
+} DashboardRefresh;
+
+static void *dashboard_refresh_main(void *argument) {
+    DashboardRefresh *refresh = argument;
+    refresh->status = scan_now(refresh->snapshot.generation,
+                               &refresh->snapshot, &refresh->error);
+    atomic_store(&refresh->done, true);
+    return NULL;
+}
+
+static bool dashboard_refresh_start(DashboardRefresh *refresh,
+                                    uint64_t generation,
+                                    OdError *error) {
+    if (refresh->active) return false;
+    *refresh = (DashboardRefresh){0};
+    od_scan_snapshot_init(&refresh->snapshot, generation);
+    atomic_init(&refresh->done, false);
+    if (pthread_create(&refresh->thread, NULL, dashboard_refresh_main, refresh) != 0) {
+        od_scan_snapshot_free(&refresh->snapshot);
+        od_error_set(error, OD_ERROR_IO, "unable to start background refresh");
+        return false;
+    }
+    refresh->active = true;
+    return true;
+}
+
+static void run_dashboard_detail(WINDOW *window,
+                                 OdCanvas *canvas,
+                                 bool use_color,
+                                 bool ascii,
+                                 const OdDashboard *dashboard) {
+    size_t page = 0U;
+    size_t page_count = 1U;
+    bool done = false;
+    while (!done) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        OdError error;
+        if (!canvas_resize(canvas, width, height, &error)) return;
+        page_count = od_render_dashboard_detail(canvas, dashboard, page, ascii);
+        if (page >= page_count) page = page_count - 1U;
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) input = KEY_PPAGE;
+                if ((event.bstate & BUTTON5_PRESSED) != 0U) input = KEY_NPAGE;
+            }
+        }
+        if (termination_requested() || input == 27 || input == 'q' ||
+            input == 'Q' || input == 'd' || input == 'D') {
+            done = true;
+        } else if ((input == KEY_PPAGE || input == KEY_UP || input == 'k') && page > 0U) {
+            --page;
+        } else if ((input == KEY_NPAGE || input == KEY_DOWN || input == 'j') &&
+                   page + 1U < page_count) {
+            ++page;
+        } else if (input == KEY_HOME) {
+            page = 0U;
+        } else if (input == KEY_END) {
+            page = page_count - 1U;
+        }
+    }
 }
 
 static void run_dashboard(WINDOW *window,
@@ -703,20 +1082,40 @@ static void run_dashboard(WINDOW *window,
         od_assignments_free(&saved);
         return;
     }
+    if (profile->service_count == 0U) dashboard.focused = OD_WIDGET_LISTENERS;
     OdHitMap hit_map;
     od_hitmap_init(&hit_map);
     char status[256];
     (void)snprintf(status, sizeof(status), "Live scan ready • %zu warning(s)",
                    snapshot->warning_count);
     uint64_t last_refresh = monotonic_milliseconds();
+    DashboardRefresh refresh = {0};
     bool done = false;
     while (!done) {
-        uint64_t now = monotonic_milliseconds();
-        if (settings->auto_refresh &&
-            now - last_refresh >= (uint64_t)settings->refresh_seconds * UINT64_C(1000)) {
-            (void)refresh_dashboard(project_root, profile, snapshot, &saved,
-                                    &plan, &dashboard, status, sizeof(status));
+        if (refresh.active && atomic_load(&refresh.done)) {
+            (void)pthread_join(refresh.thread, NULL);
+            refresh.active = false;
+            if (refresh.status == OD_OK) {
+                if (!apply_dashboard_snapshot(project_root, profile, snapshot,
+                                              &refresh.snapshot, &saved, &plan,
+                                              &dashboard, status, sizeof(status))) {
+                    od_scan_snapshot_free(&refresh.snapshot);
+                }
+            } else {
+                (void)snprintf(status, sizeof(status), "%s", refresh.error.message);
+            }
             last_refresh = monotonic_milliseconds();
+        }
+        uint64_t now = monotonic_milliseconds();
+        if (settings->auto_refresh && !refresh.active &&
+            now - last_refresh >= (uint64_t)settings->refresh_seconds * UINT64_C(1000)) {
+            if (dashboard_refresh_start(&refresh, snapshot->generation + 1U, &error)) {
+                (void)snprintf(status, sizeof(status),
+                               "Refresh in progress • navigation remains available.");
+            } else {
+                (void)snprintf(status, sizeof(status), "%s", error.message);
+                last_refresh = now;
+            }
         }
         int width = getmaxx(window);
         int height = getmaxy(window);
@@ -724,6 +1123,10 @@ static void run_dashboard(WINDOW *window,
         od_render_dashboard(canvas, &dashboard, ascii, &hit_map, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (termination_requested()) {
+            done = true;
+            continue;
+        }
         if (input == 27 || input == 'q' || input == 'Q') {
             done = true;
         } else if (input == KEY_UP || input == 'k') {
@@ -744,6 +1147,10 @@ static void run_dashboard(WINDOW *window,
             od_dashboard_focus_next(&dashboard, -1);
         } else if (input == 'e' || input == 'E' || input == '\n' || input == '\r') {
             od_dashboard_toggle_expand(&dashboard);
+        } else if (input == 'd' || input == 'D') {
+            run_dashboard_detail(window, canvas, use_color, ascii, &dashboard);
+            (void)snprintf(status, sizeof(status),
+                           "Details closed • selection and focus preserved.");
         } else if (input == '/') {
             char query[128];
             (void)snprintf(query, sizeof(query), "%s", dashboard.search);
@@ -778,27 +1185,60 @@ static void run_dashboard(WINDOW *window,
                     od_dashboard_move_focused(&dashboard, -3);
                 } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
                     od_dashboard_move_focused(&dashboard, 3);
-                } else if ((event.bstate & (BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED)) != 0U) {
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U) {
                     const OdHitRegion *hit = od_hitmap_at(&hit_map, event.x, event.y);
                     if (hit != NULL) select_mouse_target(&dashboard, hit);
                 }
             }
         } else if (input == 'r' || input == 'R') {
-            (void)snprintf(status, sizeof(status),
-                           "Refreshing listeners and Docker mappings...");
-            od_render_dashboard(canvas, &dashboard, ascii, &hit_map, status);
-            paint_canvas(window, canvas, use_color);
-            (void)refresh_dashboard(project_root, profile, snapshot, &saved,
-                                    &plan, &dashboard, status, sizeof(status));
-            last_refresh = monotonic_milliseconds();
+            if (refresh.active) {
+                (void)snprintf(status, sizeof(status),
+                               "Refresh already in progress • navigation remains available.");
+            } else if (dashboard_refresh_start(&refresh, snapshot->generation + 1U, &error)) {
+                (void)snprintf(status, sizeof(status),
+                               "Refresh in progress • navigation remains available.");
+            } else {
+                (void)snprintf(status, sizeof(status), "%s", error.message);
+            }
         } else if (input == KEY_RESIZE) {
             continue;
         }
+    }
+    if (refresh.active) {
+        (void)pthread_join(refresh.thread, NULL);
+        od_scan_snapshot_free(&refresh.snapshot);
     }
     od_hitmap_free(&hit_map);
     od_dashboard_free(&dashboard);
     od_allocation_plan_free(&plan);
     od_assignments_free(&saved);
+}
+
+static void run_listener_explorer(WINDOW *window,
+                                  OdCanvas *canvas,
+                                  bool use_color,
+                                  bool ascii,
+                                  const char *project_root,
+                                  const OdSettings *settings,
+                                  OdScanSnapshot *snapshot) {
+    OdProfile profile;
+    od_profile_init(&profile);
+    char name[128];
+    project_display_name(project_root, name, sizeof(name));
+    size_t name_length = strlen(name) + 1U;
+    profile.project_name = malloc(name_length);
+    profile.assignment_file = malloc(sizeof(".ports.env"));
+    if (profile.project_name == NULL || profile.assignment_file == NULL) {
+        od_profile_free(&profile);
+        return;
+    }
+    memcpy(profile.project_name, name, name_length);
+    memcpy(profile.assignment_file, ".ports.env", sizeof(".ports.env"));
+    profile.port_min = 1024U;
+    profile.port_max = 65535U;
+    run_dashboard(window, canvas, use_color, ascii, project_root,
+                  &profile, settings, snapshot);
+    od_profile_free(&profile);
 }
 
 static OdStatus scan_now(uint64_t generation,
@@ -839,6 +1279,7 @@ static OdStatus review_conflicts(WINDOW *window,
         od_render_conflict_resolution(canvas, resolution, ascii, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (termination_requested()) return OD_ERROR_CANCELLED;
         if (input == 27 || input == 'q' || input == 'Q') return OD_ERROR_CANCELLED;
         if (input == '\n' || input == '\r' || input == 'a' || input == 'A') {
             od_resolution_accept(resolution);
@@ -898,6 +1339,7 @@ static OdStatus review_changes_and_save(WINDOW *window,
         od_render_change_review(canvas, profile, plan, selected, ascii, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
+        if (termination_requested()) return OD_ERROR_CANCELLED;
         size_t page_size = height > 12 ? (size_t)(height - 12) : 1U;
         if (input == 27 || input == 'q' || input == 'Q') return OD_ERROR_CANCELLED;
         if ((input == KEY_UP || input == 'k') && selected > 0U) {
@@ -1052,6 +1494,155 @@ static OdStatus run_resolution(WINDOW *window,
     return status;
 }
 
+static OdStatus clone_profile(const OdProfile *source,
+                              OdProfile *copy,
+                              OdError *error) {
+    char *text = NULL;
+    size_t length = 0U;
+    OdStatus status = od_profile_render(source, &text, &length, error);
+    if (status == OD_OK) status = od_profile_parse(text, length, copy, error);
+    free(text);
+    return status;
+}
+
+static bool run_profile_editor(WINDOW *window,
+                               OdCanvas *canvas,
+                               bool use_color,
+                               bool ascii,
+                               const char *project_root,
+                               const char *profile_path,
+                               OdProfile *profile,
+                               OdScanSnapshot *snapshot,
+                               char *result,
+                               size_t result_capacity) {
+    OdError error;
+    OdProfile draft;
+    if (clone_profile(profile, &draft, &error) != OD_OK) {
+        (void)snprintf(result, result_capacity, "%s", error.message);
+        return false;
+    }
+    size_t selected = 0U;
+    char status[256] = "Edit a service or add one; nothing is saved until you press s.";
+    bool done = false;
+    bool saved = false;
+    while (!done) {
+        if (draft.service_count > 0U && selected >= draft.service_count) {
+            selected = draft.service_count - 1U;
+        }
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, &error)) break;
+        char assignment[4096];
+        const char *assignment_display = assignment_path(project_root, &draft,
+                                                          assignment,
+                                                          sizeof(assignment)) ?
+                                             assignment : "unavailable";
+        OdProfileView view = {
+            .profile = &draft,
+            .selected_service = selected,
+            .profile_path = profile_path,
+            .assignment_path = assignment_display,
+            .status = status
+        };
+        od_render_profile_editor(canvas, &view, ascii);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        size_t rows = height > 10 ? (size_t)(height - 10) : 1U;
+        if (input == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    input = KEY_UP;
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    input = KEY_DOWN;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U &&
+                           event.y >= 6 && event.y < 6 + (int)rows) {
+                    size_t page_start = (selected / rows) * rows;
+                    size_t target = page_start + (size_t)(event.y - 6);
+                    if (target < draft.service_count) selected = target;
+                    input = ERR;
+                }
+            }
+        }
+        if (termination_requested()) {
+            done = true;
+        } else if (input == 27 || input == 'q' || input == 'Q') {
+            (void)snprintf(result, result_capacity,
+                           "Profile editor closed; draft changes were discarded.");
+            done = true;
+        } else if ((input == KEY_UP || input == 'k') && selected > 0U) {
+            --selected;
+        } else if ((input == KEY_DOWN || input == 'j') &&
+                   selected + 1U < draft.service_count) {
+            ++selected;
+        } else if (input == KEY_PPAGE) {
+            selected = selected > rows ? selected - rows : 0U;
+        } else if (input == KEY_NPAGE && draft.service_count > 0U) {
+            size_t maximum = draft.service_count - 1U;
+            selected = selected + rows > maximum ? maximum : selected + rows;
+        } else if (input == KEY_HOME) {
+            selected = 0U;
+        } else if (input == KEY_END && draft.service_count > 0U) {
+            selected = draft.service_count - 1U;
+        } else if (input == 'e' || input == 'E' || input == '\n' || input == '\r') {
+            if (draft.service_count == 0U) {
+                (void)snprintf(status, sizeof(status),
+                               "No service is selected; press a to add one.");
+            } else {
+                (void)prompt_profile_service(window, canvas, use_color, ascii,
+                                             &draft, selected, true,
+                                             status, sizeof(status));
+            }
+        } else if (input == 'a' || input == 'A') {
+            if (prompt_profile_service(window, canvas, use_color, ascii,
+                                       &draft, selected, false,
+                                       status, sizeof(status))) {
+                selected = draft.service_count - 1U;
+            }
+        } else if (input == 'x' || input == 'X') {
+            char confirmation[16] = {0};
+            if (!prompt_text(window, canvas, use_color, ascii,
+                             "Reset local assignments",
+                             "Type RESET to back up and remove only the assignment file",
+                             confirmation, sizeof(confirmation))) {
+                (void)snprintf(status, sizeof(status),
+                               "Reset cancelled; no assignment file was changed.");
+            } else if (strcmp(confirmation, "RESET") != 0) {
+                (void)snprintf(status, sizeof(status),
+                               "Reset cancelled; type RESET exactly to confirm.");
+            } else if (od_project_reset_assignments(project_root, profile, &error) != OD_OK) {
+                (void)snprintf(status, sizeof(status), "%s", error.message);
+            } else {
+                (void)snprintf(status, sizeof(status),
+                               "Local assignments reset; the project profile was kept.");
+            }
+        } else if (input == 's' || input == 'S') {
+            OdStatus save_status = od_profile_validate(&draft, &error);
+            if (save_status == OD_OK) {
+                save_status = run_resolution(window, canvas, use_color, ascii,
+                                             project_root, profile_path, &draft,
+                                             snapshot, &error);
+            }
+            if (save_status == OD_OK) {
+                od_profile_free(profile);
+                *profile = draft;
+                draft = (OdProfile){0};
+                (void)snprintf(result, result_capacity,
+                               "Project profile and assignments saved atomically.");
+                saved = true;
+                done = true;
+            } else if (save_status == OD_ERROR_CANCELLED) {
+                (void)snprintf(status, sizeof(status),
+                               "Save cancelled; the profile draft remains open.");
+            } else {
+                (void)snprintf(status, sizeof(status), "%s", error.message);
+            }
+        }
+    }
+    od_profile_free(&draft);
+    return saved;
+}
+
 int od_tui_run(const OpendoorOptions *options) {
     (void)setlocale(LC_ALL, "");
     OdSettings settings;
@@ -1088,6 +1679,8 @@ int od_tui_run(const OpendoorOptions *options) {
     bool ascii = options->force_ascii || settings.unicode_mode == OD_UNICODE_NEVER ||
                  (settings.unicode_mode == OD_UNICODE_AUTO && MB_CUR_MAX <= 1U);
     bool reduced_motion = options->reduced_motion || settings.reduced_motion;
+    SignalState signal_state;
+    if (!signal_state_install(&signal_state)) return 5;
     StartupScan scan = {0};
     od_scan_snapshot_init(&scan.snapshot, 1U);
     atomic_init(&scan.stage, OD_LOAD_PROJECT_FILES);
@@ -1095,6 +1688,7 @@ int od_tui_run(const OpendoorOptions *options) {
     atomic_init(&scan.warning_count, 0U);
     if (pthread_create(&scan.thread, NULL, startup_scan_main, &scan) != 0) {
         od_scan_snapshot_free(&scan.snapshot);
+        signal_state_restore(&signal_state);
         return 5;
     }
 
@@ -1102,6 +1696,7 @@ int od_tui_run(const OpendoorOptions *options) {
     if (window == NULL) {
         (void)pthread_join(scan.thread, NULL);
         od_scan_snapshot_free(&scan.snapshot);
+        signal_state_restore(&signal_state);
         return 5;
     }
     (void)noecho();
@@ -1123,6 +1718,7 @@ int od_tui_run(const OpendoorOptions *options) {
             (void)endwin();
             (void)pthread_join(scan.thread, NULL);
             od_scan_snapshot_free(&scan.snapshot);
+            signal_state_restore(&signal_state);
             return 5;
         }
         uint64_t elapsed = monotonic_milliseconds() - started;
@@ -1139,6 +1735,10 @@ int od_tui_run(const OpendoorOptions *options) {
         }
         paint_canvas(window, &canvas, use_color);
         int input = wgetch(window);
+        if (termination_requested()) {
+            animation_skipped = true;
+            break;
+        }
         if (input == 27) animation_skipped = true;
         if (atomic_load(&scan.done) && elapsed >= 350U) break;
     }
@@ -1166,7 +1766,7 @@ int od_tui_run(const OpendoorOptions *options) {
     }
     bool scan_joined = false;
     size_t selected = 0U;
-    bool quit = false;
+    bool quit = termination_requested();
     char status[256];
     menu_status(status, sizeof(status), configured, selected);
     if (profile_error[0] != '\0') {
@@ -1194,8 +1794,31 @@ int od_tui_run(const OpendoorOptions *options) {
         }
         paint_canvas(window, &canvas, use_color);
         int input = wgetch(window);
+        if (input == KEY_MOUSE && settings.mouse) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if ((event.bstate & BUTTON4_PRESSED) != 0U) {
+                    input = KEY_UP;
+                } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
+                    input = KEY_DOWN;
+                } else if ((event.bstate & BUTTON1_CLICKED) != 0U) {
+                    int menu_width = 50;
+                    if (menu_width > width - 4) menu_width = width - 4;
+                    int menu_x = (width - menu_width) / 2;
+                    int first_row = 11;
+                    if (event.x >= menu_x && event.x < menu_x + menu_width &&
+                        event.y >= first_row &&
+                        event.y < first_row + (int)menu_item_count(configured)) {
+                        selected = (size_t)(event.y - first_row);
+                        input = '\n';
+                    }
+                }
+            }
+        }
         size_t count = menu_item_count(configured);
-        if (input == '?') {
+        if (termination_requested()) {
+            quit = true;
+        } else if (input == '?') {
             run_help(window, &canvas, use_color, ascii);
             menu_status(status, sizeof(status), configured, selected);
         } else if (input == 'q' || input == 'Q' || input == 27) {
@@ -1238,6 +1861,19 @@ int od_tui_run(const OpendoorOptions *options) {
                 } else {
                     (void)snprintf(status, sizeof(status),
                                    "Discovery review cancelled; no files were changed.");
+                }
+            } else if (!configured && selected == 1U) {
+                if (!atomic_load(&scan.done)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "The startup scan is still running; try again in a moment.");
+                } else {
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    run_listener_explorer(window, &canvas, use_color, ascii,
+                                          project_root, &settings, &scan.snapshot);
+                    menu_status(status, sizeof(status), configured, selected);
                 }
             } else if (configured && selected == 0U) {
                 if (!session_profile_ready) {
@@ -1307,6 +1943,26 @@ int od_tui_run(const OpendoorOptions *options) {
                         (void)snprintf(status, sizeof(status), "%s", refresh_error.message);
                     }
                 }
+            } else if (configured && selected == 3U) {
+                if (!session_profile_ready || active_profile_path == NULL) {
+                    (void)snprintf(status, sizeof(status),
+                                   "No valid project profile is available.");
+                } else if (!atomic_load(&scan.done)) {
+                    (void)snprintf(status, sizeof(status),
+                                   "The startup scan is still running; try again in a moment.");
+                } else {
+                    if (!scan_joined) {
+                        (void)pthread_join(scan.thread, NULL);
+                        scan_joined = true;
+                    }
+                    char editor_result[256] =
+                        "Profile editor closed; no files were changed.";
+                    (void)run_profile_editor(window, &canvas, use_color, ascii,
+                                             project_root, active_profile_path,
+                                             &session_profile, &scan.snapshot,
+                                             editor_result, sizeof(editor_result));
+                    (void)snprintf(status, sizeof(status), "%s", editor_result);
+                }
             } else if ((!configured && selected == 2U) ||
                        (configured && selected == 4U)) {
                 if (run_settings(window, &canvas, use_color, ascii,
@@ -1342,5 +1998,6 @@ int od_tui_run(const OpendoorOptions *options) {
     if (!scan_joined) (void)pthread_join(scan.thread, NULL);
     od_scan_snapshot_free(&scan.snapshot);
     if (session_profile_ready) od_profile_free(&session_profile);
+    signal_state_restore(&signal_state);
     return 0;
 }

@@ -33,6 +33,14 @@ typedef struct {
     const char *status;
 } OdSettingsView;
 
+typedef struct {
+    const OdProfile *profile;
+    size_t selected_service;
+    const char *profile_path;
+    const char *assignment_path;
+    const char *status;
+} OdProfileView;
+
 void od_render_resize_required(OdCanvas *canvas);
 void od_render_loading(OdCanvas *canvas,
                        OdLoadingStage stage,
@@ -51,6 +59,13 @@ void od_render_dashboard(OdCanvas *canvas,
                          bool ascii,
                          OdHitMap *hit_map,
                          const char *status);
+size_t od_render_dashboard_detail(OdCanvas *canvas,
+                                  const OdDashboard *dashboard,
+                                  size_t page,
+                                  bool ascii);
+void od_render_profile_editor(OdCanvas *canvas,
+                              const OdProfileView *view,
+                              bool ascii);
 void od_render_conflict_resolution(OdCanvas *canvas,
                                    const OdResolution *resolution,
                                    bool ascii,

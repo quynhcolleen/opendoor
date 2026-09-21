@@ -3,10 +3,14 @@
 #include "tomlc17.h"
 
 #include <limits.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define OD_CONFIG_MAX_BYTES (4U * 1024U * 1024U)
 
@@ -304,34 +308,47 @@ OdStatus od_profile_parse(const char *text, size_t length, OdProfile *profile, O
 }
 
 static OdStatus read_file(const char *path, char **text, size_t *length, OdError *error) {
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
-        od_error_set(error, OD_ERROR_IO, "unable to open %s", path);
-        return OD_ERROR_IO;
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        od_error_set(error, errno == ELOOP ? OD_ERROR_INVALID : OD_ERROR_IO,
+                     errno == ELOOP ? "refusing symlink configuration: %s" :
+                                      "unable to open %s",
+                     path);
+        return errno == ELOOP ? OD_ERROR_INVALID : OD_ERROR_IO;
     }
-    if (fseek(file, 0L, SEEK_END) != 0) {
-        fclose(file);
-        od_error_set(error, OD_ERROR_IO, "unable to inspect %s", path);
-        return OD_ERROR_IO;
-    }
-    long end = ftell(file);
-    if (end < 0 || (unsigned long)end > OD_CONFIG_MAX_BYTES || fseek(file, 0L, SEEK_SET) != 0) {
-        fclose(file);
-        od_error_set(error, OD_ERROR_INVALID, "%s is too large or unreadable", path);
+    struct stat information;
+    if (fstat(descriptor, &information) != 0 || !S_ISREG(information.st_mode)) {
+        (void)close(descriptor);
+        od_error_set(error, OD_ERROR_INVALID, "%s is not a regular configuration file", path);
         return OD_ERROR_INVALID;
     }
-    size_t size = (size_t)end;
+    if (information.st_size < 0 || (uintmax_t)information.st_size > OD_CONFIG_MAX_BYTES) {
+        (void)close(descriptor);
+        od_error_set(error, OD_ERROR_INVALID, "%s is too large", path);
+        return OD_ERROR_INVALID;
+    }
+    size_t size = (size_t)information.st_size;
     char *buffer = malloc(size + 1U);
     if (buffer == NULL) {
-        fclose(file);
+        (void)close(descriptor);
         od_error_set(error, OD_ERROR_MEMORY, "unable to read %s", path);
         return OD_ERROR_MEMORY;
     }
-    size_t read_count = fread(buffer, 1U, size, file);
-    int close_result = fclose(file);
-    if (read_count != size || close_result != 0) {
+    size_t used = 0U;
+    while (used < size) {
+        ssize_t count = read(descriptor, buffer + used, size - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            free(buffer);
+            (void)close(descriptor);
+            od_error_set(error, OD_ERROR_IO, "unable to read %s", path);
+            return OD_ERROR_IO;
+        }
+        used += (size_t)count;
+    }
+    if (close(descriptor) != 0) {
         free(buffer);
-        od_error_set(error, OD_ERROR_IO, "unable to read %s", path);
+        od_error_set(error, OD_ERROR_IO, "unable to close %s", path);
         return OD_ERROR_IO;
     }
     buffer[size] = '\0';

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 static int failures = 0;
 
@@ -73,6 +74,30 @@ static void test_settings_round_trip_and_atomic_save(void) {
     (void)rmdir(root);
 }
 
+static void test_config_loader_rejects_symlinks(void) {
+    char template[] = "/tmp/opendoor-config-link-XXXXXX";
+    char *root = mkdtemp(template);
+    CHECK(root != NULL);
+    if (root == NULL) return;
+    char target[1024];
+    char link[1024];
+    (void)snprintf(target, sizeof(target), "%s/target.toml", root);
+    (void)snprintf(link, sizeof(link), "%s/settings.toml", root);
+    FILE *file = fopen(target, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("schema_version = 1\n", file);
+        (void)fclose(file);
+    }
+    CHECK(symlink(target, link) == 0);
+    OdSettings settings;
+    OdError error;
+    CHECK(od_settings_load(link, &settings, &error) == OD_ERROR_INVALID);
+    (void)unlink(link);
+    (void)unlink(target);
+    (void)rmdir(root);
+}
+
 static void test_help_search_and_pagination(void) {
     OdHelp help;
     OdError error;
@@ -86,6 +111,9 @@ static void test_help_search_and_pagination(void) {
     CHECK(help.visible_count > 0U);
     CHECK(strstr(od_help_description(&help, 0U), "mouse") != NULL ||
           strstr(od_help_key(&help, 0U), "mouse") != NULL);
+    CHECK(od_help_search(&help, "selected row details", &error) == OD_OK);
+    CHECK(help.visible_count == 1U);
+    CHECK(strcmp(od_help_key(&help, 0U), "d") == 0);
     od_help_end(&help);
     od_help_home(&help);
     CHECK(help.selected == 0U && help.page_start == 0U);
@@ -124,6 +152,7 @@ static void test_settings_and_help_are_one_viewport(void) {
 
 int main(void) {
     test_settings_round_trip_and_atomic_save();
+    test_config_loader_rejects_symlinks();
     test_help_search_and_pagination();
     test_settings_and_help_are_one_viewport();
     CHECK(od_theme_count() == 4U);

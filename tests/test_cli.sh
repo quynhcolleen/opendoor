@@ -25,3 +25,8 @@ status=$?
 set -e
 [[ $status -eq 2 ]]
 
+set +e
+$binary </dev/null >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 4 ]]

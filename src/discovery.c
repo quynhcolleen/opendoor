@@ -6,11 +6,13 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define OD_DISCOVERY_INPUT_LIMIT (4U * 1024U * 1024U)
 #define OD_DISCOVERY_SOURCE_CAP 4096U
@@ -514,23 +516,33 @@ static bool skipped_directory(const char *name) {
 }
 
 static OdStatus read_discovery_file(const char *path, char **text, OdError *error) {
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) return errno == ELOOP ? OD_ERROR_INVALID : OD_ERROR_IO;
     struct stat metadata;
-    if (lstat(path, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
         metadata.st_size < 0 || (uintmax_t)metadata.st_size > OD_DISCOVERY_INPUT_LIMIT) {
+        (void)close(descriptor);
         return OD_ERROR_INVALID;
     }
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) return OD_ERROR_IO;
     size_t length = (size_t)metadata.st_size;
     char *buffer = malloc(length + 1U);
     if (buffer == NULL) {
-        fclose(file);
+        (void)close(descriptor);
         od_error_set(error, OD_ERROR_MEMORY, "unable to read %s", path);
         return OD_ERROR_MEMORY;
     }
-    size_t count = fread(buffer, 1U, length, file);
-    int close_result = fclose(file);
-    if (count != length || close_result != 0) {
+    size_t used = 0U;
+    while (used < length) {
+        ssize_t count = read(descriptor, buffer + used, length - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            free(buffer);
+            (void)close(descriptor);
+            return OD_ERROR_IO;
+        }
+        used += (size_t)count;
+    }
+    if (close(descriptor) != 0) {
         free(buffer);
         return OD_ERROR_IO;
     }

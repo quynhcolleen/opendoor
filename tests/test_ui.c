@@ -104,6 +104,24 @@ static void test_unicode_and_ascii_boxes(void) {
     od_canvas_free(&canvas);
 }
 
+static void test_terminal_text_is_sanitized(void) {
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 24U, 3U, &error) == OD_OK);
+    od_canvas_clear(&canvas, OD_ROLE_DEFAULT);
+    const char hostile[] = "safe\x1b[31m bad\x01 \xc0\xaf end";
+    od_canvas_write(&canvas, 0, 0, hostile, 24U, OD_ROLE_DEFAULT, 0U);
+    char *text = od_canvas_to_text(&canvas, &error);
+    CHECK(text != NULL);
+    if (text != NULL) {
+        CHECK(strstr(text, "safe [31m bad  ?? end") != NULL);
+        CHECK(strchr(text, '\x1b') == NULL);
+        CHECK(strchr(text, '\x01') == NULL);
+        free(text);
+    }
+    od_canvas_free(&canvas);
+}
+
 static void test_midnight_theme(void) {
     const OdTheme *theme = od_theme_by_name("midnight");
     CHECK(theme != NULL);
@@ -120,6 +138,7 @@ int main(void) {
     test_main_menu_snapshot();
     test_loading_and_resize_snapshots();
     test_unicode_and_ascii_boxes();
+    test_terminal_text_is_sanitized();
     test_midnight_theme();
     if (failures != 0) {
         fprintf(stderr, "%d UI checks failed\n", failures);

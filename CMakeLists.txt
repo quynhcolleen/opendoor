@@ -101,6 +101,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_settings PRIVATE opendoor_core)
   target_compile_options(test_settings PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME settings_contracts COMMAND test_settings)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME tui_pty_contracts
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tui_pty.py
+              ${CMAKE_BINARY_DIR}/opendoor
+    )
+    set_tests_properties(tui_pty_contracts PROPERTIES TIMEOUT 30)
+  endif()
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)

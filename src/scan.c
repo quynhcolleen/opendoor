@@ -94,21 +94,73 @@ static bool same_endpoint(const OdEndpoint *left, const OdEndpoint *right) {
            strcmp(left->remote_address, right->remote_address) == 0;
 }
 
-static OdStatus add_endpoint(OdScanSnapshot *snapshot, const OdEndpoint *endpoint, OdError *error) {
-    for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {
-        if (same_endpoint(&snapshot->endpoints[index], endpoint)) {
-            return OD_OK;
+static OdStatus add_endpoint(OdScanSnapshot *snapshot,
+                             const OdEndpoint *endpoint,
+                             OdError *error) {
+    if (snapshot->endpoint_count == snapshot->endpoint_capacity) {
+        size_t capacity = snapshot->endpoint_capacity == 0U ? 64U :
+                          snapshot->endpoint_capacity * 2U;
+        if (capacity <= snapshot->endpoint_count ||
+            capacity > SIZE_MAX / sizeof(*snapshot->endpoints)) {
+            od_error_set(error, OD_ERROR_MEMORY, "endpoint collection is too large");
+            return OD_ERROR_MEMORY;
         }
+        OdEndpoint *items = realloc(snapshot->endpoints,
+                                    capacity * sizeof(*items));
+        if (items == NULL) {
+            od_error_set(error, OD_ERROR_MEMORY, "unable to store endpoint");
+            return OD_ERROR_MEMORY;
+        }
+        snapshot->endpoints = items;
+        snapshot->endpoint_capacity = capacity;
     }
-    OdEndpoint *items = realloc(snapshot->endpoints,
-                                (snapshot->endpoint_count + 1U) * sizeof(*items));
-    if (items == NULL) {
-        od_error_set(error, OD_ERROR_MEMORY, "unable to store endpoint");
+    snapshot->endpoints[snapshot->endpoint_count] = *endpoint;
+    ++snapshot->endpoint_count;
+    return OD_OK;
+}
+
+static OdStatus deduplicate_endpoints(OdScanSnapshot *snapshot, OdError *error) {
+    if (snapshot->endpoint_count < 2U) return OD_OK;
+    if (snapshot->endpoint_count > SIZE_MAX / 2U) {
+        od_error_set(error, OD_ERROR_MEMORY, "endpoint index is too large");
         return OD_ERROR_MEMORY;
     }
-    snapshot->endpoints = items;
-    items[snapshot->endpoint_count] = *endpoint;
-    ++snapshot->endpoint_count;
+    size_t table_size = 1U;
+    size_t required = snapshot->endpoint_count * 2U;
+    while (table_size < required) {
+        if (table_size > SIZE_MAX / 2U) {
+            od_error_set(error, OD_ERROR_MEMORY, "endpoint index is too large");
+            return OD_ERROR_MEMORY;
+        }
+        table_size *= 2U;
+    }
+    size_t *table = calloc(table_size, sizeof(*table));
+    if (table == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to index endpoints");
+        return OD_ERROR_MEMORY;
+    }
+    size_t output = 0U;
+    for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {
+        const OdEndpoint *endpoint = &snapshot->endpoints[index];
+        uint64_t hash = fnv1a(endpoint->stable_id, strlen(endpoint->stable_id),
+                              UINT64_C(1469598103934665603));
+        size_t slot = (size_t)hash & (table_size - 1U);
+        bool duplicate = false;
+        while (table[slot] != 0U) {
+            size_t existing = table[slot] - 1U;
+            if (same_endpoint(&snapshot->endpoints[existing], endpoint)) {
+                duplicate = true;
+                break;
+            }
+            slot = (slot + 1U) & (table_size - 1U);
+        }
+        if (duplicate) continue;
+        if (output != index) snapshot->endpoints[output] = *endpoint;
+        table[slot] = output + 1U;
+        ++output;
+    }
+    snapshot->endpoint_count = output;
+    free(table);
     return OD_OK;
 }
 
@@ -234,6 +286,7 @@ OdStatus od_parse_proc_net(const char *text,
         status = add_endpoint(snapshot, &endpoint, error);
     }
     free(buffer);
+    if (status == OD_OK) status = deduplicate_endpoints(snapshot, error);
     if (status == OD_OK) od_error_clear(error);
     return status;
 }
@@ -344,6 +397,7 @@ static OdStatus scan_netlink(OdScanSnapshot *snapshot, OdError *error) {
                                         sequence++, snapshot, error);
         }
     }
+    if (status == OD_OK) status = deduplicate_endpoints(snapshot, error);
     (void)close(socket_fd);
     return status;
 }
@@ -505,14 +559,48 @@ static void read_process_metadata(const char *proc_root, pid_t pid, OdEndpoint *
     }
 }
 
-static void attach_inode(OdScanSnapshot *snapshot, uint64_t inode,
-                         const char *proc_root, pid_t pid) {
-    for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {
-        OdEndpoint *endpoint = &snapshot->endpoints[index];
-        if (endpoint->inode == inode && endpoint->pid == 0) {
+typedef struct {
+    uint64_t inode;
+    size_t endpoint_index;
+} InodeTarget;
+
+static int compare_inode_targets(const void *left_value, const void *right_value) {
+    const InodeTarget *left = left_value;
+    const InodeTarget *right = right_value;
+    if (left->inode == right->inode) return 0;
+    return left->inode < right->inode ? -1 : 1;
+}
+
+static size_t inode_lower_bound(const InodeTarget *targets,
+                                size_t count,
+                                uint64_t inode) {
+    size_t left = 0U;
+    size_t right = count;
+    while (left < right) {
+        size_t middle = left + (right - left) / 2U;
+        if (targets[middle].inode < inode) {
+            left = middle + 1U;
+        } else {
+            right = middle;
+        }
+    }
+    return left;
+}
+
+static void attach_inode(OdScanSnapshot *snapshot,
+                         const InodeTarget *targets,
+                         size_t target_count,
+                         uint64_t inode,
+                         const char *proc_root,
+                         pid_t pid) {
+    size_t index = inode_lower_bound(targets, target_count, inode);
+    while (index < target_count && targets[index].inode == inode) {
+        OdEndpoint *endpoint = &snapshot->endpoints[targets[index].endpoint_index];
+        if (endpoint->pid == 0) {
             endpoint->pid = pid;
             read_process_metadata(proc_root, pid, endpoint);
         }
+        ++index;
     }
 }
 
@@ -523,8 +611,22 @@ OdStatus od_resolve_process_owners(const char *proc_root,
         od_error_set(error, OD_ERROR_INVALID, "proc root and snapshot are required");
         return OD_ERROR_INVALID;
     }
+    InodeTarget *targets = NULL;
+    if (snapshot->endpoint_count > 0U) {
+        targets = calloc(snapshot->endpoint_count, sizeof(*targets));
+        if (targets == NULL) {
+            od_error_set(error, OD_ERROR_MEMORY, "unable to index socket inodes");
+            return OD_ERROR_MEMORY;
+        }
+        for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {
+            targets[index] = (InodeTarget){snapshot->endpoints[index].inode, index};
+        }
+        qsort(targets, snapshot->endpoint_count, sizeof(*targets),
+              compare_inode_targets);
+    }
     DIR *root = opendir(proc_root);
     if (root == NULL) {
+        free(targets);
         od_error_set(error, OD_ERROR_IO, "unable to open %s", proc_root);
         return OD_ERROR_IO;
     }
@@ -558,12 +660,14 @@ OdStatus od_resolve_process_owners(const char *proc_root,
             target[(size_t)target_length] = '\0';
             uint64_t inode = 0U;
             if (od_parse_socket_inode(target, &inode)) {
-                attach_inode(snapshot, inode, proc_root, pid);
+                attach_inode(snapshot, targets, snapshot->endpoint_count,
+                             inode, proc_root, pid);
             }
         }
         closedir(fds);
     }
     closedir(root);
+    free(targets);
     if (limited) {
         snapshot->process_permissions_limited = true;
         for (size_t index = 0U; index < snapshot->endpoint_count; ++index) {

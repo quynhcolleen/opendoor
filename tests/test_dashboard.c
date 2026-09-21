@@ -205,6 +205,25 @@ static void test_responsive_dashboard_snapshots_and_focus(void) {
     render_and_check(&dashboard, 100U, 26U, "Services", "Medium layout");
     dashboard.focused = OD_WIDGET_DOCKER;
     render_and_check(&dashboard, 70U, 22U, "Docker mappings", "Compact layout");
+    OdCanvas compact_canvas;
+    OdHitMap compact_hits;
+    od_hitmap_init(&compact_hits);
+    CHECK(od_canvas_init(&compact_canvas, 70U, 22U, &error) == OD_OK);
+    od_render_dashboard(&compact_canvas, &dashboard, true, &compact_hits,
+                        "Compact mouse targets");
+    bool has_tab = false;
+    bool has_scroll_up = false;
+    bool has_scroll_down = false;
+    for (size_t index = 0U; index < compact_hits.count; ++index) {
+        has_tab = has_tab || compact_hits.items[index].action == OD_HIT_FOCUS_WIDGET;
+        has_scroll_up = has_scroll_up ||
+            compact_hits.items[index].action == OD_HIT_SCROLL_UP;
+        has_scroll_down = has_scroll_down ||
+            compact_hits.items[index].action == OD_HIT_SCROLL_DOWN;
+    }
+    CHECK(has_tab && has_scroll_up && has_scroll_down);
+    od_hitmap_free(&compact_hits);
+    od_canvas_free(&compact_canvas);
     od_dashboard_toggle_expand(&dashboard);
     CHECK(dashboard.expanded);
     render_and_check(&dashboard, 100U, 24U, "Docker mappings", "Expanded widget");
@@ -217,9 +236,90 @@ static void test_responsive_dashboard_snapshots_and_focus(void) {
     od_profile_free(&profile);
 }
 
+static void test_detail_view_wraps_full_values_across_internal_pages(void) {
+    OdProfile profile;
+    OdScanSnapshot snapshot;
+    OdAllocationPlan plan;
+    make_dashboard_inputs(&profile, &snapshot, &plan);
+    memset(snapshot.endpoints[0].executable, 'x',
+           sizeof(snapshot.endpoints[0].executable) - 1U);
+    const char marker[] = "DETAIL-TAIL";
+    size_t marker_offset = sizeof(snapshot.endpoints[0].executable) - sizeof(marker);
+    memcpy(snapshot.endpoints[0].executable + marker_offset, marker, sizeof(marker));
+    (void)strcpy(snapshot.endpoints[0].command,
+                 "server --listen 0.0.0.0 --port 3000 --mode integration");
+
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_dashboard_init(&dashboard, &profile, &snapshot, &plan, &error) == OD_OK);
+    dashboard.focused = OD_WIDGET_LISTENERS;
+    dashboard.listener_selected = 0U;
+    OdCanvas canvas;
+    CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
+    size_t pages = od_render_dashboard_detail(&canvas, &dashboard, 0U, true);
+    CHECK(pages > 1U);
+    char *first = od_canvas_to_text(&canvas, &error);
+    CHECK(first != NULL && strstr(first, "Listener details") != NULL);
+    CHECK(first != NULL && strstr(first, marker) == NULL);
+    free(first);
+
+    bool marker_prefix_found = false;
+    bool marker_suffix_found = false;
+    for (size_t page = 1U; page < pages; ++page) {
+        (void)od_render_dashboard_detail(&canvas, &dashboard, page, true);
+        char *rendered = od_canvas_to_text(&canvas, &error);
+        CHECK(rendered != NULL && count_newlines(rendered) == 18U);
+        CHECK(rendered != NULL && strstr(rendered, "PgUp/PgDn Page") != NULL);
+        if (rendered != NULL && strstr(rendered, "DETAIL-") != NULL) {
+            marker_prefix_found = true;
+        }
+        if (rendered != NULL && strstr(rendered, "TAIL") != NULL) {
+            marker_suffix_found = true;
+        }
+        free(rendered);
+    }
+    CHECK(marker_prefix_found && marker_suffix_found);
+    od_canvas_free(&canvas);
+    od_dashboard_free(&dashboard);
+    od_allocation_plan_free(&plan);
+    od_scan_snapshot_free(&snapshot);
+    od_profile_free(&profile);
+}
+
+static void test_profile_editor_is_paginated_inside_one_viewport(void) {
+    OdProfile profile;
+    OdScanSnapshot snapshot;
+    OdAllocationPlan plan;
+    make_dashboard_inputs(&profile, &snapshot, &plan);
+    OdProfileView view = {
+        .profile = &profile,
+        .selected_service = 12U,
+        .profile_path = ".opendoor/project.toml",
+        .assignment_path = ".ports.env",
+        .status = "Draft changes are not saved"
+    };
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 70U, 18U, &error) == OD_OK);
+    od_render_profile_editor(&canvas, &view, true);
+    char *text = od_canvas_to_text(&canvas, &error);
+    CHECK(text != NULL && count_newlines(text) == 18U);
+    CHECK(text != NULL && strstr(text, "Edit project profile") != NULL);
+    CHECK(text != NULL && strstr(text, "Service 12") != NULL);
+    CHECK(text != NULL && strstr(text, "Page 2/") != NULL);
+    CHECK(text != NULL && strstr(text, "x Reset assignments") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
+    od_allocation_plan_free(&plan);
+    od_scan_snapshot_free(&snapshot);
+    od_profile_free(&profile);
+}
+
 int main(void) {
     test_selection_survives_sort_search_and_pages();
     test_responsive_dashboard_snapshots_and_focus();
+    test_detail_view_wraps_full_values_across_internal_pages();
+    test_profile_editor_is_paginated_inside_one_viewport();
     if (failures != 0) {
         fprintf(stderr, "%d dashboard checks failed\n", failures);
         return 1;

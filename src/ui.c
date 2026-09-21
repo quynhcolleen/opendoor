@@ -4,20 +4,38 @@
 #include <stdlib.h>
 #include <string.h>
 
-static size_t utf8_glyph_length(unsigned char first) {
-    if (first < 0x80U) return 1U;
-    if ((first & 0xe0U) == 0xc0U) return 2U;
-    if ((first & 0xf0U) == 0xe0U) return 3U;
-    if ((first & 0xf8U) == 0xf0U) return 4U;
-    return 1U;
+static bool continuation(unsigned char byte) {
+    return (byte & 0xc0U) == 0x80U;
+}
+
+static size_t valid_utf8_length(const char *text, size_t available) {
+    if (available == 0U) return 0U;
+    const unsigned char *bytes = (const unsigned char *)text;
+    if (bytes[0] < 0x80U) return 1U;
+    if (bytes[0] >= 0xc2U && bytes[0] <= 0xdfU && available >= 2U &&
+        continuation(bytes[1])) return 2U;
+    if (bytes[0] == 0xe0U && available >= 3U && bytes[1] >= 0xa0U &&
+        bytes[1] <= 0xbfU && continuation(bytes[2])) return 3U;
+    if (((bytes[0] >= 0xe1U && bytes[0] <= 0xecU) ||
+         (bytes[0] >= 0xeeU && bytes[0] <= 0xefU)) && available >= 3U &&
+        continuation(bytes[1]) && continuation(bytes[2])) return 3U;
+    if (bytes[0] == 0xedU && available >= 3U && bytes[1] >= 0x80U &&
+        bytes[1] <= 0x9fU && continuation(bytes[2])) return 3U;
+    if (bytes[0] == 0xf0U && available >= 4U && bytes[1] >= 0x90U &&
+        bytes[1] <= 0xbfU && continuation(bytes[2]) && continuation(bytes[3])) return 4U;
+    if (bytes[0] >= 0xf1U && bytes[0] <= 0xf3U && available >= 4U &&
+        continuation(bytes[1]) && continuation(bytes[2]) && continuation(bytes[3])) return 4U;
+    if (bytes[0] == 0xf4U && available >= 4U && bytes[1] >= 0x80U &&
+        bytes[1] <= 0x8fU && continuation(bytes[2]) && continuation(bytes[3])) return 4U;
+    return 0U;
 }
 
 static size_t text_columns(const char *text) {
     size_t columns = 0U;
-    for (size_t index = 0U; text[index] != '\0' && text[index] != '\n';) {
-        size_t length = utf8_glyph_length((unsigned char)text[index]);
-        size_t available = strlen(text + index);
-        index += length <= available ? length : 1U;
+    size_t total = strlen(text);
+    for (size_t index = 0U; index < total && text[index] != '\n';) {
+        size_t length = valid_utf8_length(text + index, total - index);
+        index += length == 0U ? 1U : length;
         ++columns;
     }
     return columns;
@@ -65,11 +83,17 @@ void od_canvas_put(OdCanvas *canvas,
     if (canvas == NULL || glyph == NULL || x < 0 || y < 0 ||
         (size_t)x >= canvas->width || (size_t)y >= canvas->height) return;
     OdCell *cell = &canvas->cells[(size_t)y * canvas->width + (size_t)x];
-    size_t length = utf8_glyph_length((unsigned char)glyph[0]);
     size_t available = strlen(glyph);
-    if (length > available || length >= sizeof(cell->glyph)) length = 1U;
-    memcpy(cell->glyph, glyph, length);
-    cell->glyph[length] = '\0';
+    size_t length = valid_utf8_length(glyph, available);
+    if (length == 0U || length >= sizeof(cell->glyph)) {
+        (void)strcpy(cell->glyph, "?");
+    } else if (length == 1U &&
+               ((unsigned char)glyph[0] < 0x20U || (unsigned char)glyph[0] == 0x7fU)) {
+        (void)strcpy(cell->glyph, " ");
+    } else {
+        memcpy(cell->glyph, glyph, length);
+        cell->glyph[length] = '\0';
+    }
     cell->role = role;
     cell->attributes = attributes;
 }
@@ -85,12 +109,12 @@ void od_canvas_write(OdCanvas *canvas,
         maximum_columns == 0U) return;
     size_t column = 0U;
     size_t index = 0U;
-    while (text[index] != '\0' && text[index] != '\n' && column < maximum_columns) {
+    size_t total = strlen(text);
+    while (index < total && text[index] != '\n' && column < maximum_columns) {
         int destination_x = x + (int)column;
         if (destination_x >= (int)canvas->width) break;
-        size_t length = utf8_glyph_length((unsigned char)text[index]);
-        size_t available = strlen(text + index);
-        if (length > available) length = 1U;
+        size_t length = valid_utf8_length(text + index, total - index);
+        if (length == 0U) length = 1U;
         if (destination_x >= 0) {
             char glyph[OD_CELL_BYTES] = {0};
             if (length >= sizeof(glyph)) length = 1U;
@@ -171,4 +195,3 @@ char *od_canvas_to_text(const OdCanvas *canvas, OdError *error) {
     od_error_clear(error);
     return text;
 }
-

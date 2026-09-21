@@ -135,6 +135,20 @@ static bool valid_variable(const char *variable) {
     return true;
 }
 
+static bool safe_relative_path(const char *path) {
+    if (path == NULL || path[0] == '\0' || path[0] == '/') return false;
+    const char *component = path;
+    while (*component != '\0') {
+        const char *end = strchr(component, '/');
+        size_t length = end == NULL ? strlen(component) : (size_t)(end - component);
+        if (length == 0U || (length == 1U && component[0] == '.') ||
+            (length == 2U && component[0] == '.' && component[1] == '.')) return false;
+        if (end == NULL) break;
+        component = end + 1;
+    }
+    return true;
+}
+
 OdStatus od_profile_validate(const OdProfile *profile, OdError *error) {
     if (profile == NULL || profile->project_name == NULL || profile->project_name[0] == '\0' ||
         profile->assignment_file == NULL || profile->assignment_file[0] == '\0') {
@@ -145,6 +159,11 @@ OdStatus od_profile_validate(const OdProfile *profile, OdError *error) {
         od_error_set(error, OD_ERROR_UNSUPPORTED, "unsupported schema version %u", profile->schema_version);
         return OD_ERROR_UNSUPPORTED;
     }
+    if (!safe_relative_path(profile->assignment_file)) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "assignment_file must be a safe project-relative path");
+        return OD_ERROR_INVALID;
+    }
     if (profile->port_min == 0U || profile->port_max < profile->port_min) {
         od_error_set(error, OD_ERROR_INVALID, "invalid port range");
         return OD_ERROR_INVALID;
@@ -154,7 +173,8 @@ OdStatus od_profile_validate(const OdProfile *profile, OdError *error) {
         if (service->id == NULL || service->id[0] == '\0' || service->name == NULL ||
             service->name[0] == '\0' || service->group == NULL || service->group[0] == '\0' ||
             !valid_variable(service->variable) || service->preferred_port < profile->port_min ||
-            service->preferred_port > profile->port_max || service->protocols == 0U) {
+            service->preferred_port > profile->port_max || service->protocols == 0U ||
+            (service->protocols & ~(unsigned)(OD_PROTOCOL_TCP | OD_PROTOCOL_UDP)) != 0U) {
             od_error_set(error, OD_ERROR_INVALID, "invalid service at index %zu", index);
             return OD_ERROR_INVALID;
         }
@@ -184,4 +204,3 @@ void od_settings_defaults(OdSettings *settings) {
     settings->mouse = true;
     settings->refresh_seconds = 5U;
 }
-

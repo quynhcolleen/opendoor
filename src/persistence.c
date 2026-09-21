@@ -490,6 +490,24 @@ static OdStatus backup_existing(const char *path,
     return status;
 }
 
+static OdStatus preflight_backup_target(const char *path,
+                                        bool source_exists,
+                                        OdError *error) {
+    if (!source_exists) return OD_OK;
+    size_t capacity = strlen(path) + sizeof(".opendoor.bak");
+    char *backup = malloc(capacity);
+    if (backup == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to prepare backup path");
+        return OD_ERROR_MEMORY;
+    }
+    (void)snprintf(backup, capacity, "%s.opendoor.bak", path);
+    bool exists = false;
+    mode_t mode = (mode_t)0644;
+    OdStatus status = inspect_regular_target(backup, &exists, &mode, error);
+    free(backup);
+    return status;
+}
+
 static OdStatus replace_with_backup(const char *path,
                                     const char *data,
                                     size_t length,
@@ -543,8 +561,12 @@ static OdStatus project_save_with_policy(const char *project_root,
     mode_t profile_mode;
     if (status == OD_OK) {
         status = inspect_regular_target(profile_path, &profile_exists, &profile_mode, error);
-        (void)profile_exists;
-        (void)profile_mode;
+    }
+    if (status == OD_OK) {
+        status = preflight_backup_target(profile_path, profile_exists, error);
+    }
+    if (status == OD_OK) {
+        status = preflight_backup_target(assignment_path, assignment_exists, error);
     }
 
     char *profile_text = NULL;

@@ -21,6 +21,7 @@ static const HelpEntry entries[] = {
     {"Enter", "Open, accept, or save the selected action"},
     {"Space", "Toggle the selected onboarding candidate"},
     {"e", "Edit a value or expand the focused widget"},
+    {"d", "Open the selected row details"},
     {"/", "Search the active table or this help screen"},
     {"s / S", "Cycle the sort column or reverse sort direction"},
     {"r", "Refresh listeners, processes, and Docker mappings"},

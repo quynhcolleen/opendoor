@@ -36,16 +36,6 @@ static bool profile_has_variable(const OdProfile *profile, const char *variable)
     return false;
 }
 
-static bool is_other_preferred(const OdProfile *profile, size_t service_index, uint16_t port) {
-    for (size_t index = 0U; index < profile->service_count; ++index) {
-        if (index != service_index && profile->services[index].managed &&
-            profile->services[index].preferred_port == port) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static OdStatus fill_allocation(OdAllocation *allocation,
                                 const OdService *service,
                                 uint16_t old_port,
@@ -89,10 +79,12 @@ OdStatus od_allocate(const OdProfile *profile,
 
     bool *blocked = calloc(OD_PORT_COUNT, sizeof(*blocked));
     bool *used = calloc(OD_PORT_COUNT, sizeof(*used));
+    size_t *preferred_count = calloc(OD_PORT_COUNT, sizeof(*preferred_count));
     bool *allocated = calloc(profile->service_count, sizeof(*allocated));
-    if (blocked == NULL || used == NULL || allocated == NULL) {
+    if (blocked == NULL || used == NULL || preferred_count == NULL || allocated == NULL) {
         free(blocked);
         free(used);
+        free(preferred_count);
         free(allocated);
         od_error_set(error, OD_ERROR_MEMORY, "unable to allocate port map");
         return OD_ERROR_MEMORY;
@@ -107,11 +99,16 @@ OdStatus od_allocate(const OdProfile *profile,
             }
         }
     }
+    for (size_t index = 0U; index < profile->service_count; ++index) {
+        const OdService *service = &profile->services[index];
+        if (service->managed) ++preferred_count[service->preferred_port];
+    }
 
     plan->items = calloc(profile->service_count, sizeof(*plan->items));
     if (plan->items == NULL) {
         free(blocked);
         free(used);
+        free(preferred_count);
         free(allocated);
         od_error_set(error, OD_ERROR_MEMORY, "unable to allocate result plan");
         return OD_ERROR_MEMORY;
@@ -150,7 +147,7 @@ OdStatus od_allocate(const OdProfile *profile,
              ++candidate) {
             uint16_t port = (uint16_t)candidate;
             bool protects_other = port != service->preferred_port &&
-                                  is_other_preferred(profile, index, port);
+                                  preferred_count[port] > 0U;
             if (!blocked[port] && !used[port] && !protects_other) {
                 selected = port;
                 break;
@@ -177,6 +174,7 @@ OdStatus od_allocate(const OdProfile *profile,
 
     free(blocked);
     free(used);
+    free(preferred_count);
     free(allocated);
     if (status != OD_OK) {
         od_allocation_plan_free(plan);

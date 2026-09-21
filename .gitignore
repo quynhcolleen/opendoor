@@ -1,4 +1,7 @@
 /build/
+/build-native/
+/build-sanitize/
+/build-release/
 /dist/
 /.cache/
 /.superpowers/
@@ -7,4 +10,3 @@
 *.swp
 .ports.env
 .ports.env.opendoor.bak
-

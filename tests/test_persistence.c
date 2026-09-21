@@ -240,10 +240,50 @@ static void test_atomic_save_backup_foreign_refusal_and_reset(void) {
     cleanup_tree(root);
 }
 
+static void test_save_preflights_every_target_before_writing(void) {
+    char template[] = "/tmp/opendoor-preflight-XXXXXX";
+    char *root = mkdtemp(template);
+    CHECK(root != NULL);
+    if (root == NULL) return;
+
+    char profile_path[1024];
+    char assignment_path[1024];
+    char backup_path[1024];
+    char outside_path[1024];
+    (void)snprintf(profile_path, sizeof(profile_path), "%s/.opendoor/project.toml", root);
+    (void)snprintf(assignment_path, sizeof(assignment_path), "%s/.ports.env", root);
+    (void)snprintf(backup_path, sizeof(backup_path), "%s/.ports.env.opendoor.bak", root);
+    (void)snprintf(outside_path, sizeof(outside_path), "%s/outside", root);
+    CHECK(write_text(assignment_path,
+                     "PORTS_CONFIGURED=1\nOPENDOOR_CONFIGURED=1\nAPI_PORT=4000\n"));
+    CHECK(write_text(outside_path, "must remain unchanged\n"));
+    CHECK(symlink(outside_path, backup_path) == 0);
+
+    OdError error;
+    OdProfile profile;
+    make_profile(&profile, 4000U, &error);
+    OdAllocationPlan plan;
+    make_plan(&plan, 4001U);
+    CHECK(od_project_save(root, profile_path, &profile, &plan, &error) ==
+          OD_ERROR_INVALID);
+    CHECK(access(profile_path, F_OK) != 0);
+    char *outside = read_text(outside_path);
+    CHECK(outside != NULL && strcmp(outside, "must remain unchanged\n") == 0);
+    free(outside);
+
+    od_allocation_plan_free(&plan);
+    od_profile_free(&profile);
+    (void)unlink(backup_path);
+    (void)unlink(outside_path);
+    (void)unlink(assignment_path);
+    (void)rmdir(root);
+}
+
 int main(void) {
     test_resolution_and_snapshot_validation();
     test_bind_probe_detects_changed_port();
     test_atomic_save_backup_foreign_refusal_and_reset();
+    test_save_preflights_every_target_before_writing();
     if (failures != 0) {
         fprintf(stderr, "%d persistence checks failed\n", failures);
         return 1;

@@ -258,7 +258,7 @@ void od_render_dashboard(OdCanvas *canvas,
                         OD_ROLE_MUTED, 0U);
     }
     od_canvas_write(canvas, 1, footer_y,
-                    "PgUp/PgDn Page  Up/Down Select  Tab Focus  e Expand  / Search  s Sort  Esc Back",
+                    "PgUp/PgDn Page  Up/Down Select  Tab Focus  e Expand  d Details  / Search  Esc Back",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
 
     static const char *const widget_names[] = {
@@ -300,12 +300,25 @@ void od_render_dashboard(OdCanvas *canvas,
         DRAW_TITLE((X), (Y), (W), (WIDGET));                                      \
     } while (0)
 
+#define DRAW_SCROLL_CONTROLS(X, Y, W, WIDGET)                                     \
+    do {                                                                          \
+        int up_x__ = (X) + (W) - 8;                                               \
+        int down_x__ = (X) + (W) - 4;                                             \
+        od_canvas_write(canvas, up_x__, (Y), ascii ? "[^]" : "[↑]", 3U,        \
+                        OD_ROLE_MUTED, 0U);                                        \
+        od_canvas_write(canvas, down_x__, (Y), ascii ? "[v]" : "[↓]", 3U,      \
+                        OD_ROLE_MUTED, 0U);                                        \
+        ADD_HIT(up_x__, (Y), 3, 1, OD_HIT_SCROLL_UP, (WIDGET), 0U);                \
+        ADD_HIT(down_x__, (Y), 3, 1, OD_HIT_SCROLL_DOWN, (WIDGET), 0U);            \
+    } while (0)
+
 #define DRAW_SERVICES(X, Y, W, H)                                                  \
     do {                                                                          \
         int inner_width__ = (W) - 4;                                               \
         size_t rows__ = (H) > 5 ? (size_t)((H) - 5) : 1U;                         \
         od_dashboard_set_page_size(dashboard, rows__);                             \
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_SERVICES);                         \
+        DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_SERVICES);                  \
         const char *columns__ = inner_width__ >= 72 ?                              \
             "SERVICE             GROUP      VARIABLE             PREF  PORT STATUS" : \
             "SERVICE          VARIABLE      PREF  PORT STATUS";                   \
@@ -375,6 +388,7 @@ void od_render_dashboard(OdCanvas *canvas,
 #define DRAW_CONFLICTS(X, Y, W, H)                                                 \
     do {                                                                          \
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_CONFLICTS);                        \
+        DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_CONFLICTS);                 \
         size_t rows__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                         \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_CONFLICTS, rows__); \
         size_t conflict_ordinal__ = 0U;                                            \
@@ -424,6 +438,7 @@ void od_render_dashboard(OdCanvas *canvas,
 #define DRAW_LISTENERS(X, Y, W, H)                                                 \
     do {                                                                          \
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_LISTENERS);                        \
+        DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_LISTENERS);                 \
         size_t capacity__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                     \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_LISTENERS,          \
                                           capacity__);                             \
@@ -466,6 +481,7 @@ void od_render_dashboard(OdCanvas *canvas,
 #define DRAW_DOCKER(X, Y, W, H)                                                    \
     do {                                                                          \
         DRAW_BOX((X), (Y), (W), (H), OD_WIDGET_DOCKER);                           \
+        DRAW_SCROLL_CONTROLS((X), (Y), (W), OD_WIDGET_DOCKER);                    \
         size_t capacity__ = (H) > 4 ? (size_t)((H) - 4) : 1U;                     \
         od_dashboard_set_widget_page_size(dashboard, OD_WIDGET_DOCKER, capacity__);\
         size_t start__ = dashboard->docker_page_start;                            \
@@ -542,13 +558,21 @@ void od_render_dashboard(OdCanvas *canvas,
         DRAW_WIDGET(secondary, 1, content_y + primary_height,
                     (int)canvas->width - 2, secondary_height);
     } else {
-        char tabs[128];
-        (void)snprintf(tabs, sizeof(tabs), "[%s]  %s  %s  %s",
-                       widget_names[(size_t)dashboard->focused],
-                       widget_names[((size_t)dashboard->focused + 1U) % OD_WIDGET_COUNT],
-                       widget_names[((size_t)dashboard->focused + 2U) % OD_WIDGET_COUNT],
-                       widget_names[((size_t)dashboard->focused + 3U) % OD_WIDGET_COUNT]);
-        od_canvas_write(canvas, 1, 3, tabs, canvas->width - 2U, OD_ROLE_MUTED, 0U);
+        int tab_x = 1;
+        for (size_t offset = 0U; offset < OD_WIDGET_COUNT; ++offset) {
+            OdDashboardWidget widget = (OdDashboardWidget)(
+                ((size_t)dashboard->focused + offset) % OD_WIDGET_COUNT);
+            char tab[48];
+            (void)snprintf(tab, sizeof(tab), offset == 0U ? "[%s]" : "%s",
+                           widget_names[(size_t)widget]);
+            int tab_width = (int)strlen(tab);
+            if (tab_x + tab_width >= (int)canvas->width - 1) break;
+            od_canvas_write(canvas, tab_x, 3, tab, (size_t)tab_width,
+                            offset == 0U ? OD_ROLE_PRIMARY : OD_ROLE_MUTED,
+                            offset == 0U ? 1U : 0U);
+            ADD_HIT(tab_x, 3, tab_width, 1, OD_HIT_FOCUS_WIDGET, widget, 0U);
+            tab_x += tab_width + 2;
+        }
         DRAW_WIDGET(dashboard->focused, 1, content_y,
                     (int)canvas->width - 2, content_height);
     }
@@ -559,8 +583,286 @@ void od_render_dashboard(OdCanvas *canvas,
 #undef DRAW_CONFLICTS
 #undef DRAW_SERVICES
 #undef DRAW_BOX
+#undef DRAW_SCROLL_CONTROLS
 #undef DRAW_TITLE
 #undef ADD_HIT
+}
+
+static const OdServiceRow *selected_conflict(const OdDashboard *dashboard) {
+    size_t ordinal = 0U;
+    for (size_t index = 0U; index < dashboard->service_count; ++index) {
+        if (!dashboard->services[index].conflict) continue;
+        if (ordinal == dashboard->conflict_selected) return &dashboard->services[index];
+        ++ordinal;
+    }
+    return NULL;
+}
+
+static void append_detail(char *text,
+                          size_t capacity,
+                          size_t *used,
+                          const char *label,
+                          const char *value) {
+    if (*used >= capacity) return;
+    int count = snprintf(text + *used, capacity - *used, "%s: %s\n", label,
+                         value == NULL || value[0] == '\0' ? "—" : value);
+    if (count < 0) return;
+    size_t added = (size_t)count;
+    *used += added < capacity - *used ? added : capacity - *used;
+}
+
+static void append_detail_number(char *text,
+                                 size_t capacity,
+                                 size_t *used,
+                                 const char *label,
+                                 unsigned long long value) {
+    char number[48];
+    (void)snprintf(number, sizeof(number), "%llu", value);
+    append_detail(text, capacity, used, label, number);
+}
+
+static size_t detail_chunk(const char *text, size_t length, size_t width) {
+    size_t chunk = length < width ? length : width;
+    if (chunk == length) return chunk;
+    while (chunk > 0U && (((unsigned char)text[chunk] & 0xc0U) == 0x80U)) --chunk;
+    return chunk == 0U ? (length < width ? length : width) : chunk;
+}
+
+static size_t wrapped_detail_rows(const char *text, size_t width) {
+    size_t rows = 0U;
+    const char *cursor = text;
+    while (*cursor != '\0') {
+        const char *newline = strchr(cursor, '\n');
+        size_t length = newline == NULL ? strlen(cursor) : (size_t)(newline - cursor);
+        if (length == 0U) {
+            ++rows;
+        } else {
+            size_t consumed = 0U;
+            while (consumed < length) {
+                consumed += detail_chunk(cursor + consumed, length - consumed, width);
+                ++rows;
+            }
+        }
+        if (newline == NULL) break;
+        cursor = newline + 1;
+    }
+    return rows;
+}
+
+static void build_dashboard_detail(const OdDashboard *dashboard,
+                                   char *title,
+                                   size_t title_capacity,
+                                   char *text,
+                                   size_t text_capacity) {
+    size_t used = 0U;
+    text[0] = '\0';
+    if (dashboard->focused == OD_WIDGET_SERVICES ||
+        dashboard->focused == OD_WIDGET_CONFLICTS) {
+        const OdServiceRow *row = dashboard->focused == OD_WIDGET_SERVICES ?
+            od_dashboard_selected_service(dashboard) : selected_conflict(dashboard);
+        (void)snprintf(title, title_capacity, "%s",
+                       dashboard->focused == OD_WIDGET_SERVICES ?
+                           "Service details" : "Conflict details");
+        if (row == NULL) {
+            append_detail(text, text_capacity, &used, "Selection", "No row selected");
+            return;
+        }
+        append_detail(text, text_capacity, &used, "Stable ID", row->stable_id);
+        append_detail(text, text_capacity, &used, "Service", row->service);
+        append_detail(text, text_capacity, &used, "Group", row->group);
+        append_detail(text, text_capacity, &used, "Variable", row->variable);
+        append_detail_number(text, text_capacity, &used, "Preferred port",
+                             row->preferred_port);
+        append_detail_number(text, text_capacity, &used, "Selected port",
+                             row->selected_port);
+        append_detail(text, text_capacity, &used, "Status",
+                      od_service_status_name(row->status));
+        append_detail(text, text_capacity, &used, "Conflict",
+                      row->conflict ? row->conflict_detail : "None");
+        return;
+    }
+    if (dashboard->focused == OD_WIDGET_LISTENERS) {
+        (void)snprintf(title, title_capacity, "Listener details");
+        if (dashboard->listener_selected >= dashboard->snapshot->endpoint_count) {
+            append_detail(text, text_capacity, &used, "Selection", "No row selected");
+            return;
+        }
+        const OdEndpoint *endpoint =
+            &dashboard->snapshot->endpoints[dashboard->listener_selected];
+        append_detail(text, text_capacity, &used, "Stable ID", endpoint->stable_id);
+        append_detail(text, text_capacity, &used, "Protocol",
+                      endpoint->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP");
+        append_detail(text, text_capacity, &used, "Local address", endpoint->local_address);
+        append_detail_number(text, text_capacity, &used, "Local port", endpoint->local_port);
+        append_detail(text, text_capacity, &used, "Remote address", endpoint->remote_address);
+        append_detail_number(text, text_capacity, &used, "Remote port", endpoint->remote_port);
+        append_detail(text, text_capacity, &used, "Process", endpoint->process);
+        append_detail_number(text, text_capacity, &used, "PID",
+                             (unsigned long long)endpoint->pid);
+        append_detail(text, text_capacity, &used, "User", endpoint->user);
+        append_detail_number(text, text_capacity, &used, "UID",
+                             (unsigned long long)endpoint->uid);
+        append_detail_number(text, text_capacity, &used, "Socket inode", endpoint->inode);
+        append_detail(text, text_capacity, &used, "Executable", endpoint->executable);
+        append_detail(text, text_capacity, &used, "Command", endpoint->command);
+        append_detail(text, text_capacity, &used, "Ownership",
+                      endpoint->permission_limited ?
+                          "Process details limited by permissions" : "Resolved");
+        return;
+    }
+    (void)snprintf(title, title_capacity, "Docker mapping details");
+    if (dashboard->docker_selected >= dashboard->snapshot->docker_mapping_count) {
+        append_detail(text, text_capacity, &used, "Selection", "No row selected");
+        return;
+    }
+    const OdDockerMapping *mapping =
+        &dashboard->snapshot->docker_mappings[dashboard->docker_selected];
+    append_detail(text, text_capacity, &used, "Container", mapping->container);
+    append_detail(text, text_capacity, &used, "Container ID", mapping->container_id);
+    append_detail(text, text_capacity, &used, "Compose project", mapping->project);
+    append_detail(text, text_capacity, &used, "Compose service", mapping->service);
+    append_detail(text, text_capacity, &used, "Bind address", mapping->bind_address);
+    append_detail_number(text, text_capacity, &used, "Host port", mapping->host_port);
+    append_detail_number(text, text_capacity, &used, "Container port",
+                         mapping->container_port);
+    append_detail(text, text_capacity, &used, "Protocol",
+                  mapping->protocol == OD_PROTOCOL_UDP ? "UDP" : "TCP");
+}
+
+size_t od_render_dashboard_detail(OdCanvas *canvas,
+                                  const OdDashboard *dashboard,
+                                  size_t page,
+                                  bool ascii) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return 1U;
+    }
+    char title[96];
+    char detail[8192];
+    build_dashboard_detail(dashboard, title, sizeof(title), detail, sizeof(detail));
+    od_canvas_write(canvas, 2, 1, title, canvas->width - 4U, OD_ROLE_PRIMARY, 1U);
+    od_canvas_write(canvas, 2, 2,
+                    "Full selected-row values • content wraps inside this viewport",
+                    canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    int box_x = 1;
+    int box_y = 4;
+    int box_width = (int)canvas->width - 2;
+    int box_height = (int)canvas->height - 7;
+    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                  OD_ROLE_FOCUSED_BORDER);
+    size_t line_width = (size_t)(box_width - 4);
+    size_t page_size = box_height > 3 ? (size_t)(box_height - 3) : 1U;
+    size_t row_count = wrapped_detail_rows(detail, line_width);
+    size_t page_count = row_count == 0U ? 1U : (row_count + page_size - 1U) / page_size;
+    size_t current_page = page < page_count ? page : page_count - 1U;
+    size_t first_row = current_page * page_size;
+    size_t final_row = first_row + page_size;
+    char *line = malloc(line_width + 1U);
+    if (line != NULL) {
+        size_t row = 0U;
+        const char *cursor = detail;
+        while (*cursor != '\0' && row < final_row) {
+            const char *newline = strchr(cursor, '\n');
+            size_t length = newline == NULL ? strlen(cursor) : (size_t)(newline - cursor);
+            size_t consumed = 0U;
+            do {
+                size_t chunk = length == 0U ? 0U :
+                    detail_chunk(cursor + consumed, length - consumed, line_width);
+                if (row >= first_row && row < final_row) {
+                    if (chunk > 0U) memcpy(line, cursor + consumed, chunk);
+                    line[chunk] = '\0';
+                    od_canvas_write(canvas, box_x + 2,
+                                    box_y + 1 + (int)(row - first_row), line,
+                                    line_width, OD_ROLE_DEFAULT, 0U);
+                }
+                consumed += chunk;
+                ++row;
+            } while (consumed < length && row < final_row);
+            if (newline == NULL) break;
+            cursor = newline + 1;
+        }
+        free(line);
+    }
+    char page_text[96];
+    (void)snprintf(page_text, sizeof(page_text), "Page %zu/%zu  %zu wrapped line(s)",
+                   current_page + 1U, page_count, row_count);
+    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page_text,
+                    line_width, OD_ROLE_MUTED, 0U);
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "PgUp/PgDn Page  Up/Down Page  Home/End  Esc Back",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+    return page_count;
+}
+
+void od_render_profile_editor(OdCanvas *canvas,
+                              const OdProfileView *view,
+                              bool ascii) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "Edit project profile", canvas->width - 4U,
+                    OD_ROLE_PRIMARY, 1U);
+    char paths[640];
+    (void)snprintf(paths, sizeof(paths), "Profile: %s  •  Assignments: %s",
+                   view->profile_path == NULL ? "unavailable" : view->profile_path,
+                   view->assignment_path == NULL ? "unavailable" : view->assignment_path);
+    od_canvas_write(canvas, 2, 2, paths, canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    int box_x = 1;
+    int box_y = 4;
+    int box_width = (int)canvas->width - 2;
+    int box_height = (int)canvas->height - 6;
+    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                  OD_ROLE_FOCUSED_BORDER);
+    od_canvas_write(canvas, box_x + 2, box_y + 1,
+                    "SERVICE               GROUP          VARIABLE             PORT PROTOCOL",
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 1U);
+    size_t rows = box_height > 4 ? (size_t)(box_height - 4) : 1U;
+    size_t selected = view->selected_service;
+    if (view->profile->service_count == 0U) selected = 0U;
+    if (selected >= view->profile->service_count && view->profile->service_count > 0U) {
+        selected = view->profile->service_count - 1U;
+    }
+    size_t page_start = (selected / rows) * rows;
+    size_t end = page_start + rows;
+    if (end > view->profile->service_count) end = view->profile->service_count;
+    for (size_t index = page_start; index < end; ++index) {
+        const OdService *service = &view->profile->services[index];
+        const char *protocol = service->protocols == (OD_PROTOCOL_TCP | OD_PROTOCOL_UDP) ?
+            "tcp,udp" : (service->protocols == OD_PROTOCOL_UDP ? "udp" : "tcp");
+        char row[384];
+        (void)snprintf(row, sizeof(row), "%-21.21s %-14.14s %-20.20s %5u %-7s",
+                       service->name, service->group, service->variable,
+                       (unsigned)service->preferred_port, protocol);
+        bool is_selected = index == selected;
+        od_canvas_write(canvas, box_x + 2,
+                        box_y + 2 + (int)(index - page_start), row,
+                        (size_t)(box_width - 4),
+                        is_selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
+                        is_selected ? 2U : 0U);
+    }
+    if (view->profile->service_count == 0U) {
+        od_canvas_write_centered(canvas, box_y + box_height / 2,
+                                 "No managed services • press a to add one",
+                                 OD_ROLE_MUTED, 0U);
+    }
+    char page_text[96];
+    size_t pages = view->profile->service_count == 0U ? 1U :
+        (view->profile->service_count + rows - 1U) / rows;
+    (void)snprintf(page_text, sizeof(page_text), "Page %zu/%zu  %zu service(s)",
+                   view->profile->service_count == 0U ? 1U : page_start / rows + 1U,
+                   pages, view->profile->service_count);
+    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page_text,
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+    if (view->status != NULL) {
+        od_canvas_write(canvas, 2, (int)canvas->height - 2, view->status,
+                        canvas->width - 4U, OD_ROLE_WARNING, 0U);
+    }
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "x Reset assignments  e Edit  a Add  s Save  Up/Down/Pg Page  Esc Back",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
 }
 
 void od_render_conflict_resolution(OdCanvas *canvas,

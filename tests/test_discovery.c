@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -148,7 +149,7 @@ static void test_docker_absent_is_nonfatal(void) {
 }
 
 static void test_many_docker_containers(void) {
-    const size_t containers = 200U;
+    const size_t containers = 24000U;
     const size_t line_size = 160U;
     char *lines = calloc(containers, line_size);
     CHECK(lines != NULL);
@@ -164,10 +165,53 @@ static void test_many_docker_containers(void) {
     OdScanSnapshot snapshot;
     OdError error;
     od_scan_snapshot_init(&snapshot, 3U);
+    struct timespec started;
+    struct timespec finished;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
     CHECK(od_docker_parse_ps_json_lines(lines, used, &snapshot, &error) == OD_OK);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &finished) == 0);
+    double elapsed = (double)(finished.tv_sec - started.tv_sec) +
+                     (double)(finished.tv_nsec - started.tv_nsec) / 1000000000.0;
+    CHECK(elapsed < 0.5);
     CHECK(snapshot.docker_mapping_count == containers);
     od_scan_snapshot_free(&snapshot);
     free(lines);
+}
+
+static void test_many_proc_sockets_stay_interactive(void) {
+    const size_t sockets = 30000U;
+    const size_t line_size = 160U;
+    char *table = calloc(sockets + 1U, line_size);
+    CHECK(table != NULL);
+    if (table == NULL) return;
+    size_t capacity = (sockets + 1U) * line_size;
+    size_t used = (size_t)snprintf(
+        table, capacity,
+        "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n");
+    for (size_t index = 0U; index < sockets; ++index) {
+        unsigned port = 10000U + (unsigned)index;
+        int count = snprintf(table + used, capacity - used,
+            "%4zu: 0100007F:%04X 00000000:0000 0A "
+            "00000000:00000000 00:00000000 00000000 1000 0 %zu\n",
+            index, port, 100000U + index);
+        CHECK(count > 0 && (size_t)count < capacity - used);
+        used += (size_t)count;
+    }
+    OdScanSnapshot snapshot;
+    OdError error;
+    od_scan_snapshot_init(&snapshot, 4U);
+    struct timespec started;
+    struct timespec finished;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
+    CHECK(od_parse_proc_net(table, AF_INET, OD_PROTOCOL_TCP,
+                            &snapshot, &error) == OD_OK);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &finished) == 0);
+    double elapsed = (double)(finished.tv_sec - started.tv_sec) +
+                     (double)(finished.tv_nsec - started.tv_nsec) / 1000000000.0;
+    CHECK(elapsed < 2.0);
+    CHECK(snapshot.endpoint_count == sockets);
+    od_scan_snapshot_free(&snapshot);
+    free(table);
 }
 
 static void test_project_discovery_and_merge(void) {
@@ -255,6 +299,17 @@ static void test_project_directory_discovery(void) {
         (void)fputs("ADMIN_PORT ?= 8081\n", file);
         (void)fclose(file);
     }
+    char outside[512];
+    char linked[512];
+    (void)snprintf(outside, sizeof(outside), "%s-outside.env", root);
+    file = fopen(outside, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("EVIL_PORT=6666\n", file);
+        (void)fclose(file);
+    }
+    (void)snprintf(linked, sizeof(linked), "%s/.env.link", root);
+    CHECK(symlink(outside, linked) == 0);
     OdCandidateList candidates;
     OdError error;
     od_candidate_list_init(&candidates);
@@ -264,6 +319,9 @@ static void test_project_directory_discovery(void) {
         CHECK(candidates.items[0].sources.count == 2U);
         CHECK(strcmp(candidates.items[0].variable, "API_PORT") == 0);
     }
+    for (size_t index = 0U; index < candidates.count; ++index) {
+        CHECK(strcmp(candidates.items[index].variable, "EVIL_PORT") != 0);
+    }
     od_candidate_list_free(&candidates);
     (void)snprintf(path, sizeof(path), "%s/compose.yaml", root);
     (void)unlink(path);
@@ -271,6 +329,8 @@ static void test_project_directory_discovery(void) {
     (void)unlink(path);
     (void)snprintf(path, sizeof(path), "%s/Makefile", root);
     (void)unlink(path);
+    (void)unlink(linked);
+    (void)unlink(outside);
     (void)rmdir(root);
 }
 
@@ -281,6 +341,7 @@ int main(void) {
     test_docker_json_lines();
     test_docker_absent_is_nonfatal();
     test_many_docker_containers();
+    test_many_proc_sockets_stay_interactive();
     test_project_discovery_and_merge();
     test_project_directory_discovery();
     if (failures != 0) {
