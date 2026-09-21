@@ -1,4 +1,5 @@
 #include "opendoor/app.h"
+#include "opendoor/tui.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -71,7 +72,7 @@ int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options) {
         fprintf(stderr, "opendoor: unknown option: %s\n", argument);
         return 2;
     }
-    return 0;
+    return od_tui_run(options);
 }
 
 int opendoor_run(const OpendoorOptions *options) {
@@ -82,4 +83,3 @@ int opendoor_run(const OpendoorOptions *options) {
     }
     return 0;
 }
-

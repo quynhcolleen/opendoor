@@ -7,6 +7,26 @@ set(CMAKE_C_EXTENSIONS OFF)
 add_compile_definitions(_POSIX_C_SOURCE=200809L)
 
 include(CTest)
+find_package(Threads REQUIRED)
+find_library(NCURSESW_LIBRARY NAMES ncursesw)
+if(NOT NCURSESW_LIBRARY)
+  find_file(NCURSESW_LIBRARY
+    NAMES libncursesw.so.6
+    PATHS /lib /usr/lib
+    PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
+  )
+endif()
+if(NOT NCURSESW_LIBRARY)
+  message(FATAL_ERROR "OpenDoor requires the ncursesw runtime and development library")
+endif()
+find_library(TINFO_LIBRARY NAMES tinfo)
+if(NOT TINFO_LIBRARY)
+  find_file(TINFO_LIBRARY
+    NAMES libtinfo.so.6
+    PATHS /lib /usr/lib
+    PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
+  )
+endif()
 
 add_library(tomlc17 STATIC vendor/tomlc17/tomlc17.c)
 target_include_directories(tomlc17 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/tomlc17)
@@ -23,6 +43,10 @@ add_library(opendoor_core
   src/scan.c
   src/docker.c
   src/discovery.c
+  src/theme.c
+  src/ui.c
+  src/screens.c
+  src/tui.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(opendoor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
@@ -30,7 +54,10 @@ target_compile_definitions(opendoor_core PUBLIC OPENDOOR_VERSION="${PROJECT_VERS
 target_compile_options(opendoor_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 add_executable(opendoor src/main.c)
-target_link_libraries(opendoor_core PRIVATE tomlc17 jsmn)
+target_link_libraries(opendoor_core PRIVATE tomlc17 jsmn Threads::Threads ${NCURSESW_LIBRARY})
+if(TINFO_LIBRARY)
+  target_link_libraries(opendoor_core PRIVATE ${TINFO_LIBRARY})
+endif()
 target_link_libraries(opendoor PRIVATE opendoor_core)
 target_compile_options(opendoor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
@@ -48,6 +75,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_discovery PRIVATE opendoor_core)
   target_compile_options(test_discovery PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME discovery_contracts COMMAND test_discovery)
+  add_executable(test_ui tests/test_ui.c)
+  target_link_libraries(test_ui PRIVATE opendoor_core)
+  target_compile_options(test_ui PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME ui_contracts COMMAND test_ui)
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)
