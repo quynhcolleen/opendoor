@@ -694,3 +694,108 @@ void od_render_change_review(OdCanvas *canvas,
                     "Up/Down Select  PgUp/PgDn Page  Enter Save  Esc Cancel",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
 }
+
+void od_render_settings(OdCanvas *canvas, const OdSettingsView *view, bool ascii) {
+    static const char *const unicode_names[] = {"auto", "always", "never"};
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "Settings and appearance",
+                    canvas->width - 4U, OD_ROLE_PRIMARY, 1U);
+    char path[320];
+    (void)snprintf(path, sizeof(path), "Saved globally: %s",
+                   view->settings_path == NULL ? "path unavailable" : view->settings_path);
+    od_canvas_write(canvas, 2, 2, path, canvas->width - 4U, OD_ROLE_MUTED, 0U);
+
+    int box_x = 2;
+    int box_y = 4;
+    int box_width = (int)canvas->width - 4;
+    int box_height = (int)canvas->height - 8;
+    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                  OD_ROLE_FOCUSED_BORDER);
+    char rows[6][160];
+    (void)snprintf(rows[0], sizeof(rows[0]), "Theme                 < %s >",
+                   view->settings->theme);
+    (void)snprintf(rows[1], sizeof(rows[1]), "Unicode               < %s >",
+                   unicode_names[view->settings->unicode_mode]);
+    (void)snprintf(rows[2], sizeof(rows[2]), "Reduce motion           [%s]",
+                   view->settings->reduced_motion ? "on" : "off");
+    (void)snprintf(rows[3], sizeof(rows[3]), "Mouse input             [%s]",
+                   view->settings->mouse ? "on" : "off");
+    (void)snprintf(rows[4], sizeof(rows[4]), "Refresh automatically   [%s]",
+                   view->settings->auto_refresh ? "on" : "off");
+    (void)snprintf(rows[5], sizeof(rows[5]), "Refresh interval       < %u seconds >",
+                   view->settings->refresh_seconds);
+    for (size_t index = 0U; index < 6U; ++index) {
+        bool selected = index == view->selected_item;
+        od_canvas_write(canvas, box_x + 2, box_y + 2 + (int)index, rows[index],
+                        (size_t)(box_width - 4),
+                        selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
+                        selected ? 2U : 0U);
+    }
+    if (view->status != NULL) {
+        od_canvas_write(canvas, 2, (int)canvas->height - 2, view->status,
+                        canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    }
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "Up/Down Select  Left/Right Change  Space Toggle  s Save  Esc Cancel",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+}
+
+void od_render_help(OdCanvas *canvas, OdHelp *help, bool ascii, const char *status) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "Keyboard and workflow help",
+                    canvas->width - 4U, OD_ROLE_PRIMARY, 1U);
+    char search[180];
+    (void)snprintf(search, sizeof(search), "Search: %s%s",
+                   help->query[0] == '\0' ? "all topics" : help->query,
+                   help->query[0] == '\0' ? "" : "  (press / to change)");
+    od_canvas_write(canvas, 2, 2, search, canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    int box_x = 1;
+    int box_y = 4;
+    int box_width = (int)canvas->width - 2;
+    int box_height = (int)canvas->height - 8;
+    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                  OD_ROLE_FOCUSED_BORDER);
+    size_t rows = box_height > 4 ? (size_t)(box_height - 4) : 1U;
+    od_help_set_page_size(help, rows);
+    size_t end = help->page_start + rows;
+    if (end > help->visible_count) end = help->visible_count;
+    for (size_t index = help->page_start; index < end; ++index) {
+        char line[384];
+        (void)snprintf(line, sizeof(line), "%-18.18s  %s",
+                       od_help_key(help, index), od_help_description(help, index));
+        bool selected = index == help->selected;
+        od_canvas_write(canvas, box_x + 2,
+                        box_y + 2 + (int)(index - help->page_start),
+                        line, (size_t)(box_width - 4),
+                        selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
+                        selected ? 2U : 0U);
+    }
+    if (help->visible_count == 0U) {
+        od_canvas_write_centered(canvas, box_y + box_height / 2,
+                                 "No help topics match • press / to change the search",
+                                 OD_ROLE_MUTED, 0U);
+    }
+    char page[96];
+    (void)snprintf(page, sizeof(page), "Page %zu/%zu  %zu topic(s)",
+                   help->visible_count == 0U ? 0U : help->page_start / rows + 1U,
+                   help->visible_count == 0U ? 0U :
+                       (help->visible_count + rows - 1U) / rows,
+                   help->visible_count);
+    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page,
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+    if (status != NULL) {
+        od_canvas_write(canvas, 2, (int)canvas->height - 2, status,
+                        canvas->width - 4U, OD_ROLE_MUTED, 0U);
+    }
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "Up/Down Select  PgUp/PgDn Page  / Search  Home/End  Esc Back",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+}

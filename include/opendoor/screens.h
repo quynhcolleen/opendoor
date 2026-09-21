@@ -5,6 +5,7 @@
 #include "opendoor/onboarding.h"
 #include "opendoor/dashboard.h"
 #include "opendoor/resolution.h"
+#include "opendoor/help.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -24,6 +25,13 @@ typedef struct {
     size_t selected_item;
     const char *status;
 } OdMenuView;
+
+typedef struct {
+    const OdSettings *settings;
+    size_t selected_item;
+    const char *settings_path;
+    const char *status;
+} OdSettingsView;
 
 void od_render_resize_required(OdCanvas *canvas);
 void od_render_loading(OdCanvas *canvas,
@@ -53,6 +61,8 @@ void od_render_change_review(OdCanvas *canvas,
                              size_t selected,
                              bool ascii,
                              const char *status);
+void od_render_settings(OdCanvas *canvas, const OdSettingsView *view, bool ascii);
+void od_render_help(OdCanvas *canvas, OdHelp *help, bool ascii, const char *status);
 const char *const *od_banner_lines(void);
 size_t od_banner_line_count(void);
 

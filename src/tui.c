@@ -6,11 +6,13 @@
 #include "opendoor/dashboard.h"
 #include "opendoor/docker.h"
 #include "opendoor/discovery.h"
+#include "opendoor/help.h"
 #include "opendoor/onboarding.h"
 #include "opendoor/persistence.h"
 #include "opendoor/resolution.h"
 #include "opendoor/screens.h"
 #include "opendoor/scan.h"
+#include "opendoor/settings_store.h"
 #include "opendoor/theme.h"
 #include "opendoor/ui.h"
 
@@ -255,6 +257,143 @@ static bool prompt_candidate(WINDOW *window,
     return true;
 }
 
+static void run_help(WINDOW *window,
+                     OdCanvas *canvas,
+                     bool use_color,
+                     bool ascii) {
+    OdError error;
+    int height = getmaxy(window);
+    OdHelp help;
+    if (od_help_init(&help, height > 12 ? (size_t)(height - 12) : 1U, &error) != OD_OK) {
+        return;
+    }
+    char status[256] = "Select a topic; every mouse action has a keyboard equivalent.";
+    bool done = false;
+    while (!done) {
+        int width = getmaxx(window);
+        height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, &error)) break;
+        od_render_help(canvas, &help, ascii, status);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == 27 || input == 'q' || input == 'Q' || input == '?') {
+            done = true;
+        } else if (input == KEY_UP || input == 'k') {
+            od_help_move(&help, -1);
+        } else if (input == KEY_DOWN || input == 'j') {
+            od_help_move(&help, 1);
+        } else if (input == KEY_PPAGE) {
+            od_help_move_page(&help, -1);
+        } else if (input == KEY_NPAGE) {
+            od_help_move_page(&help, 1);
+        } else if (input == KEY_HOME) {
+            od_help_home(&help);
+        } else if (input == KEY_END) {
+            od_help_end(&help);
+        } else if (input == '/') {
+            char query[96];
+            (void)snprintf(query, sizeof(query), "%s", help.query);
+            if (prompt_text(window, canvas, use_color, ascii,
+                            "Search help", "Key, action, or workflow",
+                            query, sizeof(query))) {
+                if (od_help_search(&help, query, &error) == OD_OK) {
+                    (void)snprintf(status, sizeof(status),
+                        query[0] == '\0' ? "Showing all help topics." :
+                                           "Showing help topics matching %.180s.",
+                        query);
+                } else {
+                    (void)snprintf(status, sizeof(status), "%s", error.message);
+                }
+            }
+        } else if (input == KEY_RESIZE) {
+            continue;
+        }
+    }
+    od_help_free(&help);
+}
+
+static size_t theme_index(const char *name) {
+    for (size_t index = 0U; index < od_theme_count(); ++index) {
+        const OdTheme *theme = od_theme_at(index);
+        if (theme != NULL && strcmp(theme->name, name) == 0) return index;
+    }
+    return 0U;
+}
+
+static void change_setting(OdSettings *settings, size_t selected, int direction) {
+    int step = direction < 0 ? -1 : 1;
+    if (selected == 0U) {
+        size_t count = od_theme_count();
+        size_t index = theme_index(settings->theme);
+        index = direction < 0 ? (index == 0U ? count - 1U : index - 1U) :
+                                (index + 1U) % count;
+        const OdTheme *theme = od_theme_at(index);
+        if (theme != NULL) (void)snprintf(settings->theme, sizeof(settings->theme), "%s", theme->name);
+    } else if (selected == 1U) {
+        int mode = (int)settings->unicode_mode + step;
+        if (mode < (int)OD_UNICODE_AUTO) mode = (int)OD_UNICODE_NEVER;
+        if (mode > (int)OD_UNICODE_NEVER) mode = (int)OD_UNICODE_AUTO;
+        settings->unicode_mode = (OdUnicodeMode)mode;
+    } else if (selected == 2U) {
+        settings->reduced_motion = !settings->reduced_motion;
+    } else if (selected == 3U) {
+        settings->mouse = !settings->mouse;
+    } else if (selected == 4U) {
+        settings->auto_refresh = !settings->auto_refresh;
+    } else if (selected == 5U) {
+        if (direction < 0 && settings->refresh_seconds > 1U) {
+            --settings->refresh_seconds;
+        } else if (direction > 0 && settings->refresh_seconds < 3600U) {
+            ++settings->refresh_seconds;
+        }
+    }
+}
+
+static bool run_settings(WINDOW *window,
+                         OdCanvas *canvas,
+                         bool use_color,
+                         bool ascii,
+                         const char *settings_path,
+                         OdSettings *settings) {
+    OdSettings draft = *settings;
+    size_t selected = 0U;
+    char status[256] = "Changes apply after you save.";
+    OdError error;
+    while (true) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, &error)) return false;
+        OdSettingsView view = {&draft, selected, settings_path, status};
+        od_render_settings(canvas, &view, ascii);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == 27 || input == 'q' || input == 'Q') return false;
+        if (input == KEY_UP || input == 'k') {
+            selected = selected == 0U ? 5U : selected - 1U;
+        } else if (input == KEY_DOWN || input == 'j') {
+            selected = (selected + 1U) % 6U;
+        } else if (input == KEY_LEFT || input == 'h') {
+            change_setting(&draft, selected, -1);
+            (void)snprintf(status, sizeof(status), "Changed locally; press s to save.");
+        } else if (input == KEY_RIGHT || input == 'l' || input == ' ') {
+            change_setting(&draft, selected, 1);
+            (void)snprintf(status, sizeof(status), "Changed locally; press s to save.");
+        } else if (input == 's' || input == 'S' || input == '\n' || input == '\r') {
+            if (settings_path == NULL) {
+                (void)snprintf(status, sizeof(status),
+                               "Unable to save: settings path is unavailable.");
+            } else if (od_settings_save(settings_path, &draft, &error) != OD_OK) {
+                (void)snprintf(status, sizeof(status), "%s", error.message);
+            } else {
+                *settings = draft;
+                return true;
+            }
+        } else if (input == KEY_RESIZE) {
+            continue;
+        }
+    }
+}
+
 static void project_display_name(const char *project_root, char *name, size_t capacity) {
     const char *end = project_root + strlen(project_root);
     while (end > project_root && end[-1] == '/') --end;
@@ -470,13 +609,88 @@ static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) 
     }
 }
 
+static OdStatus scan_now(uint64_t generation,
+                         OdScanSnapshot *snapshot,
+                         OdError *error);
+
+static bool refresh_dashboard(const char *project_root,
+                              const OdProfile *profile,
+                              OdScanSnapshot *snapshot,
+                              OdAssignments *saved,
+                              OdAllocationPlan *plan,
+                              OdDashboard *dashboard,
+                              char *status,
+                              size_t status_capacity) {
+    OdError error;
+    OdScanSnapshot fresh;
+    OdStatus scan_status = scan_now(snapshot->generation + 1U, &fresh, &error);
+    if (scan_status != OD_OK) {
+        (void)snprintf(status, status_capacity, "%s", error.message);
+        return false;
+    }
+    OdAssignments new_saved;
+    OdStatus saved_status = load_saved_assignments(project_root, profile, &new_saved, &error);
+    if (saved_status != OD_OK && saved_status != OD_ERROR_FOREIGN) {
+        od_scan_snapshot_free(&fresh);
+        (void)snprintf(status, status_capacity, "%s", error.message);
+        return false;
+    }
+    OdAllocationPlan new_plan = {0};
+    OdDashboard new_dashboard;
+    if (!create_dashboard(profile, &fresh,
+                          saved_status == OD_OK ? &new_saved : NULL,
+                          &new_dashboard, &new_plan, &error)) {
+        od_assignments_free(&new_saved);
+        od_scan_snapshot_free(&fresh);
+        (void)snprintf(status, status_capacity, "%s", error.message);
+        return false;
+    }
+
+    char selected_id[64];
+    char search[128];
+    (void)snprintf(selected_id, sizeof(selected_id), "%s", dashboard->selected_id);
+    (void)snprintf(search, sizeof(search), "%s", dashboard->search);
+    OdServiceSort sort = dashboard->sort;
+    bool ascending = dashboard->sort_ascending;
+    OdDashboardWidget focused = dashboard->focused;
+    bool expanded = dashboard->expanded;
+    (void)snprintf(new_dashboard.selected_id, sizeof(new_dashboard.selected_id), "%s",
+                   selected_id);
+    if (od_dashboard_search(&new_dashboard, search, &error) != OD_OK) {
+        od_dashboard_free(&new_dashboard);
+        od_allocation_plan_free(&new_plan);
+        od_assignments_free(&new_saved);
+        od_scan_snapshot_free(&fresh);
+        (void)snprintf(status, status_capacity, "%s", error.message);
+        return false;
+    }
+    if (sort != OD_SERVICE_SORT_NAME) od_dashboard_sort(&new_dashboard, sort);
+    if (!ascending) od_dashboard_sort(&new_dashboard, sort);
+    new_dashboard.focused = focused;
+    new_dashboard.expanded = expanded;
+
+    od_dashboard_free(dashboard);
+    od_allocation_plan_free(plan);
+    od_assignments_free(saved);
+    od_scan_snapshot_free(snapshot);
+    *snapshot = fresh;
+    new_dashboard.snapshot = snapshot;
+    *dashboard = new_dashboard;
+    *plan = new_plan;
+    *saved = new_saved;
+    (void)snprintf(status, status_capacity, "Scan #%llu complete • %zu warning(s)",
+                   (unsigned long long)snapshot->generation, snapshot->warning_count);
+    return true;
+}
+
 static void run_dashboard(WINDOW *window,
                           OdCanvas *canvas,
                           bool use_color,
                           bool ascii,
                           const char *project_root,
                           const OdProfile *profile,
-                          const OdScanSnapshot *snapshot) {
+                          const OdSettings *settings,
+                          OdScanSnapshot *snapshot) {
     OdDashboard dashboard;
     OdAllocationPlan plan = {0};
     OdError error;
@@ -494,8 +708,16 @@ static void run_dashboard(WINDOW *window,
     char status[256];
     (void)snprintf(status, sizeof(status), "Live scan ready • %zu warning(s)",
                    snapshot->warning_count);
+    uint64_t last_refresh = monotonic_milliseconds();
     bool done = false;
     while (!done) {
+        uint64_t now = monotonic_milliseconds();
+        if (settings->auto_refresh &&
+            now - last_refresh >= (uint64_t)settings->refresh_seconds * UINT64_C(1000)) {
+            (void)refresh_dashboard(project_root, profile, snapshot, &saved,
+                                    &plan, &dashboard, status, sizeof(status));
+            last_refresh = monotonic_milliseconds();
+        }
         int width = getmaxx(window);
         int height = getmaxy(window);
         if (!canvas_resize(canvas, width, height, &error)) break;
@@ -545,6 +767,10 @@ static void run_dashboard(WINDOW *window,
         } else if (input == 'S') {
             od_dashboard_sort(&dashboard, dashboard.sort);
             (void)snprintf(status, sizeof(status), "Service sort direction reversed.");
+        } else if (input == '?') {
+            run_help(window, canvas, use_color, ascii);
+            (void)snprintf(status, sizeof(status),
+                           "Help closed • dashboard focus preserved.");
         } else if (input == KEY_MOUSE) {
             MEVENT event;
             if (getmouse(&event) == OK) {
@@ -559,7 +785,12 @@ static void run_dashboard(WINDOW *window,
             }
         } else if (input == 'r' || input == 'R') {
             (void)snprintf(status, sizeof(status),
-                           "Return to the main menu to start a fresh scan.");
+                           "Refreshing listeners and Docker mappings...");
+            od_render_dashboard(canvas, &dashboard, ascii, &hit_map, status);
+            paint_canvas(window, canvas, use_color);
+            (void)refresh_dashboard(project_root, profile, snapshot, &saved,
+                                    &plan, &dashboard, status, sizeof(status));
+            last_refresh = monotonic_milliseconds();
         } else if (input == KEY_RESIZE) {
             continue;
         }
@@ -823,6 +1054,40 @@ static OdStatus run_resolution(WINDOW *window,
 
 int od_tui_run(const OpendoorOptions *options) {
     (void)setlocale(LC_ALL, "");
+    OdSettings settings;
+    od_settings_defaults(&settings);
+    char settings_path[4096];
+    OdError settings_error;
+    const char *active_settings_path =
+        od_settings_resolve_path(settings_path, sizeof(settings_path), &settings_error) == OD_OK ?
+            settings_path : NULL;
+    char settings_notice[256] = {0};
+    if (active_settings_path != NULL) {
+        struct stat settings_information;
+        if (lstat(active_settings_path, &settings_information) == 0) {
+            if (od_settings_load(active_settings_path, &settings, &settings_error) != OD_OK) {
+                od_settings_defaults(&settings);
+                (void)snprintf(settings_notice, sizeof(settings_notice),
+                               "Settings ignored: %.220s", settings_error.message);
+            }
+        } else if (errno != ENOENT) {
+            (void)snprintf(settings_notice, sizeof(settings_notice),
+                           "Settings unavailable: %.210s", strerror(errno));
+        }
+    } else {
+        (void)snprintf(settings_notice, sizeof(settings_notice), "%s",
+                       settings_error.message);
+    }
+    const OdTheme *theme = od_theme_by_name(settings.theme);
+    if (theme == NULL) {
+        theme = od_theme_by_name("midnight");
+        (void)snprintf(settings.theme, sizeof(settings.theme), "midnight");
+        (void)snprintf(settings_notice, sizeof(settings_notice),
+                       "Unknown theme replaced with midnight; save settings to keep it.");
+    }
+    bool ascii = options->force_ascii || settings.unicode_mode == OD_UNICODE_NEVER ||
+                 (settings.unicode_mode == OD_UNICODE_AUTO && MB_CUR_MAX <= 1U);
+    bool reduced_motion = options->reduced_motion || settings.reduced_motion;
     StartupScan scan = {0};
     od_scan_snapshot_init(&scan.snapshot, 1U);
     atomic_init(&scan.stage, OD_LOAD_PROJECT_FILES);
@@ -843,9 +1108,8 @@ int od_tui_run(const OpendoorOptions *options) {
     (void)cbreak();
     (void)curs_set(0);
     (void)keypad(window, true);
-    (void)mousemask(ALL_MOUSE_EVENTS, NULL);
+    (void)mousemask(settings.mouse ? ALL_MOUSE_EVENTS : 0U, NULL);
     wtimeout(window, 80);
-    const OdTheme *theme = od_theme_by_name("midnight");
     bool use_color = initialize_colors(theme, options->no_color);
     OdCanvas canvas = {0};
     OdError canvas_error;
@@ -869,8 +1133,8 @@ int od_tui_run(const OpendoorOptions *options) {
                               (OdLoadingStage)atomic_load(&scan.stage),
                               frame++,
                               elapsed > UINT32_MAX ? UINT32_MAX : (unsigned)elapsed,
-                              options->reduced_motion,
-                              options->force_ascii,
+                              reduced_motion,
+                              ascii,
                               atomic_load(&scan.warning_count));
         }
         paint_canvas(window, &canvas, use_color);
@@ -907,6 +1171,8 @@ int od_tui_run(const OpendoorOptions *options) {
     menu_status(status, sizeof(status), configured, selected);
     if (profile_error[0] != '\0') {
         (void)snprintf(status, sizeof(status), "Profile not loaded: %.220s", profile_error);
+    } else if (settings_notice[0] != '\0') {
+        (void)snprintf(status, sizeof(status), "%s", settings_notice);
     }
     while (!quit) {
         int width = getmaxx(window);
@@ -924,12 +1190,15 @@ int od_tui_run(const OpendoorOptions *options) {
                                atomic_load(&scan.warning_count));
             }
             OdMenuView view = {project_label(options), configured, selected, status};
-            od_render_main_menu(&canvas, &view, options->force_ascii);
+            od_render_main_menu(&canvas, &view, ascii);
         }
         paint_canvas(window, &canvas, use_color);
         int input = wgetch(window);
         size_t count = menu_item_count(configured);
-        if (input == 'q' || input == 'Q' || input == 27) {
+        if (input == '?') {
+            run_help(window, &canvas, use_color, ascii);
+            menu_status(status, sizeof(status), configured, selected);
+        } else if (input == 'q' || input == 'Q' || input == 27) {
             quit = true;
         } else if (input == KEY_UP || input == 'k' || input == 'h') {
             selected = selected == 0U ? count - 1U : selected - 1U;
@@ -941,7 +1210,7 @@ int od_tui_run(const OpendoorOptions *options) {
             if (selected == count - 1U) {
                 quit = true;
             } else if (!configured && selected == 0U) {
-                if (run_onboarding(window, &canvas, use_color, options->force_ascii,
+                if (run_onboarding(window, &canvas, use_color, ascii,
                                    project_root, &session_profile)) {
                     configured = true;
                     session_profile_ready = true;
@@ -952,7 +1221,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     }
                     OdError workflow_error;
                     OdStatus workflow_status = active_profile_path == NULL ? OD_ERROR_INVALID :
-                        run_resolution(window, &canvas, use_color, options->force_ascii,
+                        run_resolution(window, &canvas, use_color, ascii,
                                        project_root, active_profile_path, &session_profile,
                                        &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
@@ -982,8 +1251,9 @@ int od_tui_run(const OpendoorOptions *options) {
                         (void)pthread_join(scan.thread, NULL);
                         scan_joined = true;
                     }
-                    run_dashboard(window, &canvas, use_color, options->force_ascii,
-                                  project_root, &session_profile, &scan.snapshot);
+                    run_dashboard(window, &canvas, use_color, ascii,
+                                  project_root, &session_profile, &settings,
+                                  &scan.snapshot);
                     menu_status(status, sizeof(status), configured, selected);
                 }
             } else if (configured && selected == 1U) {
@@ -1000,7 +1270,7 @@ int od_tui_run(const OpendoorOptions *options) {
                     }
                     OdError workflow_error;
                     OdStatus workflow_status = run_resolution(
-                        window, &canvas, use_color, options->force_ascii,
+                        window, &canvas, use_color, ascii,
                         project_root, active_profile_path, &session_profile,
                         &scan.snapshot, &workflow_error);
                     if (workflow_status == OD_OK) {
@@ -1037,6 +1307,29 @@ int od_tui_run(const OpendoorOptions *options) {
                         (void)snprintf(status, sizeof(status), "%s", refresh_error.message);
                     }
                 }
+            } else if ((!configured && selected == 2U) ||
+                       (configured && selected == 4U)) {
+                if (run_settings(window, &canvas, use_color, ascii,
+                                 active_settings_path, &settings)) {
+                    theme = od_theme_by_name(settings.theme);
+                    if (theme == NULL) theme = od_theme_by_name("midnight");
+                    use_color = initialize_colors(theme, options->no_color);
+                    ascii = options->force_ascii ||
+                            settings.unicode_mode == OD_UNICODE_NEVER ||
+                            (settings.unicode_mode == OD_UNICODE_AUTO && MB_CUR_MAX <= 1U);
+                    reduced_motion = options->reduced_motion || settings.reduced_motion;
+                    (void)reduced_motion;
+                    (void)mousemask(settings.mouse ? ALL_MOUSE_EVENTS : 0U, NULL);
+                    (void)snprintf(status, sizeof(status),
+                                   "Settings saved and applied.");
+                } else {
+                    (void)snprintf(status, sizeof(status),
+                                   "Settings closed without saving changes.");
+                }
+            } else if ((!configured && selected == 3U) ||
+                       (configured && selected == 5U)) {
+                run_help(window, &canvas, use_color, ascii);
+                menu_status(status, sizeof(status), configured, selected);
             } else {
                 menu_status(status, sizeof(status), configured, selected);
             }

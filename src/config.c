@@ -500,3 +500,40 @@ OdStatus od_settings_load(const char *path, OdSettings *settings, OdError *error
     free(text);
     return status;
 }
+
+OdStatus od_settings_render(const OdSettings *settings,
+                            char **text,
+                            size_t *length,
+                            OdError *error) {
+    if (settings == NULL || text == NULL || length == NULL ||
+        settings->schema_version != 1U || settings->theme[0] == '\0' ||
+        settings->unicode_mode > OD_UNICODE_NEVER ||
+        settings->refresh_seconds < 1U || settings->refresh_seconds > 3600U) {
+        od_error_set(error, OD_ERROR_INVALID, "settings values are invalid");
+        return OD_ERROR_INVALID;
+    }
+    static const char *const unicode_names[] = {"auto", "always", "never"};
+    TextBuilder builder = {0};
+    OdStatus status = builder_appendf(
+        &builder, error,
+        "schema_version = 1\n"
+        "theme = \"%s\"\n"
+        "unicode = \"%s\"\n"
+        "reduced_motion = %s\n"
+        "mouse = %s\n"
+        "auto_refresh = %s\n"
+        "refresh_seconds = %u\n",
+        settings->theme, unicode_names[settings->unicode_mode],
+        settings->reduced_motion ? "true" : "false",
+        settings->mouse ? "true" : "false",
+        settings->auto_refresh ? "true" : "false",
+        settings->refresh_seconds);
+    if (status != OD_OK) {
+        free(builder.data);
+        return status;
+    }
+    *text = builder.data;
+    *length = builder.length;
+    od_error_clear(error);
+    return OD_OK;
+}
