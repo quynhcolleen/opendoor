@@ -35,7 +35,7 @@ SOFTWARE.
 - Upstream: https://github.com/zserge/jsmn
 - Revision: `25647e692c7906b96ffd2b05ca54c097948e879c`
 - License: MIT
-- File: `vendor/jsmn/jsmn.h`
+- Files: `vendor/jsmn/jsmn.h`, `vendor/jsmn/jsmn.c` (OpenDoor compilation wrapper)
 
 Copyright (c) 2010 Serge A. Zaitsev
 

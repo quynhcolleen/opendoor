@@ -10,6 +10,8 @@ include(CTest)
 
 add_library(tomlc17 STATIC vendor/tomlc17/tomlc17.c)
 target_include_directories(tomlc17 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/tomlc17)
+add_library(jsmn STATIC vendor/jsmn/jsmn.c)
+target_include_directories(jsmn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
 
 add_library(opendoor_core
   src/app.c
@@ -18,13 +20,17 @@ add_library(opendoor_core
   src/config.c
   src/dotenv.c
   src/allocation.c
+  src/scan.c
+  src/docker.c
+  src/discovery.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(opendoor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
 target_compile_definitions(opendoor_core PUBLIC OPENDOOR_VERSION="${PROJECT_VERSION}")
 target_compile_options(opendoor_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 add_executable(opendoor src/main.c)
-target_link_libraries(opendoor_core PRIVATE tomlc17)
+target_link_libraries(opendoor_core PRIVATE tomlc17 jsmn)
 target_link_libraries(opendoor PRIVATE opendoor_core)
 target_compile_options(opendoor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
@@ -38,6 +44,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_core PRIVATE opendoor_core)
   target_compile_options(test_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME core_contracts COMMAND test_core)
+  add_executable(test_discovery tests/test_discovery.c)
+  target_link_libraries(test_discovery PRIVATE opendoor_core)
+  target_compile_options(test_discovery PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME discovery_contracts COMMAND test_discovery)
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)
