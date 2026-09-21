@@ -47,6 +47,7 @@ add_library(opendoor_core
   src/ui.c
   src/screens.c
   src/tui.c
+  src/onboarding.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(opendoor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
@@ -79,6 +80,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_ui PRIVATE opendoor_core)
   target_compile_options(test_ui PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME ui_contracts COMMAND test_ui)
+  add_executable(test_onboarding tests/test_onboarding.c)
+  target_link_libraries(test_onboarding PRIVATE opendoor_core)
+  target_compile_options(test_onboarding PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME onboarding_contracts COMMAND test_onboarding)
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)

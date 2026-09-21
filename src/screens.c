@@ -145,3 +145,75 @@ void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii) {
                     "Up/Down Navigate  Enter Select  ? Help  q Quit",
                     canvas->width - 2U, OD_ROLE_MUTED, 0U);
 }
+
+void od_render_onboarding(OdCanvas *canvas,
+                          const OdOnboarding *onboarding,
+                          bool ascii,
+                          const char *status) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "Discover this project", canvas->width - 4U,
+                    OD_ROLE_PRIMARY, 1U);
+    size_t reviewed_count = 0U;
+    for (size_t index = 0U; index < onboarding->candidates.count; ++index) {
+        if (onboarding->reviewed[index]) ++reviewed_count;
+    }
+    char summary[160];
+    (void)snprintf(summary, sizeof(summary),
+                   "Review every candidate • %zu of %zu reviewed • Space toggles use",
+                   reviewed_count, onboarding->candidates.count);
+    od_canvas_write(canvas, 2, 2, summary, canvas->width - 4U,
+                    reviewed_count == onboarding->candidates.count ? OD_ROLE_SUCCESS : OD_ROLE_MUTED,
+                    0U);
+
+    int box_x = 1;
+    int box_y = 4;
+    int box_width = (int)canvas->width - 2;
+    int box_height = (int)canvas->height - 8;
+    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                  OD_ROLE_FOCUSED_BORDER);
+    od_canvas_write(canvas, box_x + 2, box_y + 1,
+                    "USE REVIEW CONFIDENCE   NAME                 VARIABLE                 PORT",
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 1U);
+
+    size_t start = od_onboarding_page_start(onboarding);
+    size_t end = start + onboarding->page_size;
+    if (end > onboarding->candidates.count) end = onboarding->candidates.count;
+    for (size_t index = start; index < end; ++index) {
+        const OdCandidate *candidate = &onboarding->candidates.items[index];
+        const char *confidence = candidate->confidence == OD_CONFIDENCE_CONFIRMED ? "Confirmed" :
+                                 (candidate->confidence == OD_CONFIDENCE_LIKELY ? "Likely" : "Possible");
+        const char *use = candidate->selected ? (ascii ? "[x]" : "[✓]") : "[ ]";
+        const char *review = onboarding->reviewed[index] ? (ascii ? "yes" : "✓") : "—";
+        char row[320];
+        (void)snprintf(row, sizeof(row), "%-3s %-6s %-12s %-20.20s %-24.24s %5u",
+                       use, review, confidence, candidate->name, candidate->variable,
+                       (unsigned)candidate->port);
+        int row_y = box_y + 2 + (int)(index - start);
+        bool selected = index == onboarding->selected;
+        od_canvas_write(canvas, box_x + 2, row_y, row, (size_t)(box_width - 4),
+                        selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
+                        selected ? 1U : 0U);
+    }
+    if (onboarding->candidates.count == 0U) {
+        od_canvas_write_centered(canvas, box_y + box_height / 2,
+                                 "No candidates found • press a to add a service",
+                                 OD_ROLE_MUTED, 0U);
+    }
+    char page[80];
+    (void)snprintf(page, sizeof(page), "Page %zu/%zu",
+                   od_onboarding_page(onboarding) + 1U,
+                   od_onboarding_page_count(onboarding));
+    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page,
+                    (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+    if (status != NULL) {
+        od_canvas_write(canvas, 2, (int)canvas->height - 3, status,
+                        canvas->width - 4U, OD_ROLE_WARNING, 0U);
+    }
+    od_canvas_write(canvas, 1, (int)canvas->height - 1,
+                    "Up/Down Select  PgUp/PgDn Page  Space Use  Enter Review  e Edit  a Add  s Continue  Esc Back",
+                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+}

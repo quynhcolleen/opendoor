@@ -230,6 +230,50 @@ static void test_project_discovery_and_merge(void) {
     od_candidate_list_free(&make_candidates);
 }
 
+static void test_project_directory_discovery(void) {
+    char root[] = "/tmp/opendoor-project-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char path[512];
+    (void)snprintf(path, sizeof(path), "%s/compose.yaml", root);
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("services:\n  api:\n    ports:\n      - \"${API_PORT:-3100}:3100\"\n", file);
+        (void)fclose(file);
+    }
+    (void)snprintf(path, sizeof(path), "%s/.env", root);
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("API_PORT=3100\nMETRICS_PORT=9100\n", file);
+        (void)fclose(file);
+    }
+    (void)snprintf(path, sizeof(path), "%s/Makefile", root);
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        (void)fputs("ADMIN_PORT ?= 8081\n", file);
+        (void)fclose(file);
+    }
+    OdCandidateList candidates;
+    OdError error;
+    od_candidate_list_init(&candidates);
+    CHECK(od_discover_project(root, &candidates, &error) == OD_OK);
+    CHECK(candidates.count == 3U);
+    if (candidates.count == 3U) {
+        CHECK(candidates.items[0].sources.count == 2U);
+        CHECK(strcmp(candidates.items[0].variable, "API_PORT") == 0);
+    }
+    od_candidate_list_free(&candidates);
+    (void)snprintf(path, sizeof(path), "%s/compose.yaml", root);
+    (void)unlink(path);
+    (void)snprintf(path, sizeof(path), "%s/.env", root);
+    (void)unlink(path);
+    (void)snprintf(path, sizeof(path), "%s/Makefile", root);
+    (void)unlink(path);
+    (void)rmdir(root);
+}
+
 int main(void) {
     test_proc_tcp_udp_ipv4_ipv6_and_deduplication();
     test_socket_inode_target();
@@ -238,6 +282,7 @@ int main(void) {
     test_docker_absent_is_nonfatal();
     test_many_docker_containers();
     test_project_discovery_and_merge();
+    test_project_directory_discovery();
     if (failures != 0) {
         fprintf(stderr, "%d discovery checks failed\n", failures);
         return 1;

@@ -4,11 +4,13 @@
 #include "jsmn.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define OD_DISCOVERY_INPUT_LIMIT (4U * 1024U * 1024U)
 #define OD_DISCOVERY_SOURCE_CAP 4096U
@@ -483,6 +485,163 @@ OdStatus od_candidates_merge(OdCandidateList *destination,
              ++source_item) {
             status = source_add(&match->sources, incoming->sources.items[source_item], error);
         }
+    }
+    if (status == OD_OK) od_error_clear(error);
+    return status;
+}
+
+static bool suffix(const char *value, const char *ending) {
+    size_t value_length = strlen(value);
+    size_t ending_length = strlen(ending);
+    return value_length >= ending_length &&
+           strcmp(value + value_length - ending_length, ending) == 0;
+}
+
+static bool compose_name(const char *name) {
+    bool extension = suffix(name, ".yaml") || suffix(name, ".yml");
+    return extension &&
+           (strncmp(name, "compose", 7U) == 0 || strncmp(name, "docker-compose", 14U) == 0);
+}
+
+static bool skipped_directory(const char *name) {
+    static const char *const skipped[] = {
+        ".git", ".opendoor", ".worktrees", "node_modules", "build", "dist"
+    };
+    for (size_t index = 0U; index < sizeof(skipped) / sizeof(skipped[0]); ++index) {
+        if (strcmp(name, skipped[index]) == 0) return true;
+    }
+    return false;
+}
+
+static OdStatus read_discovery_file(const char *path, char **text, OdError *error) {
+    struct stat metadata;
+    if (lstat(path, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_size < 0 || (uintmax_t)metadata.st_size > OD_DISCOVERY_INPUT_LIMIT) {
+        return OD_ERROR_INVALID;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return OD_ERROR_IO;
+    size_t length = (size_t)metadata.st_size;
+    char *buffer = malloc(length + 1U);
+    if (buffer == NULL) {
+        fclose(file);
+        od_error_set(error, OD_ERROR_MEMORY, "unable to read %s", path);
+        return OD_ERROR_MEMORY;
+    }
+    size_t count = fread(buffer, 1U, length, file);
+    int close_result = fclose(file);
+    if (count != length || close_result != 0) {
+        free(buffer);
+        return OD_ERROR_IO;
+    }
+    buffer[length] = '\0';
+    *text = buffer;
+    return OD_OK;
+}
+
+static OdStatus discover_file(const char *full_path,
+                              const char *relative_path,
+                              const char *name,
+                              OdCandidateList *candidates,
+                              OdError *error) {
+    bool is_compose = compose_name(name);
+    bool is_dotenv = strncmp(name, ".env", 4U) == 0 || strcmp(name, ".ports.env") == 0;
+    bool is_package = strcmp(name, "package.json") == 0;
+    bool is_makefile = strcmp(name, "Makefile") == 0 || strcmp(name, "makefile") == 0;
+    if (!is_compose && !is_dotenv && !is_package && !is_makefile) return OD_OK;
+    char *text = NULL;
+    OdStatus status = read_discovery_file(full_path, &text, error);
+    if (status != OD_OK) {
+        return status == OD_ERROR_MEMORY ? status : OD_OK;
+    }
+    OdCandidateList found;
+    od_candidate_list_init(&found);
+    if (is_compose) {
+        status = od_discover_compose_text(relative_path, text, &found, error);
+    } else if (is_dotenv) {
+        status = od_discover_dotenv_text(relative_path, text, &found, error);
+    } else if (is_package) {
+        status = od_discover_package_json(relative_path, text, &found, error);
+    } else {
+        status = od_discover_makefile_text(relative_path, text, &found, error);
+    }
+    free(text);
+    if (status == OD_OK) status = od_candidates_merge(candidates, &found, error);
+    od_candidate_list_free(&found);
+    if (status == OD_ERROR_INVALID || status == OD_ERROR_IO) {
+        od_error_clear(error);
+        return OD_OK;
+    }
+    return status;
+}
+
+static OdStatus discover_directory(const char *root,
+                                   const char *relative,
+                                   unsigned depth,
+                                   OdCandidateList *candidates,
+                                   OdError *error) {
+    char directory_path[OD_DISCOVERY_SOURCE_CAP];
+    int count = relative[0] == '\0' ?
+                snprintf(directory_path, sizeof(directory_path), "%s", root) :
+                snprintf(directory_path, sizeof(directory_path), "%s/%s", root, relative);
+    if (count < 0 || (size_t)count >= sizeof(directory_path)) {
+        od_error_set(error, OD_ERROR_INVALID, "project path is too long");
+        return OD_ERROR_INVALID;
+    }
+    DIR *directory = opendir(directory_path);
+    if (directory == NULL) {
+        if (depth == 0U) {
+            od_error_set(error, OD_ERROR_IO, "unable to open project root: %s", root);
+            return OD_ERROR_IO;
+        }
+        return OD_OK;
+    }
+    OdStatus status = OD_OK;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL && status == OD_OK) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char child_relative[OD_DISCOVERY_SOURCE_CAP];
+        count = relative[0] == '\0' ?
+                snprintf(child_relative, sizeof(child_relative), "%s", entry->d_name) :
+                snprintf(child_relative, sizeof(child_relative), "%s/%s", relative, entry->d_name);
+        if (count < 0 || (size_t)count >= sizeof(child_relative)) continue;
+        char full_path[OD_DISCOVERY_SOURCE_CAP];
+        count = snprintf(full_path, sizeof(full_path), "%s/%s", root, child_relative);
+        if (count < 0 || (size_t)count >= sizeof(full_path)) continue;
+        struct stat metadata;
+        if (lstat(full_path, &metadata) != 0) continue;
+        if (S_ISDIR(metadata.st_mode) && depth < 3U && !skipped_directory(entry->d_name)) {
+            status = discover_directory(root, child_relative, depth + 1U, candidates, error);
+        } else if (S_ISREG(metadata.st_mode)) {
+            status = discover_file(full_path, child_relative, entry->d_name, candidates, error);
+        }
+    }
+    closedir(directory);
+    return status;
+}
+
+static int compare_candidates(const void *left_value, const void *right_value) {
+    const OdCandidate *left = left_value;
+    const OdCandidate *right = right_value;
+    if (left->confidence != right->confidence) {
+        return left->confidence > right->confidence ? -1 : 1;
+    }
+    int variable = strcmp(left->variable, right->variable);
+    if (variable != 0) return variable;
+    if (left->port == right->port) return 0;
+    return left->port < right->port ? -1 : 1;
+}
+
+OdStatus od_discover_project(const char *project_root,
+                             OdCandidateList *candidates,
+                             OdError *error) {
+    if (project_root == NULL || candidates == NULL) {
+        od_error_set(error, OD_ERROR_INVALID, "project root and candidate list are required");
+        return OD_ERROR_INVALID;
+    }
+    OdStatus status = discover_directory(project_root, "", 0U, candidates, error);
+    if (status == OD_OK && candidates->count > 1U) {
+        qsort(candidates->items, candidates->count, sizeof(*candidates->items), compare_candidates);
     }
     if (status == OD_OK) od_error_clear(error);
     return status;

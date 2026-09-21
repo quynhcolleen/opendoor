@@ -2,6 +2,7 @@
 #define OPENDOOR_SCREENS_H
 
 #include "opendoor/ui.h"
+#include "opendoor/onboarding.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -31,8 +32,11 @@ void od_render_loading(OdCanvas *canvas,
                        bool ascii,
                        size_t warning_count);
 void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii);
+void od_render_onboarding(OdCanvas *canvas,
+                          const OdOnboarding *onboarding,
+                          bool ascii,
+                          const char *status);
 const char *const *od_banner_lines(void);
 size_t od_banner_line_count(void);
 
 #endif
-

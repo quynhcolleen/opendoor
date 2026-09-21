@@ -2,17 +2,22 @@
 
 #include "curses_compat.h"
 #include "opendoor/docker.h"
+#include "opendoor/discovery.h"
+#include "opendoor/onboarding.h"
 #include "opendoor/screens.h"
 #include "opendoor/scan.h"
 #include "opendoor/theme.h"
 #include "opendoor/ui.h"
 
 #include <locale.h>
+#include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -137,6 +142,208 @@ static void menu_status(char *status, size_t capacity, bool configured, size_t s
     (void)snprintf(status, capacity, "%s", message);
 }
 
+static bool prompt_text(WINDOW *window,
+                        OdCanvas *canvas,
+                        bool use_color,
+                        bool ascii,
+                        const char *title,
+                        const char *label,
+                        char *value,
+                        size_t capacity) {
+    size_t length = strlen(value);
+    while (true) {
+        int width = getmaxx(window);
+        int height = getmaxy(window);
+        OdError error;
+        if (!canvas_resize(canvas, width, height, &error)) return false;
+        if (width < 60 || height < 18) {
+            od_render_resize_required(canvas);
+        } else {
+            od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+            int box_width = width > 76 ? 72 : width - 4;
+            int box_height = 9;
+            int box_x = (width - box_width) / 2;
+            int box_y = (height - box_height) / 2;
+            od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+                          OD_ROLE_FOCUSED_BORDER);
+            od_canvas_write(canvas, box_x + 2, box_y + 1, title,
+                            (size_t)(box_width - 4), OD_ROLE_PRIMARY, 1U);
+            od_canvas_write(canvas, box_x + 2, box_y + 3, label,
+                            (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+            char shown[512];
+            (void)snprintf(shown, sizeof(shown), "> %s_", value);
+            od_canvas_write(canvas, box_x + 2, box_y + 4, shown,
+                            (size_t)(box_width - 4), OD_ROLE_SELECTED, 0U);
+            od_canvas_write(canvas, box_x + 2, box_y + 7,
+                            "Enter Accept  Esc Cancel  Backspace Delete",
+                            (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+        }
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == 27) return false;
+        if (input == '\n' || input == '\r') return true;
+        if (input == 127 || input == 8) {
+            if (length > 0U) value[--length] = '\0';
+        } else if (input >= 0 && input <= 255 && isprint((unsigned char)input) &&
+                   length + 1U < capacity) {
+            value[length++] = (char)input;
+            value[length] = '\0';
+        }
+    }
+}
+
+static bool prompt_candidate(WINDOW *window,
+                             OdCanvas *canvas,
+                             bool use_color,
+                             bool ascii,
+                             OdOnboarding *onboarding,
+                             bool editing,
+                             char *status,
+                             size_t status_capacity) {
+    char name[128] = {0};
+    char group[128] = "default";
+    char variable[128] = {0};
+    char port_text[16] = {0};
+    if (editing && onboarding->selected < onboarding->candidates.count) {
+        const OdCandidate *candidate = &onboarding->candidates.items[onboarding->selected];
+        (void)snprintf(name, sizeof(name), "%s", candidate->name);
+        (void)snprintf(group, sizeof(group), "%s", candidate->group);
+        (void)snprintf(variable, sizeof(variable), "%s", candidate->variable);
+        (void)snprintf(port_text, sizeof(port_text), "%u", (unsigned)candidate->port);
+    }
+    const char *title = editing ? "Edit discovered service" : "Add managed service";
+    if (!prompt_text(window, canvas, use_color, ascii, title, "Display name", name, sizeof(name)) ||
+        !prompt_text(window, canvas, use_color, ascii, title, "Group", group, sizeof(group)) ||
+        !prompt_text(window, canvas, use_color, ascii, title, "Environment variable", variable, sizeof(variable)) ||
+        !prompt_text(window, canvas, use_color, ascii, title, "Preferred port", port_text, sizeof(port_text))) {
+        (void)snprintf(status, status_capacity, "Edit cancelled; no candidate was changed.");
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long numeric = strtoul(port_text, &end, 10);
+    if (errno != 0 || end == port_text || *end != '\0' || numeric > 65535UL) {
+        (void)snprintf(status, status_capacity, "Preferred port must be a number from %u to %u.",
+                       (unsigned)onboarding->port_min, (unsigned)onboarding->port_max);
+        return false;
+    }
+    OdError error;
+    OdStatus result = editing ?
+        od_onboarding_edit_selected(onboarding, name, group, variable,
+                                    (uint16_t)numeric, &error) :
+        od_onboarding_add_manual(onboarding, name, group, variable,
+                                 (uint16_t)numeric, OD_PROTOCOL_TCP, &error);
+    if (result != OD_OK) {
+        (void)snprintf(status, status_capacity, "%s", error.message);
+        return false;
+    }
+    (void)snprintf(status, status_capacity,
+                   editing ? "Candidate updated and marked reviewed." :
+                             "Manual candidate added; review it before continuing.");
+    return true;
+}
+
+static void project_display_name(const char *project_root, char *name, size_t capacity) {
+    const char *end = project_root + strlen(project_root);
+    while (end > project_root && end[-1] == '/') --end;
+    const char *start = end;
+    while (start > project_root && start[-1] != '/') --start;
+    size_t length = (size_t)(end - start);
+    if (length == 0U) {
+        (void)snprintf(name, capacity, "Project");
+    } else {
+        if (length >= capacity) length = capacity - 1U;
+        memcpy(name, start, length);
+        name[length] = '\0';
+    }
+}
+
+static bool run_onboarding(WINDOW *window,
+                           OdCanvas *canvas,
+                           bool use_color,
+                           bool ascii,
+                           const char *project_root,
+                           OdProfile *profile) {
+    OdCandidateList candidates;
+    OdError error;
+    od_candidate_list_init(&candidates);
+    OdStatus discovery_status = od_discover_project(project_root, &candidates, &error);
+    if (discovery_status != OD_OK) {
+        od_candidate_list_free(&candidates);
+        return false;
+    }
+    int height = getmaxy(window);
+    size_t page_size = height > 14 ? (size_t)(height - 12) : 1U;
+    OdOnboarding onboarding;
+    if (od_onboarding_init(&onboarding, &candidates, page_size,
+                           1024U, 65535U, &error) != OD_OK) {
+        od_candidate_list_free(&candidates);
+        return false;
+    }
+    od_candidate_list_free(&candidates);
+    char status[256] = "Review every candidate before continuing.";
+    bool finished = false;
+    bool accepted = false;
+    while (!finished) {
+        int width = getmaxx(window);
+        height = getmaxy(window);
+        if (!canvas_resize(canvas, width, height, &error)) break;
+        onboarding.page_size = height > 14 ? (size_t)(height - 12) : 1U;
+        od_render_onboarding(canvas, &onboarding, ascii, status);
+        paint_canvas(window, canvas, use_color);
+        int input = wgetch(window);
+        if (input == 27 || input == 'q') {
+            finished = true;
+        } else if (input == KEY_UP || input == 'k') {
+            od_onboarding_move(&onboarding, -1);
+        } else if (input == KEY_DOWN || input == 'j') {
+            od_onboarding_move(&onboarding, 1);
+        } else if (input == KEY_PPAGE) {
+            od_onboarding_move_page(&onboarding, -1);
+        } else if (input == KEY_NPAGE) {
+            od_onboarding_move_page(&onboarding, 1);
+        } else if (input == KEY_HOME) {
+            onboarding.selected = 0U;
+        } else if (input == KEY_END && onboarding.candidates.count > 0U) {
+            onboarding.selected = onboarding.candidates.count - 1U;
+        } else if (input == ' ') {
+            od_onboarding_toggle_selected(&onboarding);
+            (void)snprintf(status, sizeof(status), "Selection changed; press Enter to mark this row reviewed.");
+        } else if (input == '\n' || input == '\r') {
+            od_onboarding_review_selected(&onboarding);
+            (void)snprintf(status, sizeof(status), "Candidate reviewed.");
+        } else if (input == 'a') {
+            (void)prompt_candidate(window, canvas, use_color, ascii, &onboarding,
+                                   false, status, sizeof(status));
+        } else if (input == 'e') {
+            if (onboarding.candidates.count == 0U) {
+                (void)snprintf(status, sizeof(status), "There is no candidate to edit; press a to add one.");
+            } else {
+                (void)prompt_candidate(window, canvas, use_color, ascii, &onboarding,
+                                       true, status, sizeof(status));
+            }
+        } else if (input == 's') {
+            if (!od_onboarding_all_reviewed(&onboarding)) {
+                (void)snprintf(status, sizeof(status),
+                               "Review every candidate before continuing.");
+            } else {
+                char name[128];
+                project_display_name(project_root, name, sizeof(name));
+                OdStatus profile_status = od_onboarding_build_profile(
+                    &onboarding, name, ".ports.env", profile, &error);
+                if (profile_status == OD_OK) {
+                    accepted = true;
+                    finished = true;
+                } else {
+                    (void)snprintf(status, sizeof(status), "%s", error.message);
+                }
+            }
+        }
+    }
+    od_onboarding_free(&onboarding);
+    return accepted;
+}
+
 int od_tui_run(const OpendoorOptions *options) {
     (void)setlocale(LC_ALL, "");
     StartupScan scan = {0};
@@ -195,6 +402,9 @@ int od_tui_run(const OpendoorOptions *options) {
     }
 
     bool configured = profile_exists(options);
+    OdProfile session_profile;
+    od_profile_init(&session_profile);
+    bool session_profile_ready = false;
     size_t selected = 0U;
     bool quit = false;
     char status[256];
@@ -231,6 +441,19 @@ int od_tui_run(const OpendoorOptions *options) {
         } else if (input == '\n' || input == '\r') {
             if (selected == count - 1U) {
                 quit = true;
+            } else if (!configured && selected == 0U) {
+                const char *root = options->project_path == NULL ? "." : options->project_path;
+                if (run_onboarding(window, &canvas, use_color, options->force_ascii,
+                                   root, &session_profile)) {
+                    configured = true;
+                    session_profile_ready = true;
+                    selected = 0U;
+                    (void)snprintf(status, sizeof(status),
+                                   "Candidate review complete • profile ready for conflict resolution.");
+                } else {
+                    (void)snprintf(status, sizeof(status),
+                                   "Discovery review cancelled; no files were changed.");
+                }
             } else {
                 menu_status(status, sizeof(status), configured, selected);
             }
@@ -242,5 +465,6 @@ int od_tui_run(const OpendoorOptions *options) {
     (void)endwin();
     (void)pthread_join(scan.thread, NULL);
     od_scan_snapshot_free(&scan.snapshot);
+    if (session_profile_ready) od_profile_free(&session_profile);
     return 0;
 }

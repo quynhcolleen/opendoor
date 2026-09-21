@@ -52,6 +52,8 @@ OdStatus od_discover_makefile_text(const char *path,
 OdStatus od_candidates_merge(OdCandidateList *destination,
                              const OdCandidateList *source,
                              OdError *error);
+OdStatus od_discover_project(const char *project_root,
+                             OdCandidateList *candidates,
+                             OdError *error);
 
 #endif
-
