@@ -73,10 +73,12 @@ Use a dense widget layout inspired by `btm`’s focusable, expandable widgets, s
 
 Responsive layout:
 
+- Always occupy exactly the current terminal viewport; never rely on terminal scrollback or render content below the visible screen.
 - `120+` columns: full multi-widget grid.
 - `80–119`: dominant services widget with one secondary widget.
 - `60–79`: one full-width widget with a tab bar.
 - Below `60×18`: centered resize message without corrupting terminal state.
+- Paginate overflowing rows inside the focused widget. Arrow keys move the selection one row, PgUp/PgDn move one visible page, and resize recomputes page capacity while keeping the selected stable row visible.
 
 ### Tables and interaction
 
@@ -378,6 +380,7 @@ The existing DSVN Makefile and Bash scripts remain unchanged.
 - Every mouse action has a keyboard equivalent.
 - A user can complete first-run discovery, review, resolution, and save without editing a file manually.
 - Long fields never corrupt borders or adjacent columns.
+- Every screen remains within one terminal viewport; overflowing content is navigated through focused-widget pagination, never terminal page scrolling.
 - Missing Docker and restricted `/proc` access degrade clearly without terminating the app.
 - Pre-save state changes cannot produce a known-conflicting assignment.
 - Generated `.ports.env` works with DSVN without modifying its current workflow.
