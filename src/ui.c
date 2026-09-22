@@ -68,7 +68,7 @@ static size_t codepoint_columns(uint32_t codepoint) {
     return 1U;
 }
 
-static size_t text_columns(const char *text) {
+size_t od_text_columns(const char *text) {
     size_t columns = 0U;
     size_t total = strlen(text);
     for (size_t index = 0U; index < total && text[index] != '\n';) {
@@ -141,19 +141,22 @@ void od_canvas_put(OdCanvas *canvas,
     cell->attributes = attributes;
 }
 
-void od_canvas_write(OdCanvas *canvas,
-                     int x,
-                     int y,
-                     const char *text,
-                     size_t maximum_columns,
-                     OdThemeRole role,
-                     unsigned attributes) {
+void od_canvas_write_slice(OdCanvas *canvas,
+                           int x,
+                           int y,
+                           const char *text,
+                           size_t first_column,
+                           size_t maximum_columns,
+                           OdThemeRole role,
+                           unsigned attributes) {
     if (canvas == NULL || text == NULL || y < 0 || (size_t)y >= canvas->height ||
         maximum_columns == 0U) return;
-    size_t column = 0U;
+    size_t source_column = 0U;
+    size_t destination_column = 0U;
     size_t index = 0U;
     size_t total = strlen(text);
-    while (index < total && text[index] != '\n' && column < maximum_columns) {
+    while (index < total && text[index] != '\n' &&
+           destination_column < maximum_columns) {
         size_t length = valid_utf8_length(text + index, total - index);
         size_t width = 1U;
         if (length == 0U) {
@@ -162,8 +165,8 @@ void od_canvas_write(OdCanvas *canvas,
             width = codepoint_columns(utf8_codepoint(text + index, length));
         }
         if (width == 0U) {
-            if (column > 0U) {
-                int previous_x = x + (int)column - 1;
+            if (destination_column > 0U && source_column >= first_column) {
+                int previous_x = x + (int)destination_column - 1;
                 while (previous_x >= x) {
                     OdCell *previous = &canvas->cells[(size_t)y * canvas->width +
                                                      (size_t)previous_x];
@@ -181,9 +184,19 @@ void od_canvas_write(OdCanvas *canvas,
             index += length;
             continue;
         }
-        int destination_x = x + (int)column;
+        if (source_column + width <= first_column) {
+            source_column += width;
+            index += length;
+            continue;
+        }
+        if (source_column < first_column) {
+            source_column += width;
+            index += length;
+            continue;
+        }
+        int destination_x = x + (int)destination_column;
         if (destination_x >= (int)canvas->width ||
-            width > maximum_columns - column ||
+            width > maximum_columns - destination_column ||
             (width == 2U && destination_x + 1 >= (int)canvas->width)) break;
         if (destination_x >= 0) {
             char glyph[OD_CELL_BYTES] = {0};
@@ -199,8 +212,20 @@ void od_canvas_write(OdCanvas *canvas,
             }
         }
         index += length;
-        column += width;
+        source_column += width;
+        destination_column += width;
     }
+}
+
+void od_canvas_write(OdCanvas *canvas,
+                     int x,
+                     int y,
+                     const char *text,
+                     size_t maximum_columns,
+                     OdThemeRole role,
+                     unsigned attributes) {
+    od_canvas_write_slice(canvas, x, y, text, 0U, maximum_columns,
+                          role, attributes);
 }
 
 void od_canvas_write_centered(OdCanvas *canvas,
@@ -209,7 +234,7 @@ void od_canvas_write_centered(OdCanvas *canvas,
                               OdThemeRole role,
                               unsigned attributes) {
     if (canvas == NULL || text == NULL) return;
-    size_t columns = text_columns(text);
+    size_t columns = od_text_columns(text);
     int x = columns >= canvas->width ? 0 : (int)((canvas->width - columns) / 2U);
     od_canvas_write(canvas, x, y, text, canvas->width, role, attributes);
 }

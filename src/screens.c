@@ -5,11 +5,13 @@
 #include <string.h>
 
 static const char *const banner[] = {
-    "   ____  ____  _______   __   ____  ____  ____  ____",
-    "  / __ \\/ __ \\/ ____/ | / /  / __ \\/ __ \\/ __ \\/ __ \\",
-    " / / / / /_/ / __/ /  |/ /  / / / / / / / / / / /_/ /",
-    "/ /_/ / ____/ /___/ /|  /  / /_/ / /_/ / /_/ / _, _/",
-    "\\____/_/   /_____/_/ |_/   \\____/_____/\\____/_/ |_|  OPEN DOOR"
+    "   ▄▄▄▄    ▄▄▄▄▄▄    ▄▄▄▄▄▄▄▄  ▄▄▄   ▄▄  ▄▄▄▄▄       ▄▄▄▄      ▄▄▄▄    ▄▄▄▄▄▄",
+    "  ██▀▀██   ██▀▀▀▀█▄  ██▀▀▀▀▀▀  ███   ██  ██▀▀▀██    ██▀▀██    ██▀▀██   ██▀▀▀▀██",
+    " ██    ██  ██    ██  ██        ██▀█  ██  ██    ██  ██    ██  ██    ██  ██    ██",
+    " ██    ██  ██████▀   ███████   ██ ██ ██  ██    ██  ██    ██  ██    ██  ███████",
+    " ██    ██  ██        ██        ██  █▄██  ██    ██  ██    ██  ██    ██  ██  ▀██▄",
+    "  ██▄▄██   ██        ██▄▄▄▄▄▄  ██   ███  ██▄▄▄██    ██▄▄██    ██▄▄██   ██    ██",
+    "   ▀▀▀▀    ▀▀        ▀▀▀▀▀▀▀▀  ▀▀   ▀▀▀  ▀▀▀▀▀       ▀▀▀▀      ▀▀▀▀    ▀▀    ▀▀▀"
 };
 
 const char *const *od_banner_lines(void) {
@@ -87,13 +89,108 @@ void od_render_loading(OdCanvas *canvas,
                              "Esc Skip animation", OD_ROLE_MUTED, 0U);
 }
 
-size_t od_menu_page_size(size_t viewport_height, size_t item_count) {
-    size_t available = viewport_height > 14U ? viewport_height - 14U : 1U;
-    return available < item_count ? available : item_count;
+static size_t menu_banner_height(size_t viewport_width,
+                                 size_t viewport_height,
+                                 bool ascii) {
+    return !ascii && viewport_width >= 84U && viewport_height >= 26U ?
+        od_banner_line_count() : 1U;
+}
+
+static int menu_row_stride(size_t viewport_height) {
+    return viewport_height >= 36U ? 2 : 1;
+}
+
+size_t od_menu_page_size(size_t viewport_width,
+                         size_t viewport_height,
+                         size_t item_count,
+                         bool ascii) {
+    size_t content_height = viewport_height > 3U ? viewport_height - 3U : 1U;
+    size_t overhead = menu_banner_height(viewport_width, viewport_height, ascii) + 4U;
+    size_t panel_height = content_height > overhead ? content_height - overhead : 5U;
+    size_t usable_rows = panel_height > 4U ? panel_height - 4U : 1U;
+    size_t visible = usable_rows / (size_t)menu_row_stride(viewport_height);
+    if (visible == 0U) visible = 1U;
+    return visible < item_count ? visible : item_count;
 }
 
 size_t od_menu_page_start(size_t selected, size_t page_size) {
     return page_size == 0U ? 0U : selected / page_size * page_size;
+}
+
+void od_main_menu_layout(size_t viewport_width,
+                         size_t viewport_height,
+                         size_t item_count,
+                         size_t selected,
+                         bool ascii,
+                         OdMenuLayout *layout) {
+    if (layout == NULL) return;
+    size_t visible = od_menu_page_size(viewport_width, viewport_height,
+                                       item_count, ascii);
+    int stride = menu_row_stride(viewport_height);
+    size_t logo_height = menu_banner_height(viewport_width, viewport_height, ascii);
+    int box_height = (int)visible * stride + 4;
+    int content_height = viewport_height > 3U ? (int)viewport_height - 3 : 1;
+    int composition_height = (int)logo_height + 4 + box_height;
+    int composition_y = content_height > composition_height ?
+        (content_height - composition_height) / 2 : 0;
+    int box_width = (int)((viewport_width * 2U) / 5U);
+    if (box_width < 52) box_width = 52;
+    if (box_width > 84) box_width = 84;
+    if ((size_t)box_width > viewport_width - 4U) box_width = (int)viewport_width - 4;
+    *layout = (OdMenuLayout){
+        .box_x = ((int)viewport_width - box_width) / 2,
+        .box_y = composition_y + (int)logo_height + 4,
+        .box_width = box_width,
+        .box_height = box_height,
+        .first_item_y = composition_y + (int)logo_height + 6,
+        .row_stride = stride,
+        .visible_count = visible,
+        .page_start = od_menu_page_start(selected, visible)
+    };
+}
+
+typedef struct {
+    const char *key;
+    const char *label;
+} OdGuideItem;
+
+static void draw_guide(OdCanvas *canvas,
+                       int y,
+                       const OdGuideItem *items,
+                       size_t count) {
+    int x = 1;
+    for (size_t index = 0U; index < count; ++index) {
+        size_t key_width = strlen(items[index].key);
+        size_t label_width = strlen(items[index].label);
+        if (x >= (int)canvas->width - 1) break;
+        od_canvas_write(canvas, x, y, items[index].key, key_width,
+                        OD_ROLE_PRIMARY, 1U);
+        x += (int)key_width;
+        if (x < (int)canvas->width - 1) {
+            od_canvas_write(canvas, x, y, " ", 1U, OD_ROLE_MUTED, 0U);
+            ++x;
+        }
+        od_canvas_write(canvas, x, y, items[index].label, label_width,
+                        OD_ROLE_MUTED, 0U);
+        x += (int)label_width + 3;
+    }
+}
+
+static int centered_text_x(int left, int width, const char *text) {
+    int text_width = (int)strlen(text);
+    return left + (text_width < width ? (width - text_width) / 2 : 0);
+}
+
+static void write_centered_in(OdCanvas *canvas,
+                              int left,
+                              int width,
+                              int y,
+                              const char *text,
+                              OdThemeRole role,
+                              unsigned attributes) {
+    int x = centered_text_x(left, width, text);
+    od_canvas_write(canvas, x, y, text,
+                    width > 0 ? (size_t)width : 0U, role, attributes);
 }
 
 void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii) {
@@ -118,53 +215,354 @@ void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii) {
         od_render_resize_required(canvas);
         return;
     }
-    for (size_t index = 0U; index < od_banner_line_count(); ++index) {
-        od_canvas_write_centered(canvas, 1 + (int)index, banner[index],
-                                 OD_ROLE_PRIMARY, 1U);
-    }
-    char project[256];
-    (void)snprintf(project, sizeof(project), "Project: %s  •  %s",
-                   view->project_name == NULL ? "current directory" : view->project_name,
-                   view->configured ? "profile configured" : "new project");
-    od_canvas_write_centered(canvas, 7, project, OD_ROLE_MUTED, 0U);
-
     const char *const *items = view->configured ? configured : first_run;
     size_t item_count = view->configured ? sizeof(configured) / sizeof(configured[0]) :
                                           sizeof(first_run) / sizeof(first_run[0]);
-    int box_width = 50;
-    if ((size_t)box_width > canvas->width - 4U) box_width = (int)canvas->width - 4;
-    size_t visible_count = od_menu_page_size(canvas->height, item_count);
-    size_t page_start = od_menu_page_start(view->selected_item, visible_count);
-    size_t page_end = page_start + visible_count;
+    OdMenuLayout layout;
+    od_main_menu_layout(canvas->width, canvas->height, item_count,
+                        view->selected_item, ascii, &layout);
+    int logo_height = (int)menu_banner_height(canvas->width, canvas->height, ascii);
+    int composition_y = layout.box_y - logo_height - 4;
+    if (logo_height == 1) {
+        od_canvas_write_centered(canvas, composition_y, "OPEN DOOR",
+                                 OD_ROLE_PRIMARY, 1U);
+    } else {
+        const size_t banner_width = 80U;
+        int logo_x = banner_width >= canvas->width ? 0 :
+                     (int)((canvas->width - banner_width) / 2U);
+        for (size_t index = 0U; index < od_banner_line_count(); ++index) {
+            od_canvas_write(canvas, logo_x, composition_y + (int)index,
+                            banner[index], canvas->width - (size_t)logo_x,
+                            OD_ROLE_PRIMARY, 1U);
+        }
+    }
+    char project[512];
+    (void)snprintf(project, sizeof(project), "Project  %s",
+                   view->project_name == NULL ? "." : view->project_name);
+    od_canvas_write_centered(canvas, composition_y + logo_height + 1,
+                             project, OD_ROLE_DEFAULT, 1U);
+    od_canvas_write_centered(canvas, composition_y + logo_height + 2,
+                             view->configured ? "Profile: configured" :
+                                                "Profile: not configured",
+                             view->configured ? OD_ROLE_SUCCESS : OD_ROLE_WARNING, 0U);
+
+    size_t page_end = layout.page_start + layout.visible_count;
     if (page_end > item_count) page_end = item_count;
-    int box_height = (int)visible_count + 4;
-    int box_x = ((int)canvas->width - box_width) / 2;
-    int box_y = 8;
-    od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
+    od_canvas_box(canvas, layout.box_x, layout.box_y,
+                  layout.box_width, layout.box_height, ascii,
                   OD_ROLE_FOCUSED_BORDER);
-    for (size_t index = page_start; index < page_end; ++index) {
+    for (size_t index = layout.page_start; index < page_end; ++index) {
         char line[96];
         bool selected = index == view->selected_item;
         (void)snprintf(line, sizeof(line), "%s %s", selected ? ">" : " ", items[index]);
-        od_canvas_write(canvas, box_x + 2,
-                        box_y + 2 + (int)(index - page_start), line,
-                        (size_t)(box_width - 4),
+        od_canvas_write(canvas, layout.box_x + 3,
+                        layout.first_item_y +
+                            (int)(index - layout.page_start) * layout.row_stride,
+                        line, (size_t)(layout.box_width - 6),
                         selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
                         selected ? 1U : 0U);
     }
     char page[64];
-    size_t page_count = (item_count + visible_count - 1U) / visible_count;
+    size_t page_count = (item_count + layout.visible_count - 1U) /
+                        layout.visible_count;
     (void)snprintf(page, sizeof(page), "Menu page %zu/%zu",
-                   page_start / visible_count + 1U, page_count);
-    od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page,
-                    (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
+                   layout.page_start / layout.visible_count + 1U, page_count);
+    od_canvas_write(canvas, layout.box_x + 3,
+                    layout.box_y + layout.box_height - 2, page,
+                    (size_t)(layout.box_width - 6), OD_ROLE_MUTED, 0U);
     if (view->status != NULL) {
         od_canvas_write(canvas, 1, (int)canvas->height - 2, view->status,
                         canvas->width - 2U, OD_ROLE_MUTED, 0U);
     }
-    od_canvas_write(canvas, 1, (int)canvas->height - 1,
-                    "Up/Down Navigate  Enter Select  ? Help  q Quit",
-                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+    static const OdGuideItem guide[] = {
+        {"Up/Down", "Navigate"}, {"Enter", "Select"},
+        {"?", "Help"}, {"q", "Quit"}
+    };
+    draw_guide(canvas, (int)canvas->height - 1, guide,
+               sizeof(guide) / sizeof(guide[0]));
+}
+
+typedef enum {
+    OD_TABLE_USE,
+    OD_TABLE_REVIEW,
+    OD_TABLE_CONFIDENCE,
+    OD_TABLE_NAME,
+    OD_TABLE_SOURCE,
+    OD_TABLE_VARIABLE,
+    OD_TABLE_PORT,
+    OD_TABLE_GROUP,
+    OD_TABLE_FIELD_COUNT
+} OdTableField;
+
+typedef struct {
+    OdTableField fields[OD_TABLE_FIELD_COUNT];
+    size_t widths[OD_TABLE_FIELD_COUNT];
+    size_t count;
+    size_t total_width;
+} OdOnboardingTableLayout;
+
+static const char *table_header(OdTableField field, bool abbreviated) {
+    static const char *const headers[] = {
+        "USE", "REVIEW", "CONFIDENCE", "NAME",
+        "SOURCE", "VARIABLE", "PORT", "GROUP"
+    };
+    if (abbreviated && field == OD_TABLE_REVIEW) return "REV";
+    return headers[field];
+}
+
+static const char *candidate_confidence(const OdCandidate *candidate) {
+    if (candidate->confidence == OD_CONFIDENCE_CONFIRMED) return "Confirmed";
+    if (candidate->confidence == OD_CONFIDENCE_LIKELY) return "Likely";
+    return "Possible";
+}
+
+static const char *candidate_field(const OdCandidate *candidate,
+                                   bool reviewed,
+                                   OdTableField field,
+                                   char *number,
+                                   size_t number_capacity) {
+    switch (field) {
+        case OD_TABLE_USE: return candidate->selected ? "[x]" : "[ ]";
+        case OD_TABLE_REVIEW: return reviewed ? "yes" : "-";
+        case OD_TABLE_CONFIDENCE: return candidate_confidence(candidate);
+        case OD_TABLE_NAME: return candidate->name;
+        case OD_TABLE_SOURCE:
+            return candidate->sources.count == 0U ? "unknown" :
+                   candidate->sources.items[0];
+        case OD_TABLE_VARIABLE: return candidate->variable;
+        case OD_TABLE_PORT:
+            (void)snprintf(number, number_capacity, "%u", (unsigned)candidate->port);
+            return number;
+        case OD_TABLE_GROUP: return candidate->group;
+        case OD_TABLE_FIELD_COUNT: return "";
+    }
+    return "";
+}
+
+static bool table_field_flexible(OdTableField field) {
+    return field == OD_TABLE_NAME || field == OD_TABLE_SOURCE ||
+           field == OD_TABLE_VARIABLE || field == OD_TABLE_GROUP;
+}
+
+static size_t table_field_minimum(OdTableField field, int mode) {
+    switch (field) {
+        case OD_TABLE_USE: return 3U;
+        case OD_TABLE_REVIEW: return mode == 2 ? 6U : 3U;
+        case OD_TABLE_CONFIDENCE: return 10U;
+        case OD_TABLE_NAME: return mode == 2 ? 10U : 12U;
+        case OD_TABLE_SOURCE: return 12U;
+        case OD_TABLE_VARIABLE: return mode == 0 ? 15U : 18U;
+        case OD_TABLE_PORT: return 5U;
+        case OD_TABLE_GROUP: return 8U;
+        case OD_TABLE_FIELD_COUNT: return 1U;
+    }
+    return 1U;
+}
+
+static void onboarding_table_layout(const OdOnboarding *onboarding,
+                                    size_t viewport_width,
+                                    OdOnboardingTableLayout *layout) {
+    static const OdTableField wide_fields[] = {
+        OD_TABLE_USE, OD_TABLE_REVIEW, OD_TABLE_CONFIDENCE, OD_TABLE_NAME,
+        OD_TABLE_SOURCE, OD_TABLE_VARIABLE, OD_TABLE_PORT, OD_TABLE_GROUP
+    };
+    static const OdTableField medium_fields[] = {
+        OD_TABLE_USE, OD_TABLE_REVIEW, OD_TABLE_CONFIDENCE,
+        OD_TABLE_NAME, OD_TABLE_VARIABLE, OD_TABLE_PORT
+    };
+    static const OdTableField compact_fields[] = {
+        OD_TABLE_USE, OD_TABLE_REVIEW, OD_TABLE_NAME,
+        OD_TABLE_VARIABLE, OD_TABLE_PORT
+    };
+    int box_width = viewport_width > 2U ? (int)viewport_width - 2 : 1;
+    int mode = box_width >= 110 ? 2 : (box_width >= 76 ? 1 : 0);
+    const OdTableField *fields = mode == 2 ? wide_fields :
+                                 (mode == 1 ? medium_fields : compact_fields);
+    size_t count = mode == 2 ? sizeof(wide_fields) / sizeof(wide_fields[0]) :
+                   (mode == 1 ? sizeof(medium_fields) / sizeof(medium_fields[0]) :
+                                sizeof(compact_fields) / sizeof(compact_fields[0]));
+    size_t table_width = box_width > 4 ? (size_t)(box_width - 4) : 1U;
+    size_t separator_width = count > 0U ? (count - 1U) * 3U : 0U;
+    size_t used = separator_width;
+    size_t demand[OD_TABLE_FIELD_COUNT] = {0U};
+    *layout = (OdOnboardingTableLayout){0};
+    layout->count = count;
+    layout->total_width = table_width;
+    for (size_t column = 0U; column < count; ++column) {
+        OdTableField field = fields[column];
+        layout->fields[column] = field;
+        layout->widths[column] = table_field_minimum(field, mode);
+        demand[column] = od_text_columns(table_header(field, mode != 2));
+        if (demand[column] < layout->widths[column]) demand[column] = layout->widths[column];
+        used += layout->widths[column];
+    }
+    if (onboarding != NULL) {
+        for (size_t index = 0U; index < onboarding->candidates.count; ++index) {
+            const OdCandidate *candidate = &onboarding->candidates.items[index];
+            for (size_t column = 0U; column < count; ++column) {
+                char number[16];
+                const char *value = candidate_field(candidate,
+                    onboarding->reviewed != NULL && onboarding->reviewed[index],
+                    layout->fields[column], number, sizeof(number));
+                size_t columns = od_text_columns(value);
+                if (columns > demand[column]) demand[column] = columns;
+            }
+        }
+    }
+    if (used > table_width) {
+        size_t excess = used - table_width;
+        while (excess > 0U) {
+            bool changed = false;
+            for (size_t column = count; column > 0U && excess > 0U; --column) {
+                size_t at = column - 1U;
+                if (table_field_flexible(layout->fields[at]) &&
+                    layout->widths[at] > 4U) {
+                    --layout->widths[at];
+                    --excess;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+        return;
+    }
+    size_t extra = table_width - used;
+    while (extra > 0U) {
+        size_t best = SIZE_MAX;
+        size_t largest_deficit = 0U;
+        for (size_t column = 0U; column < count; ++column) {
+            if (!table_field_flexible(layout->fields[column])) continue;
+            size_t deficit = demand[column] > layout->widths[column] ?
+                demand[column] - layout->widths[column] : 0U;
+            if (best == SIZE_MAX || deficit > largest_deficit) {
+                best = column;
+                largest_deficit = deficit;
+            }
+        }
+        if (best == SIZE_MAX) break;
+        if (largest_deficit == 0U) {
+            for (size_t column = 0U; column < count && extra > 0U; ++column) {
+                if (table_field_flexible(layout->fields[column])) {
+                    ++layout->widths[column];
+                    --extra;
+                }
+            }
+        } else {
+            ++layout->widths[best];
+            --extra;
+        }
+    }
+}
+
+static size_t wrapped_line_count(const char *text, size_t width) {
+    size_t columns = od_text_columns(text);
+    if (width == 0U || columns == 0U) return 1U;
+    return (columns + width - 1U) / width;
+}
+
+static size_t candidate_row_height(const OdOnboarding *onboarding,
+                                   size_t index,
+                                   const OdOnboardingTableLayout *layout) {
+    size_t height = 1U;
+    if (onboarding == NULL || index >= onboarding->candidates.count) return height;
+    const OdCandidate *candidate = &onboarding->candidates.items[index];
+    for (size_t column = 0U; column < layout->count; ++column) {
+        char number[16];
+        const char *value = candidate_field(candidate,
+            onboarding->reviewed != NULL && onboarding->reviewed[index],
+            layout->fields[column], number, sizeof(number));
+        size_t lines = wrapped_line_count(value, layout->widths[column]);
+        if (lines > height) height = lines;
+    }
+    return height;
+}
+
+static size_t onboarding_row_height(const OdOnboarding *onboarding,
+                                    const OdOnboardingTableLayout *layout) {
+    size_t height = 1U;
+    if (onboarding == NULL) return height;
+    for (size_t index = 0U; index < onboarding->candidates.count; ++index) {
+        size_t candidate_height = candidate_row_height(onboarding, index, layout);
+        if (candidate_height > height) height = candidate_height;
+    }
+    return height;
+}
+
+static size_t onboarding_data_lines(size_t viewport_height) {
+    return viewport_height > 13U ? viewport_height - 13U : 1U;
+}
+
+size_t od_onboarding_row_height_for_viewport(const OdOnboarding *onboarding,
+                                              size_t viewport_width,
+                                              size_t viewport_height) {
+    OdOnboardingTableLayout layout;
+    onboarding_table_layout(onboarding, viewport_width, &layout);
+    size_t height = onboarding_row_height(onboarding, &layout);
+    size_t available = onboarding_data_lines(viewport_height);
+    return height > available ? available : height;
+}
+
+size_t od_onboarding_page_size_for_viewport(const OdOnboarding *onboarding,
+                                             size_t viewport_width,
+                                             size_t viewport_height) {
+    size_t row_height = od_onboarding_row_height_for_viewport(
+        onboarding, viewport_width, viewport_height);
+    size_t available = onboarding_data_lines(viewport_height);
+    size_t rows = (available + 1U) / (row_height + 1U);
+    return rows == 0U ? 1U : rows;
+}
+
+static void draw_inner_rule(OdCanvas *canvas,
+                            int x,
+                            int y,
+                            int width,
+                            bool ascii,
+                            OdThemeRole role) {
+    const char *glyph = ascii ? "-" : "─";
+    for (int column = 1; column < width - 1; ++column) {
+        od_canvas_put(canvas, x + column, y, glyph, role, 0U);
+    }
+}
+
+static void fill_table_line(OdCanvas *canvas,
+                            int x,
+                            int y,
+                            size_t width,
+                            OdThemeRole role,
+                            unsigned attributes) {
+    for (size_t column = 0U; column < width; ++column) {
+        od_canvas_put(canvas, x + (int)column, y, " ", role, attributes);
+    }
+}
+
+static void draw_table_line(OdCanvas *canvas,
+                            const OdOnboardingTableLayout *layout,
+                            const OdCandidate *candidate,
+                            bool reviewed,
+                            bool header,
+                            bool abbreviated,
+                            size_t wrapped_line,
+                            int x,
+                            int y,
+                            const char *divider,
+                            OdThemeRole role,
+                            unsigned attributes) {
+    fill_table_line(canvas, x, y, layout->total_width, role, attributes);
+    int column_x = x;
+    for (size_t column = 0U; column < layout->count; ++column) {
+        OdTableField field = layout->fields[column];
+        char number[16];
+        const char *value = header ? table_header(field, abbreviated) :
+            candidate_field(candidate, reviewed, field, number, sizeof(number));
+        od_canvas_write_slice(canvas, column_x, y, value,
+                              wrapped_line * layout->widths[column],
+                              layout->widths[column], role, attributes);
+        column_x += (int)layout->widths[column];
+        if (column + 1U < layout->count) {
+            od_canvas_put(canvas, column_x + 1, y, divider, role, attributes);
+            column_x += 3;
+        }
+    }
 }
 
 void od_render_onboarding(OdCanvas *canvas,
@@ -196,61 +594,75 @@ void od_render_onboarding(OdCanvas *canvas,
     int box_height = (int)canvas->height - 8;
     od_canvas_box(canvas, box_x, box_y, box_width, box_height, ascii,
                   OD_ROLE_FOCUSED_BORDER);
-    const bool wide_table = box_width >= 110;
-    od_canvas_write(canvas, box_x + 2, box_y + 1,
-                    wide_table ?
-                        "USE REVIEW CONFIDENCE NAME             SOURCE               VARIABLE              PORT GROUP" :
-                        "USE REVIEW CONFIDENCE   NAME                 VARIABLE                 PORT",
-                    (size_t)(box_width - 4), OD_ROLE_MUTED, 1U);
+    const char *divider = ascii ? "|" : "│";
+    OdOnboardingTableLayout table;
+    onboarding_table_layout(onboarding, canvas->width, &table);
+    draw_table_line(canvas, &table, NULL, false, true,
+                    box_width < 110, 0U, box_x + 2, box_y + 1,
+                    divider, OD_ROLE_MUTED, 1U);
+    draw_inner_rule(canvas, box_x, box_y + 2, box_width, ascii,
+                    OD_ROLE_INACTIVE_BORDER);
 
     size_t start = od_onboarding_page_start(onboarding);
-    size_t end = start + onboarding->page_size;
+    size_t row_height = od_onboarding_row_height_for_viewport(
+        onboarding, canvas->width, canvas->height);
+    size_t capacity = od_onboarding_page_size_for_viewport(
+        onboarding, canvas->width, canvas->height);
+    if (capacity > onboarding->page_size) capacity = onboarding->page_size;
+    size_t end = start + capacity;
     if (end > onboarding->candidates.count) end = onboarding->candidates.count;
+    bool page_has_clipped_row = false;
     for (size_t index = start; index < end; ++index) {
         const OdCandidate *candidate = &onboarding->candidates.items[index];
-        const char *confidence = candidate->confidence == OD_CONFIDENCE_CONFIRMED ? "Confirmed" :
-                                 (candidate->confidence == OD_CONFIDENCE_LIKELY ? "Likely" : "Possible");
-        const char *use = candidate->selected ? (ascii ? "[x]" : "[✓]") : "[ ]";
-        const char *review = onboarding->reviewed[index] ? (ascii ? "yes" : "✓") : "—";
-        const char *source = candidate->sources.count == 0U ? "unknown" :
-                             candidate->sources.items[0];
-        char row[320];
-        if (wide_table) {
-            (void)snprintf(row, sizeof(row),
-                           "%-3s %-6s %-10s %-16.16s %-20.20s %-20.20s %5u %-12.12s",
-                           use, review, confidence, candidate->name, source,
-                           candidate->variable, (unsigned)candidate->port,
-                           candidate->group);
-        } else {
-            (void)snprintf(row, sizeof(row),
-                           "%-3s %-6s %-12s %-20.20s %-24.24s %5u",
-                           use, review, confidence, candidate->name,
-                           candidate->variable, (unsigned)candidate->port);
+        if (candidate_row_height(onboarding, index, &table) > row_height) {
+            page_has_clipped_row = true;
         }
-        int row_y = box_y + 2 + (int)(index - start);
+        int row_y = box_y + 3 +
+                    (int)(index - start) * (int)(row_height + 1U);
         bool selected = index == onboarding->selected;
-        od_canvas_write(canvas, box_x + 2, row_y, row, (size_t)(box_width - 4),
-                        selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
-                        selected ? 1U : 0U);
+        for (size_t line = 0U; line < row_height; ++line) {
+            draw_table_line(canvas, &table, candidate, onboarding->reviewed[index],
+                            false, false, line, box_x + 2, row_y + (int)line,
+                            divider,
+                            selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
+                            selected ? 1U : 0U);
+        }
+        if (index + 1U < end) {
+            draw_inner_rule(canvas, box_x, row_y + (int)row_height,
+                            box_width, ascii,
+                            OD_ROLE_INACTIVE_BORDER);
+        }
     }
     if (onboarding->candidates.count == 0U) {
-        od_canvas_write_centered(canvas, box_y + box_height / 2,
-                                 "No candidates found • press a to add a service",
-                                 OD_ROLE_MUTED, 0U);
+        write_centered_in(canvas, box_x + 1, box_width - 2,
+                          box_y + box_height / 2,
+                          "No candidates found - press a to add a service",
+                          OD_ROLE_MUTED, 0U);
     }
     char page[80];
-    (void)snprintf(page, sizeof(page), "Page %zu/%zu",
-                   od_onboarding_page(onboarding) + 1U,
-                   od_onboarding_page_count(onboarding));
+    if (page_has_clipped_row) {
+        (void)snprintf(page, sizeof(page),
+                       "Page %zu/%zu  Long row continues in d Details",
+                       od_onboarding_page(onboarding) + 1U,
+                       od_onboarding_page_count(onboarding));
+    } else {
+        (void)snprintf(page, sizeof(page), "Page %zu/%zu",
+                       od_onboarding_page(onboarding) + 1U,
+                       od_onboarding_page_count(onboarding));
+    }
     od_canvas_write(canvas, box_x + 2, box_y + box_height - 2, page,
                     (size_t)(box_width - 4), OD_ROLE_MUTED, 0U);
     if (status != NULL) {
         od_canvas_write(canvas, 2, (int)canvas->height - 3, status,
                         canvas->width - 4U, OD_ROLE_WARNING, 0U);
     }
-    od_canvas_write(canvas, 1, (int)canvas->height - 1,
-                    "Up/Down Select  PgUp/PgDn Page  Space Use  Enter Review  d Details  e Edit  a Add  s Continue  Esc Back",
-                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+    static const OdGuideItem guide[] = {
+        {"Up/Down", "Select"}, {"PgUp/PgDn", "Page"}, {"Space", "Use"},
+        {"Enter", "Review"}, {"d", "Details"}, {"e", "Edit"},
+        {"a", "Add"}, {"s", "Continue"}, {"Esc", "Back"}
+    };
+    draw_guide(canvas, (int)canvas->height - 1, guide,
+               sizeof(guide) / sizeof(guide[0]));
 }
 
 static const char *dashboard_sort_name(const OdDashboard *dashboard,
@@ -330,9 +742,12 @@ void od_render_dashboard(OdCanvas *canvas,
         od_canvas_write(canvas, 1, status_y, status, canvas->width - 2U,
                         OD_ROLE_MUTED, 0U);
     }
-    od_canvas_write(canvas, 1, footer_y,
-                    "PgUp/PgDn Page  Up/Down Select  Tab Focus  e Expand  d Details  / Search  Esc Back",
-                    canvas->width - 2U, OD_ROLE_MUTED, 0U);
+    static const OdGuideItem dashboard_guide[] = {
+        {"PgUp/PgDn", "Page"}, {"Up/Down", "Select"}, {"Tab", "Focus"},
+        {"e", "Expand"}, {"d", "Details"}, {"/", "Search"}, {"Esc", "Back"}
+    };
+    draw_guide(canvas, footer_y, dashboard_guide,
+               sizeof(dashboard_guide) / sizeof(dashboard_guide[0]));
 
     static const char *const widget_names[] = {
         "Services", "Conflicts", "Host listeners", "Docker mappings"
@@ -462,10 +877,20 @@ void od_render_dashboard(OdCanvas *canvas,
                     OD_WIDGET_SERVICES, visible__);                                \
         }                                                                          \
         if (dashboard->visible_count == 0U) {                                      \
-            od_canvas_write_centered(canvas, (Y) + (H) / 2,                       \
-                dashboard->search[0] == '\0' ? "No managed services" :            \
-                                                "No services match this search",   \
-                OD_ROLE_MUTED, 0U);                                                \
+            const char *empty__ = dashboard->search[0] != '\0' ?                  \
+                "No services match this search" :                                 \
+                (dashboard->profile_saved ? "No services are configured" :        \
+                                            "Listener explorer only");             \
+            write_centered_in(canvas, (X) + 1, (W) - 2, (Y) + (H) / 2,            \
+                              empty__, OD_ROLE_MUTED, 0U);                         \
+            if (dashboard->search[0] == '\0') {                                   \
+                const char *next__ = dashboard->profile_saved ?                   \
+                    "Edit the project profile to add one" :                       \
+                    "Run Discover this project to manage services";               \
+                write_centered_in(canvas, (X) + 1, (W) - 2,                       \
+                                  (Y) + (H) / 2 + 1, next__,                       \
+                                  OD_ROLE_PRIMARY, 0U);                            \
+            }                                                                     \
         }                                                                          \
         char page__[192];                                                          \
         size_t page_number__ = dashboard->visible_count == 0U ? 0U :               \
@@ -521,9 +946,8 @@ void od_render_dashboard(OdCanvas *canvas,
             ++conflict_ordinal__;                                                  \
         }                                                                          \
         if (total__ == 0U)                                                         \
-            od_canvas_write(canvas, (X) + 2, (Y) + 2, "No conflicts detected",    \
-                            (size_t)((W) > 4 ? (W) - 4 : 0),                       \
-                            OD_ROLE_SUCCESS, 0U);                                  \
+            write_centered_in(canvas, (X) + 1, (W) - 2, (Y) + (H) / 2,            \
+                              "No conflicts detected", OD_ROLE_SUCCESS, 0U);       \
         char page__[64];                                                           \
         (void)snprintf(page__, sizeof(page__), "Page %zu/%zu  %zu conflict(s)",   \
             total__ == 0U ? 0U : dashboard->conflict_page_start / rows__ + 1U,    \
@@ -600,10 +1024,11 @@ void od_render_dashboard(OdCanvas *canvas,
                     OD_WIDGET_LISTENERS, start__ + offset__);                      \
         }                                                                          \
         if (dashboard->listener_visible_count == 0U)                               \
-            od_canvas_write(canvas, (X) + 2, (Y) + 3,                              \
-                            dashboard->listener_search[0] == '\0' ?                \
-                                "No host listeners found" : "No listeners match",\
-                            (size_t)((W) > 4 ? (W) - 4 : 0), OD_ROLE_MUTED, 0U);   \
+            write_centered_in(canvas, (X) + 1, (W) - 2, (Y) + (H) / 2,            \
+                              dashboard->listener_search[0] == '\0' ?              \
+                                  "No host listeners found" :                     \
+                                  "No listeners match this search",               \
+                              OD_ROLE_MUTED, 0U);                                  \
         char page__[64];                                                           \
         size_t total__ = dashboard->listener_visible_count;                        \
         (void)snprintf(page__, sizeof(page__), "Page %zu/%zu  %zu listener(s)",   \
@@ -677,12 +1102,13 @@ void od_render_dashboard(OdCanvas *canvas,
                     OD_WIDGET_DOCKER, start__ + offset__);                         \
         }                                                                          \
         if (dashboard->docker_visible_count == 0U)                                 \
-            od_canvas_write(canvas, (X) + 2, (Y) + 3,                              \
-                            dashboard->docker_search[0] != '\0' ?                  \
-                                "No Docker mappings match" :                      \
-                                (dashboard->snapshot->docker_available ?           \
-                                    "No published Docker ports" : "Docker unavailable"),\
-                            (size_t)((W) > 4 ? (W) - 4 : 0), OD_ROLE_MUTED, 0U);   \
+            write_centered_in(canvas, (X) + 1, (W) - 2, (Y) + (H) / 2,            \
+                              dashboard->docker_search[0] != '\0' ?                \
+                                  "No Docker mappings match" :                    \
+                                  (dashboard->snapshot->docker_available ?         \
+                                      "No published Docker ports" :               \
+                                      "Docker unavailable"),                      \
+                              OD_ROLE_MUTED, 0U);                                  \
         char page__[64];                                                           \
         size_t total__ = dashboard->docker_visible_count;                          \
         (void)snprintf(page__, sizeof(page__), "Page %zu/%zu  %zu mapping(s)",    \

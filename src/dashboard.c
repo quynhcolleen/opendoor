@@ -788,6 +788,27 @@ void od_dashboard_move_focused(OdDashboard *dashboard, int rows) {
     ensure_widget_page(dashboard, dashboard->focused);
 }
 
+static size_t focused_selection(const OdDashboard *dashboard) {
+    switch (dashboard->focused) {
+        case OD_WIDGET_SERVICES: return dashboard->selected_visible;
+        case OD_WIDGET_CONFLICTS: return dashboard->conflict_selected;
+        case OD_WIDGET_LISTENERS: return dashboard->listener_selected;
+        case OD_WIDGET_DOCKER: return dashboard->docker_selected;
+        case OD_WIDGET_COUNT: return 0U;
+    }
+    return 0U;
+}
+
+void od_dashboard_navigate_focused(OdDashboard *dashboard, int rows) {
+    if (dashboard == NULL || rows == 0) return;
+    size_t count = widget_row_count(dashboard, dashboard->focused);
+    size_t before = focused_selection(dashboard);
+    od_dashboard_move_focused(dashboard, rows);
+    if (count == 0U || focused_selection(dashboard) == before) {
+        od_dashboard_focus_next(dashboard, rows < 0 ? -1 : 1);
+    }
+}
+
 void od_dashboard_move_focused_page(OdDashboard *dashboard, int pages) {
     if (dashboard == NULL) return;
     size_t page_size = dashboard->page_size;

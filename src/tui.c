@@ -259,13 +259,54 @@ static bool profile_exists(const OpendoorOptions *options) {
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
-static const char *project_label(const OpendoorOptions *options) {
-    if (options->project_path != NULL) return options->project_path;
-    return "current directory";
+static char *project_absolute_path(const char *project_root) {
+    if (project_root[0] == '/') return strdup(project_root);
+
+    char *current = getcwd(NULL, 0U);
+    if (current == NULL) return NULL;
+    if (strcmp(project_root, ".") == 0) return current;
+    size_t current_length = strlen(current);
+    size_t root_length = strlen(project_root);
+    if (current_length > SIZE_MAX - root_length - 2U) {
+        free(current);
+        return NULL;
+    }
+    char *path = malloc(current_length + root_length + 2U);
+    if (path == NULL) {
+        free(current);
+        return NULL;
+    }
+    memcpy(path, current, current_length);
+    path[current_length] = '/';
+    memcpy(path + current_length + 1U, project_root, root_length + 1U);
+    free(current);
+    return path;
 }
 
 static size_t menu_item_count(bool configured) {
     return configured ? 7U : 5U;
+}
+
+static int complete_menu_escape_sequence(WINDOW *window, int input) {
+    if (input != 27) return input;
+    wtimeout(window, 200);
+    int prefix = wgetch(window);
+    int result = 27;
+    if (prefix == '[' || prefix == 'O') {
+        int final = wgetch(window);
+        if (final == 'A') result = KEY_UP;
+        else if (final == 'B') result = KEY_DOWN;
+        else if (final == 'C') result = KEY_RIGHT;
+        else if (final == 'D') result = KEY_LEFT;
+        else {
+            if (final != ERR) (void)ungetch(final);
+            (void)ungetch(prefix);
+        }
+    } else if (prefix != ERR) {
+        (void)ungetch(prefix);
+    }
+    wtimeout(window, 80);
+    return result;
 }
 
 static bool canvas_resize(OdCanvas *canvas, int width, int height, OdError *error) {
@@ -765,10 +806,12 @@ static bool run_settings(WINDOW *window,
 }
 
 static void project_display_name(const char *project_root, char *name, size_t capacity) {
-    const char *end = project_root + strlen(project_root);
-    while (end > project_root && end[-1] == '/') --end;
+    char *absolute = project_absolute_path(project_root);
+    const char *root = absolute == NULL ? project_root : absolute;
+    const char *end = root + strlen(root);
+    while (end > root && end[-1] == '/') --end;
     const char *start = end;
-    while (start > project_root && start[-1] != '/') --start;
+    while (start > root && start[-1] != '/') --start;
     size_t length = (size_t)(end - start);
     if (length == 0U) {
         (void)snprintf(name, capacity, "Project");
@@ -777,6 +820,7 @@ static void project_display_name(const char *project_root, char *name, size_t ca
         memcpy(name, start, length);
         name[length] = '\0';
     }
+    free(absolute);
 }
 
 static void run_candidate_detail(WINDOW *window,
@@ -823,23 +867,26 @@ static bool run_onboarding(WINDOW *window,
                            bool ascii,
                            const char *project_root,
                            const OdCandidateList *discovered,
-                           OdProfile *profile) {
+    OdProfile *profile) {
     OdError error;
     int height = getmaxy(window);
-    size_t page_size = height > 14 ? (size_t)(height - 12) : 1U;
+    int width = getmaxx(window);
     OdOnboarding onboarding;
-    if (od_onboarding_init(&onboarding, discovered, page_size,
+    if (od_onboarding_init(&onboarding, discovered, 1U,
                            1024U, 65535U, &error) != OD_OK) {
         return false;
     }
+    onboarding.page_size = od_onboarding_page_size_for_viewport(
+        &onboarding, (size_t)width, (size_t)height);
     char status[256] = "Review every candidate before continuing.";
     bool finished = false;
     bool accepted = false;
     while (!finished) {
-        int width = getmaxx(window);
+        width = getmaxx(window);
         height = getmaxy(window);
         if (!canvas_resize(canvas, width, height, &error)) break;
-        onboarding.page_size = height > 14 ? (size_t)(height - 12) : 1U;
+        onboarding.page_size = od_onboarding_page_size_for_viewport(
+            &onboarding, (size_t)width, (size_t)height);
         od_render_onboarding(canvas, &onboarding, ascii, status);
         paint_canvas(window, canvas, use_color);
         int input = wgetch(window);
@@ -851,9 +898,17 @@ static bool run_onboarding(WINDOW *window,
                 } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
                     input = KEY_DOWN;
                 } else if ((event.bstate & BUTTON1_CLICKED) != 0U &&
-                           event.y >= 6) {
+                           event.y >= 7) {
+                    int relative_row = event.y - 7;
+                    size_t row_height = od_onboarding_row_height_for_viewport(
+                        &onboarding, (size_t)width, (size_t)height);
+                    size_t row_stride = row_height + 1U;
+                    if ((size_t)relative_row % row_stride >= row_height) {
+                        input = ERR;
+                        continue;
+                    }
                     size_t target = od_onboarding_page_start(&onboarding) +
-                                    (size_t)(event.y - 6);
+                                    (size_t)relative_row / row_stride;
                     if (target < onboarding.candidates.count &&
                         target < od_onboarding_page_start(&onboarding) +
                                  onboarding.page_size) {
@@ -1020,9 +1075,9 @@ static void select_mouse_target(OdDashboard *dashboard, const OdHitRegion *hit) 
     if (hit->action == OD_HIT_FOCUS_WIDGET) {
         dashboard->expanded = false;
     } else if (hit->action == OD_HIT_SCROLL_UP) {
-        od_dashboard_move_focused(dashboard, -1);
+        od_dashboard_navigate_focused(dashboard, -1);
     } else if (hit->action == OD_HIT_SCROLL_DOWN) {
-        od_dashboard_move_focused(dashboard, 1);
+        od_dashboard_navigate_focused(dashboard, 1);
     } else if (hit->action == OD_HIT_TOGGLE_EXPAND) {
         od_dashboard_toggle_expand(dashboard);
     } else if (hit->action == OD_HIT_SELECT_ROW) {
@@ -1351,9 +1406,9 @@ static void run_dashboard(WINDOW *window,
         if (input == 27 || input == 'q' || input == 'Q') {
             done = true;
         } else if (input == KEY_UP || input == 'k') {
-            od_dashboard_move_focused(&dashboard, -1);
+            od_dashboard_navigate_focused(&dashboard, -1);
         } else if (input == KEY_DOWN || input == 'j') {
-            od_dashboard_move_focused(&dashboard, 1);
+            od_dashboard_navigate_focused(&dashboard, 1);
         } else if (input == KEY_PPAGE) {
             od_dashboard_move_focused_page(&dashboard, -1);
         } else if (input == KEY_NPAGE) {
@@ -1409,9 +1464,9 @@ static void run_dashboard(WINDOW *window,
             MEVENT event;
             if (getmouse(&event) == OK) {
                 if ((event.bstate & BUTTON4_PRESSED) != 0U) {
-                    od_dashboard_move_focused(&dashboard, -3);
+                    od_dashboard_navigate_focused(&dashboard, -3);
                 } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
-                    od_dashboard_move_focused(&dashboard, 3);
+                    od_dashboard_navigate_focused(&dashboard, 3);
                 } else if ((event.bstate & BUTTON1_CLICKED) != 0U) {
                     const OdHitRegion *hit = od_hitmap_at(&hit_map, event.x, event.y);
                     if (hit != NULL) select_mouse_target(&dashboard, hit);
@@ -2008,6 +2063,7 @@ int od_tui_run(const OpendoorOptions *options) {
     (void)cbreak();
     (void)curs_set(0);
     (void)keypad(window, true);
+    (void)set_escdelay(25);
     (void)mousemask(settings.mouse ? ALL_MOUSE_EVENTS : 0U, NULL);
     wtimeout(window, 80);
     bool use_color = initialize_colors(theme, options->no_color);
@@ -2049,6 +2105,10 @@ int od_tui_run(const OpendoorOptions *options) {
         if (input == 27) animation_skipped = true;
         if (worker_signal_ready(&scan.signal) && elapsed >= 350U) break;
     }
+
+    char *allocated_project_path = project_absolute_path(project_root);
+    const char *project_path = allocated_project_path == NULL ?
+        "[absolute path unavailable]" : allocated_project_path;
 
     bool configured = profile_exists(options);
     char default_profile_path[4096];
@@ -2095,11 +2155,12 @@ int od_tui_run(const OpendoorOptions *options) {
                                "Scan continues in the background • %zu warning(s)",
                                atomic_load(&scan.warning_count));
             }
-            OdMenuView view = {project_label(options), configured, selected, status};
+            OdMenuView view = {project_path, configured, selected, status};
             od_render_main_menu(&canvas, &view, ascii);
         }
         paint_canvas(window, &canvas, use_color);
         int input = wgetch(window);
+        input = complete_menu_escape_sequence(window, input);
         if (input == KEY_MOUSE && settings.mouse) {
             MEVENT event;
             if (getmouse(&event) == OK) {
@@ -2108,18 +2169,21 @@ int od_tui_run(const OpendoorOptions *options) {
                 } else if ((event.bstate & BUTTON5_PRESSED) != 0U) {
                     input = KEY_DOWN;
                 } else if ((event.bstate & BUTTON1_CLICKED) != 0U) {
-                    int menu_width = 50;
-                    if (menu_width > width - 4) menu_width = width - 4;
-                    int menu_x = (width - menu_width) / 2;
                     size_t item_count = menu_item_count(configured);
-                    size_t page_size = od_menu_page_size((size_t)height, item_count);
-                    size_t page_start = od_menu_page_start(selected, page_size);
-                    int first_row = 10;
-                    if (event.x >= menu_x && event.x < menu_x + menu_width &&
-                        event.y >= first_row &&
-                        event.y < first_row + (int)page_size &&
-                        page_start + (size_t)(event.y - first_row) < item_count) {
-                        selected = page_start + (size_t)(event.y - first_row);
+                    OdMenuLayout layout;
+                    od_main_menu_layout((size_t)width, (size_t)height,
+                                        item_count, selected, ascii, &layout);
+                    int relative_row = event.y - layout.first_item_y;
+                    if (event.x >= layout.box_x &&
+                        event.x < layout.box_x + layout.box_width &&
+                        relative_row >= 0 &&
+                        relative_row % layout.row_stride == 0 &&
+                        (size_t)(relative_row / layout.row_stride) <
+                            layout.visible_count &&
+                        layout.page_start +
+                            (size_t)(relative_row / layout.row_stride) < item_count) {
+                        selected = layout.page_start +
+                            (size_t)(relative_row / layout.row_stride);
                         input = '\n';
                     }
                 }
@@ -2131,7 +2195,7 @@ int od_tui_run(const OpendoorOptions *options) {
         } else if (input == '?') {
             run_help(window, &canvas, use_color, ascii);
             menu_status(status, sizeof(status), configured, selected);
-        } else if (input == 'q' || input == 'Q' || input == 27) {
+        } else if (input == 'q' || input == 'Q') {
             quit = true;
         } else if (input == KEY_UP || input == 'k' || input == 'h') {
             selected = selected == 0U ? count - 1U : selected - 1U;
@@ -2140,12 +2204,16 @@ int od_tui_run(const OpendoorOptions *options) {
             selected = (selected + 1U) % count;
             menu_status(status, sizeof(status), configured, selected);
         } else if (input == KEY_PPAGE) {
-            size_t page_size = od_menu_page_size((size_t)height, count);
-            selected = od_page_target(selected, count, page_size, -1);
+            OdMenuLayout layout;
+            od_main_menu_layout((size_t)width, (size_t)height, count,
+                                selected, ascii, &layout);
+            selected = od_page_target(selected, count, layout.visible_count, -1);
             menu_status(status, sizeof(status), configured, selected);
         } else if (input == KEY_NPAGE) {
-            size_t page_size = od_menu_page_size((size_t)height, count);
-            selected = od_page_target(selected, count, page_size, 1);
+            OdMenuLayout layout;
+            od_main_menu_layout((size_t)width, (size_t)height, count,
+                                selected, ascii, &layout);
+            selected = od_page_target(selected, count, layout.visible_count, 1);
             menu_status(status, sizeof(status), configured, selected);
         } else if (input == '\n' || input == '\r') {
             if (selected == count - 1U) {
@@ -2343,6 +2411,7 @@ int od_tui_run(const OpendoorOptions *options) {
     od_scan_snapshot_free(&scan.snapshot);
     od_candidate_list_free(&scan.candidates);
     if (session_profile_ready) od_profile_free(&session_profile);
+    free(allocated_project_path);
     signal_state_restore(&signal_state);
     return 0;
 }
