@@ -27,6 +27,17 @@ typedef struct {
 } OdMenuView;
 
 typedef struct {
+    int box_x;
+    int box_y;
+    int box_width;
+    int box_height;
+    int first_item_y;
+    int row_stride;
+    size_t visible_count;
+    size_t page_start;
+} OdMenuLayout;
+
+typedef struct {
     const OdSettings *settings;
     size_t selected_item;
     const char *settings_path;
@@ -50,8 +61,23 @@ void od_render_loading(OdCanvas *canvas,
                        bool ascii,
                        size_t warning_count);
 void od_render_main_menu(OdCanvas *canvas, const OdMenuView *view, bool ascii);
-size_t od_menu_page_size(size_t viewport_height, size_t item_count);
+void od_main_menu_layout(size_t viewport_width,
+                         size_t viewport_height,
+                         size_t item_count,
+                         size_t selected,
+                         bool ascii,
+                         OdMenuLayout *layout);
+size_t od_menu_page_size(size_t viewport_width,
+                         size_t viewport_height,
+                         size_t item_count,
+                         bool ascii);
 size_t od_menu_page_start(size_t selected, size_t page_size);
+size_t od_onboarding_row_height_for_viewport(const OdOnboarding *onboarding,
+                                              size_t viewport_width,
+                                              size_t viewport_height);
+size_t od_onboarding_page_size_for_viewport(const OdOnboarding *onboarding,
+                                             size_t viewport_width,
+                                             size_t viewport_height);
 void od_render_onboarding(OdCanvas *canvas,
                           const OdOnboarding *onboarding,
                           bool ascii,

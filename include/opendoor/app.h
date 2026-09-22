@@ -9,6 +9,7 @@ typedef struct {
     bool force_ascii;
     bool no_color;
     bool reduced_motion;
+    bool update_requested;
 } OpendoorOptions;
 
 int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options);
@@ -17,4 +18,3 @@ void opendoor_print_help(void);
 void opendoor_print_version(void);
 
 #endif
-

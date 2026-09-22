@@ -176,6 +176,7 @@ void od_dashboard_set_widget_page_size(OdDashboard *dashboard,
                                        OdDashboardWidget widget,
                                        size_t rows);
 void od_dashboard_move_focused(OdDashboard *dashboard, int rows);
+void od_dashboard_navigate_focused(OdDashboard *dashboard, int rows);
 void od_dashboard_move_focused_page(OdDashboard *dashboard, int pages);
 void od_dashboard_home_focused(OdDashboard *dashboard);
 void od_dashboard_end_focused(OdDashboard *dashboard);

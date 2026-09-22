@@ -53,6 +53,7 @@ add_library(opendoor_core
   src/resolution.c
   src/settings_store.c
   src/help.c
+  src/update.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(opendoor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
@@ -105,6 +106,11 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_core.c")
     NAME packaging_contracts
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_packaging.sh
             ${CMAKE_BINARY_DIR}/opendoor ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  add_test(
+    NAME update_contracts
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_update.sh
+            ${CMAKE_BINARY_DIR}/opendoor
   )
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)

@@ -28,8 +28,12 @@ void od_canvas_put(OdCanvas *canvas, int x, int y, const char *glyph,
                    OdThemeRole role, unsigned attributes);
 void od_canvas_write(OdCanvas *canvas, int x, int y, const char *text,
                      size_t maximum_columns, OdThemeRole role, unsigned attributes);
+void od_canvas_write_slice(OdCanvas *canvas, int x, int y, const char *text,
+                           size_t first_column, size_t maximum_columns,
+                           OdThemeRole role, unsigned attributes);
 void od_canvas_write_centered(OdCanvas *canvas, int y, const char *text,
                               OdThemeRole role, unsigned attributes);
+size_t od_text_columns(const char *text);
 size_t od_page_target(size_t selected, size_t count, size_t page_size, int pages);
 void od_canvas_box(OdCanvas *canvas, int x, int y, int width, int height,
                    bool ascii, OdThemeRole role);
