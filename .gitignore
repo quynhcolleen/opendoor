@@ -2,8 +2,10 @@
 /build-native/
 /build-sanitize/
 /build-release/
+/build-local/
 /dist/
 /tests/
+/OPENDOOR_PLAN.md
 /.cache/
 /.superpowers/
 *.log
