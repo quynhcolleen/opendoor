@@ -1,6 +1,7 @@
 #include "opendoor/app.h"
 #include "opendoor/config.h"
 #include "opendoor/tui.h"
+#include "opendoor/update.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@ void opendoor_print_help(void) {
     puts("  --ascii              Use ASCII borders and symbols");
     puts("  --no-color           Disable terminal colors");
     puts("  --reduced-motion     Use static progress indicators");
+    puts("  --update             Rebuild and install this source checkout");
     puts("  --help               Show this help");
     puts("  --version            Show version information");
 }
@@ -38,6 +40,13 @@ int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options) {
     *options = (OpendoorOptions){0};
 
     for (int index = 1; index < argc; ++index) {
+        if (strcmp(argv[index], "--update") == 0 && argc != 2) {
+            fputs("opendoor: --update must be used alone\n", stderr);
+            return 2;
+        }
+    }
+
+    for (int index = 1; index < argc; ++index) {
         const char *argument = argv[index];
         if (strcmp(argument, "--help") == 0) {
             opendoor_print_help();
@@ -46,6 +55,10 @@ int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options) {
         if (strcmp(argument, "--version") == 0) {
             opendoor_print_version();
             return 1;
+        }
+        if (strcmp(argument, "--update") == 0) {
+            options->update_requested = true;
+            continue;
         }
         if (strcmp(argument, "--project") == 0 || strcmp(argument, "--profile") == 0) {
             if (!has_value(index, argc)) {
@@ -79,6 +92,7 @@ int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options) {
 }
 
 int opendoor_run(const OpendoorOptions *options) {
+    if (options->update_requested) return od_update_current_checkout();
     const char *project = options->project_path == NULL ? "." : options->project_path;
     struct stat project_status;
     if (stat(project, &project_status) != 0 || !S_ISDIR(project_status.st_mode)) {

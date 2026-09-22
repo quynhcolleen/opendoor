@@ -36,11 +36,22 @@ opendoor --profile PATH
 opendoor --ascii
 opendoor --no-color
 opendoor --reduced-motion
+opendoor --update
 opendoor --help
 opendoor --version
 ```
 
-OpenDoor is interactive and has no operational subcommands. It exits with code `4` when standard input or output is not an interactive terminal.
+The TUI requires an interactive terminal and exits with code `4` when standard input or output is not interactive. `--update`, `--help`, and `--version` run without opening the TUI.
+
+### Update from the local checkout
+
+For now, updates rebuild exactly the source currently on disk; they do not fetch or modify Git history. Run the updater from any directory:
+
+```bash
+opendoor --update
+```
+
+The updater uses the current directory when it is an OpenDoor checkout, then checks `OPENDOOR_SOURCE_DIR`, then `~/opendoor`. It requires CMake and the normal build dependencies. It creates a Release build in the checkout’s `build-local/`, then atomically installs the executable as `~/.local/bin/opendoor`. The `--update` flag must be used alone.
 
 ## Keyboard and mouse
 
