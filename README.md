@@ -1,116 +1,113 @@
 # OpenDoor
 
-OpenDoor is a Linux terminal application for discovering listening ports, keeping per-project port assignments, and resolving conflicts before anything is written. It never starts or stops services, kills processes, invokes `sudo`, or edits `.gitignore`.
+OpenDoor is a small Linux ncurses application with two features:
 
-The interface always fits the current terminal viewport. Long tables and detail views use internal pages with arrow keys and PgUp/PgDn; OpenDoor never uses terminal scrollback as application navigation.
+- **Dashboard** shows the union of ports requested by the project and ports
+  currently occupied on the system.
+- **Resolve conflicts** proposes replacement ports for every conflict and writes
+  the complete proposal after one confirmation.
 
-## Install from source
+The main menu is always `Dashboard`, `Resolve conflicts`, and `Quit`.
 
-OpenDoor requires Linux, a C17 compiler, CMake 3.20 or newer, pthreads, and the wide-character ncurses development library.
+## Conflict timing
 
-On Debian or Ubuntu:
+Run OpenDoor **before starting the project stack**. Dashboard identifies a
+listener's process and working directory when `/proc` permissions allow, but
+conflict classification deliberately does not infer whether that process
+belongs to the project. Consequently, a configured port that is occupied is
+treated as a conflict.
+Checking a stack that is already running will report its normal listeners as
+conflicts.
+
+OpenDoor never starts or stops services, kills processes, or invokes `sudo`.
+
+## Wanted ports
+
+Create `.ports.env` in the project root and edit it by hand. The format is one
+`KEY=PORT` entry per line; blank lines and lines beginning with `#` are ignored.
+
+```dotenv
+API_PORT=3000
+WEB_PORT=5173
+```
+
+Keys use uppercase letters, digits, and underscores, and each key must be
+unique. Configured ports may be any value from 1 through 65535.
+
+Replacement candidates use the fixed range **1024–65535**. OpenDoor chooses the
+next available candidate, wraps to 1024 when needed, avoids occupied ports and
+other configured ports, and applies every proposed replacement as-is. Saving is
+a plain overwrite of `.ports.env`; there are no backups or transaction files.
+
+## Controls
+
+Main menu:
+
+- Up/Down: navigate
+- Enter: open
+- `q`: quit
+- Mouse wheel: navigate; click a menu row to open it
+
+Dashboard:
+
+- Up/Down: scroll
+- `r`: rescan
+- `q` or Escape: return to the menu
+- Mouse wheel: scroll; click the footer refresh/back controls
+
+Dashboard is read-only. Enter has no action and the screen never writes files.
+Its columns are:
+
+- `PORT`
+- `STATUS`: `running` when occupied, otherwise `free`
+- `CONFLICT`: `yes` when the port is both configured and occupied, or when
+  multiple configured keys request the same port
+- `PROCESS`: the owning process when visible through `/proc`
+- `DIRECTORY`: the owning process's working directory when visible through
+  `/proc`
+
+Resolve conflicts:
+
+- Enter: apply the entire displayed proposal once
+- Up/Down: scroll
+- `q` or Escape: cancel without writing
+- Mouse wheel: scroll; click the footer apply-all/cancel controls
+
+Only conflicting entries appear as `OLD PORT -> NEW PORT`. Individual rows
+cannot be reviewed, skipped, or edited. If nothing conflicts, the screen shows
+`No conflicts found` and offers no apply action.
+
+## Build
+
+OpenDoor requires Linux, a C17 compiler, CMake 3.20 or newer, and the
+wide-character ncurses development library.
 
 ```bash
 sudo apt install build-essential cmake libncurses-dev
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-cmake --build build --parallel
-sudo cmake --install build
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-The installed executable is `bin/opendoor`. Documentation and licenses are installed under the platform’s standard `share` directories.
-
-## Use
-
-Open a project by running OpenDoor from that project’s directory:
+Run from a project directory or pass another project root:
 
 ```bash
-cd <project_name>
 opendoor
-```
-
-The current directory is the project root. On first launch, review discovered services and save the generated profile and assignments from the TUI. To target another directory or profile explicitly:
-
-```text
 opendoor --project PATH
-opendoor --profile PATH
-opendoor --ascii
-opendoor --no-color
-opendoor --reduced-motion
-opendoor --update
-opendoor --help
-opendoor --version
 ```
 
-The TUI requires an interactive terminal and exits with code `4` when standard input or output is not interactive. `--update`, `--help`, and `--version` run without opening the TUI.
+`--ascii`, `--help`, and `--version` are also available. The TUI requires an
+interactive terminal.
 
-### Update from the local checkout
-
-For now, updates rebuild exactly the source currently on disk; they do not fetch or modify Git history. Run the updater from any directory:
+To rebuild the source checkout and install the resulting binary to
+`~/.local/bin/opendoor`, run:
 
 ```bash
 opendoor --update
 ```
 
-The updater uses the current directory when it is an OpenDoor checkout, then checks `OPENDOOR_SOURCE_DIR`, then `~/opendoor`. It requires CMake and the normal build dependencies. It creates a Release build in the checkout’s `build-local/`, then atomically installs the executable as `~/.local/bin/opendoor`. The `--update` flag must be used alone.
+`--update` must be used alone. It builds code already present in the checkout;
+it does not fetch or pull source changes.
 
-## Keyboard and mouse
-
-- Arrow keys or `hjkl` navigate; Tab moves between dashboard widgets.
-- PgUp/PgDn moves one visible page. Home/End jumps to the first or last row.
-- Enter activates the selected action; Space toggles a discovery candidate.
-- `e` edits a value or expands the focused dashboard widget.
-- `d` opens all fields for the selected row in a paginated detail view.
-- `/` searches, `s` sorts, `S` reverses the sort, and `r` refreshes.
-- `?` opens searchable help. Escape or `q` returns to the previous screen.
-- Single clicks select menus, widgets, rows, checkboxes, and controls. The wheel moves the focused table.
-
-Mouse input can be disabled globally. Every mouse action has a keyboard equivalent.
-
-## Files and safety
-
-The project profile is `.opendoor/project.toml`; see [`examples/project.toml`](examples/project.toml). The default local assignment file is `.ports.env`:
-
-```dotenv
-# Generated by OpenDoor. Machine-local; do not commit.
-# Profile: .opendoor/project.toml
-PORTS_CONFIGURED=1
-OPENDOOR_CONFIGURED=1
-API_PORT=3000
-```
-
-OpenDoor refuses unsafe paths, symlinks, non-regular targets, and foreign assignment files. Saves use a same-directory temporary file, `fsync`, atomic rename, and one rotating `.opendoor.bak` backup. “Reset local assignments” backs up and removes only the generated assignment file; the project profile remains.
-
-Add `.ports.env` and `.opendoor.bak` files to the project’s ignore rules when appropriate. OpenDoor warns but never changes ignore files itself.
-
-## Discovery behavior
-
-OpenDoor scans Linux TCP/UDP IPv4 and IPv6 sockets, resolves process owners when `/proc` permissions allow it, and optionally reads Docker port mappings. Docker absence or restricted process metadata appears as a nonfatal warning. Static discovery understands standard Compose files, numeric `*_PORT` dotenv entries, package scripts with explicit port flags, Makefile suggestions, and compatible existing assignments.
-
-All external terminal text is sanitized. Scanner and dashboard refresh work runs off the ncurses thread, and visible tables preserve stable row selection across refreshes and sorting.
-
-## Release archives
-
-Create a native x86_64 archive:
-
-```bash
-bash scripts/build-release.sh --arch x86_64 --version 0.1.0
-```
-
-For arm64, install `aarch64-linux-gnu-gcc`, the arm64 C runtime development files, and arm64 ncurses/tinfo development libraries, then run:
-
-```bash
-bash scripts/build-release.sh --arch arm64 --version 0.1.0
-```
-
-Archives are written to `dist/` with adjacent SHA-256 files. The packaging script inspects the ELF machine type and refuses an architecture label that does not match the binary.
-
-For a prebuilt binary, call `scripts/package-release.sh` directly with `--arch`, `--binary`, and `--version`. Set `SOURCE_DATE_EPOCH` to create byte-reproducible archives.
-
-## Development build
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF
-cmake --build build --parallel
-```
-
-OpenDoor is MIT licensed. Vendored dependency notices are in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+OpenDoor is MIT licensed. Vendored source notices are in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).

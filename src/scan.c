@@ -55,7 +55,6 @@ void od_scan_snapshot_free(OdScanSnapshot *snapshot) {
         free(snapshot->endpoints[index].command);
     }
     free(snapshot->endpoints);
-    free(snapshot->docker_mappings);
     for (size_t index = 0U; index < snapshot->warning_count; ++index) {
         free(snapshot->warnings[index]);
     }
@@ -578,6 +577,13 @@ static void read_process_metadata(const char *proc_root, pid_t pid, OdEndpoint *
     if (exe_length >= 0) {
         endpoint->executable[(size_t)exe_length] = '\0';
         sanitize_field(endpoint->executable);
+    }
+    (void)snprintf(path, sizeof(path), "%s/%ld/cwd", proc_root, (long)pid);
+    ssize_t directory_length = readlink(path, endpoint->directory,
+                                        sizeof(endpoint->directory) - 1U);
+    if (directory_length >= 0) {
+        endpoint->directory[(size_t)directory_length] = '\0';
+        sanitize_field(endpoint->directory);
     }
     (void)snprintf(path, sizeof(path), "%s/%ld/cmdline", proc_root, (long)pid);
     int command_fd = open(path, O_RDONLY | O_CLOEXEC);

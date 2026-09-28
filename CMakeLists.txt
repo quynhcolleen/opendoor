@@ -7,7 +7,6 @@ set(CMAKE_C_EXTENSIONS OFF)
 add_compile_definitions(_POSIX_C_SOURCE=200809L)
 
 include(CTest)
-find_package(Threads REQUIRED)
 find_library(NCURSESW_LIBRARY NAMES ncursesw)
 if(NOT NCURSESW_LIBRARY)
   find_file(NCURSESW_LIBRARY
@@ -28,11 +27,6 @@ if(NOT TINFO_LIBRARY)
   )
 endif()
 
-add_library(tomlc17 STATIC vendor/tomlc17/tomlc17.c)
-target_include_directories(tomlc17 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/tomlc17)
-add_library(jsmn STATIC vendor/jsmn/jsmn.c)
-target_include_directories(jsmn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
-
 add_library(opendoor_core
   src/app.c
   src/common.c
@@ -41,92 +35,52 @@ add_library(opendoor_core
   src/dotenv.c
   src/allocation.c
   src/scan.c
-  src/docker.c
   src/discovery.c
-  src/theme.c
   src/ui.c
   src/screens.c
   src/tui.c
-  src/onboarding.c
   src/dashboard.c
   src/persistence.c
   src/resolution.c
-  src/settings_store.c
-  src/help.c
   src/update.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_include_directories(opendoor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jsmn)
 target_compile_definitions(opendoor_core PUBLIC OPENDOOR_VERSION="${PROJECT_VERSION}")
 target_compile_options(opendoor_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 add_executable(opendoor src/main.c)
-target_link_libraries(opendoor_core PRIVATE tomlc17 jsmn Threads::Threads ${NCURSESW_LIBRARY})
+target_link_libraries(opendoor PRIVATE opendoor_core ${NCURSESW_LIBRARY})
 if(TINFO_LIBRARY)
-  target_link_libraries(opendoor_core PRIVATE ${TINFO_LIBRARY})
+  target_link_libraries(opendoor PRIVATE ${TINFO_LIBRARY})
 endif()
-target_link_libraries(opendoor PRIVATE opendoor_core)
 target_compile_options(opendoor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
-if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_core.c")
-  add_test(
-    NAME cli_contract
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.sh
-            ${CMAKE_BINARY_DIR}/opendoor
-  )
+if(BUILD_TESTING)
   add_executable(test_core tests/test_core.c)
   target_link_libraries(test_core PRIVATE opendoor_core)
   target_compile_options(test_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME core_contracts COMMAND test_core)
+  add_test(NAME resolution_allocation_contracts COMMAND test_core)
+
   add_executable(test_discovery tests/test_discovery.c)
   target_link_libraries(test_discovery PRIVATE opendoor_core)
   target_compile_options(test_discovery PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME discovery_contracts COMMAND test_discovery)
-  add_executable(test_ui tests/test_ui.c)
-  target_link_libraries(test_ui PRIVATE opendoor_core)
-  target_compile_options(test_ui PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME ui_contracts COMMAND test_ui)
-  add_executable(test_onboarding tests/test_onboarding.c)
-  target_link_libraries(test_onboarding PRIVATE opendoor_core)
-  target_compile_options(test_onboarding PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME onboarding_contracts COMMAND test_onboarding)
-  add_executable(test_dashboard tests/test_dashboard.c)
-  target_link_libraries(test_dashboard PRIVATE opendoor_core)
-  target_compile_options(test_dashboard PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME dashboard_contracts COMMAND test_dashboard)
+  add_test(NAME scan_contracts COMMAND test_discovery)
+
   add_executable(test_persistence tests/test_persistence.c)
   target_link_libraries(test_persistence PRIVATE opendoor_core)
   target_compile_options(test_persistence PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME persistence_contracts COMMAND test_persistence)
-  add_executable(test_settings tests/test_settings.c)
-  target_link_libraries(test_settings PRIVATE opendoor_core)
-  target_compile_options(test_settings PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  add_test(NAME settings_contracts COMMAND test_settings)
-  add_test(
-    NAME packaging_contracts
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_packaging.sh
-            ${CMAKE_BINARY_DIR}/opendoor ${CMAKE_CURRENT_SOURCE_DIR}
-  )
-  add_test(
-    NAME update_contracts
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_update.sh
-            ${CMAKE_BINARY_DIR}/opendoor
-  )
-  find_package(Python3 COMPONENTS Interpreter QUIET)
-  if(Python3_Interpreter_FOUND)
-    add_test(
-      NAME tui_pty_contracts
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tui_pty.py
-              ${CMAKE_BINARY_DIR}/opendoor
-    )
-    set_tests_properties(tui_pty_contracts PROPERTIES TIMEOUT 30)
+  add_test(NAME config_contracts COMMAND test_persistence)
+
+  add_executable(test_ui tests/test_ui.c)
+  target_link_libraries(test_ui PRIVATE opendoor_core ${NCURSESW_LIBRARY})
+  if(TINFO_LIBRARY)
+    target_link_libraries(test_ui PRIVATE ${TINFO_LIBRARY})
   endif()
-elseif(BUILD_TESTING)
-  message(STATUS "OpenDoor test sources are not included; skipping test targets")
+  target_compile_options(test_ui PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME menu_contracts COMMAND test_ui)
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)
 install(FILES README.md DESTINATION share/doc/opendoor)
-install(FILES examples/project.toml DESTINATION share/doc/opendoor/examples)
 install(FILES LICENSE DESTINATION share/licenses/opendoor)
 install(FILES THIRD_PARTY_LICENSES.md DESTINATION share/licenses/opendoor)

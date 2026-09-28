@@ -57,6 +57,7 @@ int getmouse(MEVENT *event);
 #define KEY_RIGHT 0405
 #define KEY_HOME 0406
 #define KEY_BACKSPACE 0407
+#define KEY_ENTER 0527
 #define KEY_NPAGE 0522
 #define KEY_PPAGE 0523
 #define KEY_END 0550
