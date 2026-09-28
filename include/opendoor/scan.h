@@ -28,33 +28,19 @@ typedef struct {
     pid_t pid;
     char process[OD_PROCESS_CAP];
     char executable[OD_PATH_CAP];
+    char directory[OD_PATH_CAP];
     char *command;
     char user[OD_USER_CAP];
     bool permission_limited;
 } OdEndpoint;
 
 typedef struct {
-    char container[128];
-    char container_id[80];
-    char project[128];
-    char service[128];
-    char bind_address[OD_ADDRESS_CAP];
-    uint16_t host_port;
-    uint16_t container_port;
-    unsigned protocol;
-} OdDockerMapping;
-
-typedef struct {
     uint64_t generation;
     OdEndpoint *endpoints;
     size_t endpoint_count;
     size_t endpoint_capacity;
-    OdDockerMapping *docker_mappings;
-    size_t docker_mapping_count;
-    size_t docker_mapping_capacity;
     char **warnings;
     size_t warning_count;
-    bool docker_available;
     bool process_permissions_limited;
 } OdScanSnapshot;
 

@@ -9,173 +9,124 @@
 static char *copy_string(const char *value) {
     size_t length = strlen(value) + 1U;
     char *copy = malloc(length);
-    if (copy != NULL) {
-        memcpy(copy, value, length);
-    }
+    if (copy != NULL) memcpy(copy, value, length);
     return copy;
 }
 
 void od_allocation_plan_free(OdAllocationPlan *plan) {
-    if (plan == NULL) {
-        return;
-    }
+    if (plan == NULL) return;
     for (size_t index = 0U; index < plan->count; ++index) {
-        free(plan->items[index].service_id);
         free(plan->items[index].variable);
     }
     free(plan->items);
     *plan = (OdAllocationPlan){0};
 }
 
-static bool profile_has_variable(const OdProfile *profile, const char *variable) {
-    for (size_t index = 0U; index < profile->service_count; ++index) {
-        if (strcmp(profile->services[index].variable, variable) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static OdStatus fill_allocation(OdAllocation *allocation,
-                                const OdService *service,
-                                uint16_t old_port,
+                                const OdAssignment *assignment,
                                 uint16_t new_port,
-                                OdAllocationReason reason,
                                 OdError *error) {
-    allocation->service_id = copy_string(service->id);
-    allocation->variable = copy_string(service->variable);
-    allocation->old_port = old_port;
-    allocation->new_port = new_port;
-    allocation->reason = reason;
-    if (allocation->service_id == NULL || allocation->variable == NULL) {
-        free(allocation->service_id);
-        free(allocation->variable);
-        *allocation = (OdAllocation){0};
-        od_error_set(error, OD_ERROR_MEMORY, "unable to store allocation");
+    allocation->variable = copy_string(assignment->variable);
+    if (allocation->variable == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to store port proposal");
         return OD_ERROR_MEMORY;
     }
+    allocation->old_port = assignment->port;
+    allocation->new_port = new_port;
+    allocation->reason = assignment->port == new_port ?
+        OD_ALLOC_UNCHANGED : OD_ALLOC_REASSIGNED;
     return OD_OK;
 }
 
-OdStatus od_allocate(const OdProfile *profile,
-                     const OdOccupiedPort *occupied,
+static uint16_t find_replacement(uint16_t old_port,
+                                 const bool *blocked,
+                                 const bool *used,
+                                 const size_t *wanted_count) {
+    unsigned start = old_port < OD_REPLACEMENT_PORT_MIN ||
+                     old_port >= OD_REPLACEMENT_PORT_MAX ?
+        OD_REPLACEMENT_PORT_MIN : (unsigned)old_port + 1U;
+    for (unsigned candidate = start; candidate <= OD_REPLACEMENT_PORT_MAX; ++candidate) {
+        if (!blocked[candidate] && !used[candidate] && wanted_count[candidate] == 0U) {
+            return (uint16_t)candidate;
+        }
+    }
+    for (unsigned candidate = OD_REPLACEMENT_PORT_MIN; candidate < start; ++candidate) {
+        if (!blocked[candidate] && !used[candidate] && wanted_count[candidate] == 0U) {
+            return (uint16_t)candidate;
+        }
+    }
+    return 0U;
+}
+
+OdStatus od_allocate(const OdAssignments *wanted,
+                     const uint16_t *occupied,
                      size_t occupied_count,
-                     const OdAssignments *saved,
                      OdAllocationPlan *plan,
                      OdError *error) {
-    if (profile == NULL || plan == NULL || (occupied_count > 0U && occupied == NULL)) {
-        od_error_set(error, OD_ERROR_INVALID, "profile, occupied ports, and plan are required");
+    if (wanted == NULL || plan == NULL || (occupied_count > 0U && occupied == NULL)) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "wanted ports, occupied ports, and output plan are required");
         return OD_ERROR_INVALID;
     }
     *plan = (OdAllocationPlan){0};
-    OdStatus status = od_profile_validate(profile, error);
-    if (status != OD_OK) {
-        return status;
-    }
-    if (profile->service_count == 0U) {
+    if (wanted->count == 0U) {
         od_error_clear(error);
         return OD_OK;
     }
 
     bool *blocked = calloc(OD_PORT_COUNT, sizeof(*blocked));
     bool *used = calloc(OD_PORT_COUNT, sizeof(*used));
-    size_t *preferred_count = calloc(OD_PORT_COUNT, sizeof(*preferred_count));
-    bool *allocated = calloc(profile->service_count, sizeof(*allocated));
-    if (blocked == NULL || used == NULL || preferred_count == NULL || allocated == NULL) {
+    size_t *wanted_count = calloc(OD_PORT_COUNT, sizeof(*wanted_count));
+    bool *allocated = calloc(wanted->count, sizeof(*allocated));
+    plan->items = calloc(wanted->count, sizeof(*plan->items));
+    if (blocked == NULL || used == NULL || wanted_count == NULL ||
+        allocated == NULL || plan->items == NULL) {
         free(blocked);
         free(used);
-        free(preferred_count);
+        free(wanted_count);
         free(allocated);
-        od_error_set(error, OD_ERROR_MEMORY, "unable to allocate port map");
+        od_allocation_plan_free(plan);
+        od_error_set(error, OD_ERROR_MEMORY, "unable to allocate port proposal");
         return OD_ERROR_MEMORY;
     }
-    for (size_t index = 0U; index < occupied_count; ++index) {
-        blocked[occupied[index].port] = true;
-    }
-    if (saved != NULL) {
-        for (size_t index = 0U; index < saved->count; ++index) {
-            if (!profile_has_variable(profile, saved->items[index].variable)) {
-                blocked[saved->items[index].port] = true;
-            }
-        }
-    }
-    for (size_t index = 0U; index < profile->service_count; ++index) {
-        const OdService *service = &profile->services[index];
-        if (service->managed) ++preferred_count[service->preferred_port];
+    plan->count = wanted->count;
+    for (size_t index = 0U; index < occupied_count; ++index) blocked[occupied[index]] = true;
+    for (size_t index = 0U; index < wanted->count; ++index) {
+        ++wanted_count[wanted->items[index].port];
     }
 
-    plan->items = calloc(profile->service_count, sizeof(*plan->items));
-    if (plan->items == NULL) {
-        free(blocked);
-        free(used);
-        free(preferred_count);
-        free(allocated);
-        od_error_set(error, OD_ERROR_MEMORY, "unable to allocate result plan");
-        return OD_ERROR_MEMORY;
-    }
-    plan->count = profile->service_count;
-
-    for (size_t index = 0U; index < profile->service_count && status == OD_OK; ++index) {
-        const OdService *service = &profile->services[index];
-        if (!service->managed || saved == NULL) {
-            continue;
-        }
-        const OdAssignment *existing = od_assignments_find(saved, service->variable);
-        if (existing == NULL || existing->port < profile->port_min || existing->port > profile->port_max ||
-            blocked[existing->port] || used[existing->port]) {
-            continue;
-        }
-        status = fill_allocation(&plan->items[index], service, existing->port,
-                                 existing->port, OD_ALLOC_PRESERVED, error);
+    OdStatus status = OD_OK;
+    for (size_t index = 0U; index < wanted->count && status == OD_OK; ++index) {
+        uint16_t port = wanted->items[index].port;
+        if (blocked[port] || used[port]) continue;
+        status = fill_allocation(&plan->items[index], &wanted->items[index], port, error);
         if (status == OD_OK) {
-            used[existing->port] = true;
             allocated[index] = true;
+            used[port] = true;
         }
     }
-
-    for (size_t index = 0U; index < profile->service_count && status == OD_OK; ++index) {
-        const OdService *service = &profile->services[index];
-        if (allocated[index]) {
-            continue;
-        }
-        const OdAssignment *existing = saved == NULL ? NULL :
-                                       od_assignments_find(saved, service->variable);
-        uint16_t old_port = existing == NULL ? 0U : existing->port;
-        uint16_t selected = 0U;
-        for (unsigned candidate = service->preferred_port;
-             candidate <= (unsigned)profile->port_max;
-             ++candidate) {
-            uint16_t port = (uint16_t)candidate;
-            bool protects_other = port != service->preferred_port &&
-                                  preferred_count[port] > 0U;
-            if (!blocked[port] && !used[port] && !protects_other) {
-                selected = port;
-                break;
-            }
-        }
+    for (size_t index = 0U; index < wanted->count && status == OD_OK; ++index) {
+        if (allocated[index]) continue;
+        uint16_t selected = find_replacement(wanted->items[index].port,
+                                             blocked, used, wanted_count);
         if (selected == 0U) {
             od_error_set(error, OD_ERROR_EXHAUSTED,
-                         "no free port at or above %u for %s in range %u-%u",
-                         (unsigned)service->preferred_port,
-                         service->id,
-                         (unsigned)profile->port_min,
-                         (unsigned)profile->port_max);
+                         "no replacement port is available from %u to %u",
+                         OD_REPLACEMENT_PORT_MIN, OD_REPLACEMENT_PORT_MAX);
             status = OD_ERROR_EXHAUSTED;
             break;
         }
-        OdAllocationReason reason =
-            (old_port != 0U && old_port != selected) || selected != service->preferred_port ?
-                OD_ALLOC_REASSIGNED : OD_ALLOC_PREFERRED;
-        status = fill_allocation(&plan->items[index], service, old_port, selected, reason, error);
+        status = fill_allocation(&plan->items[index], &wanted->items[index],
+                                 selected, error);
         if (status == OD_OK) {
-            used[selected] = true;
             allocated[index] = true;
+            used[selected] = true;
         }
     }
 
     free(blocked);
     free(used);
-    free(preferred_count);
+    free(wanted_count);
     free(allocated);
     if (status != OD_OK) {
         od_allocation_plan_free(plan);

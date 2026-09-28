@@ -1,13 +1,20 @@
 #ifndef OPENDOOR_CONFIG_H
 #define OPENDOOR_CONFIG_H
 
-#include "opendoor/model.h"
+#include "opendoor/dotenv.h"
 
-OdStatus od_profile_parse(const char *text, size_t length, OdProfile *profile, OdError *error);
-OdStatus od_profile_load(const char *path, OdProfile *profile, OdError *error);
-OdStatus od_profile_render(const OdProfile *profile, char **text, size_t *length, OdError *error);
-OdStatus od_settings_parse(const char *text, size_t length, OdSettings *settings, OdError *error);
-OdStatus od_settings_load(const char *path, OdSettings *settings, OdError *error);
-OdStatus od_settings_render(const OdSettings *settings, char **text, size_t *length, OdError *error);
+#include <stddef.h>
+
+OdStatus od_config_parse(const char *text,
+                         size_t length,
+                         OdAssignments *assignments,
+                         OdError *error);
+OdStatus od_config_load(const char *path,
+                        OdAssignments *assignments,
+                        OdError *error);
+OdStatus od_config_render(const OdAssignments *assignments,
+                          char **text,
+                          size_t *length,
+                          OdError *error);
 
 #endif

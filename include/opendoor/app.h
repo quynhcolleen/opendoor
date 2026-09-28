@@ -5,10 +5,7 @@
 
 typedef struct {
     const char *project_path;
-    const char *profile_path;
     bool force_ascii;
-    bool no_color;
-    bool reduced_motion;
     bool update_requested;
 } OpendoorOptions;
 

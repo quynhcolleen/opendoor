@@ -108,7 +108,7 @@ void od_canvas_free(OdCanvas *canvas) {
     *canvas = (OdCanvas){0};
 }
 
-void od_canvas_clear(OdCanvas *canvas, OdThemeRole role) {
+void od_canvas_clear(OdCanvas *canvas, OdStyleRole role) {
     if (canvas == NULL) return;
     for (size_t index = 0U; index < canvas->width * canvas->height; ++index) {
         (void)strcpy(canvas->cells[index].glyph, " ");
@@ -121,7 +121,7 @@ void od_canvas_put(OdCanvas *canvas,
                    int x,
                    int y,
                    const char *glyph,
-                   OdThemeRole role,
+                   OdStyleRole role,
                    unsigned attributes) {
     if (canvas == NULL || glyph == NULL || x < 0 || y < 0 ||
         (size_t)x >= canvas->width || (size_t)y >= canvas->height) return;
@@ -147,7 +147,7 @@ void od_canvas_write_slice(OdCanvas *canvas,
                            const char *text,
                            size_t first_column,
                            size_t maximum_columns,
-                           OdThemeRole role,
+                           OdStyleRole role,
                            unsigned attributes) {
     if (canvas == NULL || text == NULL || y < 0 || (size_t)y >= canvas->height ||
         maximum_columns == 0U) return;
@@ -222,7 +222,7 @@ void od_canvas_write(OdCanvas *canvas,
                      int y,
                      const char *text,
                      size_t maximum_columns,
-                     OdThemeRole role,
+                     OdStyleRole role,
                      unsigned attributes) {
     od_canvas_write_slice(canvas, x, y, text, 0U, maximum_columns,
                           role, attributes);
@@ -231,7 +231,7 @@ void od_canvas_write(OdCanvas *canvas,
 void od_canvas_write_centered(OdCanvas *canvas,
                               int y,
                               const char *text,
-                              OdThemeRole role,
+                              OdStyleRole role,
                               unsigned attributes) {
     if (canvas == NULL || text == NULL) return;
     size_t columns = od_text_columns(text);
@@ -259,7 +259,7 @@ void od_canvas_box(OdCanvas *canvas,
                    int width,
                    int height,
                    bool ascii,
-                   OdThemeRole role) {
+                   OdStyleRole role) {
     if (canvas == NULL || width < 2 || height < 2) return;
     const char *top_left = ascii ? "+" : "┌";
     const char *top_right = ascii ? "+" : "┐";
