@@ -4,7 +4,7 @@ project(opendoor VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-add_compile_definitions(_POSIX_C_SOURCE=200809L)
+add_compile_definitions(_POSIX_C_SOURCE=200809L _XOPEN_SOURCE=700)
 
 include(CTest)
 find_library(NCURSESW_LIBRARY NAMES ncursesw)
@@ -42,7 +42,6 @@ add_library(opendoor_core
   src/dashboard.c
   src/persistence.c
   src/resolution.c
-  src/update.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(opendoor_core PUBLIC OPENDOOR_VERSION="${PROJECT_VERSION}")
@@ -78,6 +77,15 @@ if(BUILD_TESTING)
   endif()
   target_compile_options(test_ui PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME menu_contracts COMMAND test_ui)
+
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME tui_mouse_contracts
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tui_pty.py
+              $<TARGET_FILE:opendoor>)
+    set_tests_properties(tui_mouse_contracts PROPERTIES TIMEOUT 30)
+  endif()
 endif()
 
 install(TARGETS opendoor RUNTIME DESTINATION bin)

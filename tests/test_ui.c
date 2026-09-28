@@ -75,14 +75,20 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     od_canvas_free(&canvas);
 }
 
-static void test_update_is_a_cli_only_action(void) {
+static void test_removed_update_and_help_are_unknown_options(void) {
     char *update_arguments[] = {"opendoor", "--update", NULL};
     OpendoorOptions options;
-    CHECK(opendoor_parse_args(2, update_arguments, &options) == 0);
-    CHECK(options.update_requested);
+    CHECK(opendoor_parse_args(2, update_arguments, &options) == 2);
 
-    char *mixed_arguments[] = {"opendoor", "--update", "--ascii", NULL};
-    CHECK(opendoor_parse_args(3, mixed_arguments, &options) == 2);
+    char *help_arguments[] = {"opendoor", "--help", NULL};
+    CHECK(opendoor_parse_args(2, help_arguments, &options) == 2);
+
+    char *normal_arguments[] = {
+        "opendoor", "--project", ".", "--ascii", NULL
+    };
+    CHECK(opendoor_parse_args(4, normal_arguments, &options) == 0);
+    CHECK(options.project_path != NULL && strcmp(options.project_path, ".") == 0);
+    CHECK(options.force_ascii);
 }
 
 static void test_mouse_targets_match_visible_controls(void) {
@@ -112,24 +118,24 @@ static void test_dashboard_is_read_only(void) {
     OdPortRow rows[] = {
         {
             .port = 3000U,
-            .running = true,
-            .conflict = true,
-            .process = "api-server",
-            .directory = "/work/services/api"
+            .status = OD_PORT_RUNNING,
+            .declared = true,
+            .relative_folder = "./services/api",
+            .source = "./services/api/.env"
         },
         {
             .port = 4000U,
-            .running = false,
-            .conflict = false,
-            .process = "-",
-            .directory = "-"
+            .status = OD_PORT_NOT_RUNNING,
+            .declared = true,
+            .relative_folder = "./services/web",
+            .source = "./services/web/compose.yaml"
         },
         {
             .port = 5000U,
-            .running = true,
-            .conflict = false,
-            .process = "🚪🚪🚪🚪🚪🚪",
-            .directory = "/work/services/unicode"
+            .status = OD_PORT_IN_USE_OTHER,
+            .declared = true,
+            .relative_folder = "./services/外部",
+            .source = "./services/外部/.env"
         }
     };
     OdDashboard dashboard = {
@@ -140,15 +146,18 @@ static void test_dashboard_is_read_only(void) {
     OdCanvas canvas;
     OdError error;
     CHECK(od_canvas_init(&canvas, 120U, 30U, &error) == OD_OK);
-    od_render_dashboard(&canvas, &dashboard, ".ports.env", "Scan complete", false);
+    od_render_dashboard(&canvas, &dashboard, "Scan complete", false);
     char *text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "PORT") != NULL);
+    CHECK(text != NULL && strstr(text, "RELATIVE FOLDER") != NULL);
     CHECK(text != NULL && strstr(text, "STATUS") != NULL);
-    CHECK(text != NULL && strstr(text, "CONFLICT") != NULL);
-    CHECK(text != NULL && strstr(text, "PROCESS") != NULL);
-    CHECK(text != NULL && strstr(text, "DIRECTORY") != NULL);
-    CHECK(text != NULL && strstr(text, "api-server") != NULL);
-    CHECK(text != NULL && strstr(text, "/work/services/api") != NULL);
+    CHECK(text != NULL && strstr(text, "SOURCE") != NULL);
+    CHECK(text != NULL && strstr(text, "CONFLICT") == NULL);
+    CHECK(text != NULL && strstr(text, "PROCESS") == NULL);
+    CHECK(text != NULL && strstr(text, "DIRECTORY") == NULL);
+    CHECK(text != NULL && strstr(text, "/work/") == NULL);
+    CHECK(text != NULL && strstr(text, "./services/api") != NULL);
+    CHECK(text != NULL && strstr(text, "./services/api/.env") != NULL);
     CHECK(text != NULL && strstr(text, "?") == NULL);
     CHECK(text != NULL && strstr(text, "┌") != NULL);
     CHECK(text != NULL && strstr(text, "┬") != NULL);
@@ -160,7 +169,8 @@ static void test_dashboard_is_read_only(void) {
     CHECK(text != NULL && substring_count(text, "┼") >= 3U);
     CHECK(text != NULL && strstr(text, "│ PORT") != NULL);
     CHECK(text != NULL && strstr(text, "running") != NULL);
-    CHECK(text != NULL && strstr(text, "free") != NULL);
+    CHECK(text != NULL && strstr(text, "not running") != NULL);
+    CHECK(text != NULL && strstr(text, "in use (other)") != NULL);
     CHECK(text != NULL && strstr(text, "Up/Down Scroll") != NULL);
     CHECK(text != NULL && strstr(text, "r Refresh") != NULL);
     CHECK(text != NULL && strstr(text, "Enter") == NULL);
@@ -168,14 +178,14 @@ static void test_dashboard_is_read_only(void) {
     od_canvas_free(&canvas);
 
     CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
-    od_render_dashboard(&canvas, &dashboard, ".ports.env", "Scan complete", false);
+    od_render_dashboard(&canvas, &dashboard, "Scan complete", false);
     text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "Showing 1–1 of 3 port(s)") != NULL);
     CHECK(text != NULL && strstr(text, "q/Esc Back") != NULL);
     free(text);
 
     dashboard.scroll = 2U;
-    od_render_dashboard(&canvas, &dashboard, ".ports.env", "Scan complete", false);
+    od_render_dashboard(&canvas, &dashboard, "Scan complete", false);
     text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "Showing 3–3 of 3 port(s)") != NULL);
     CHECK(text != NULL && strstr(text, "5000") != NULL);
@@ -184,36 +194,80 @@ static void test_dashboard_is_read_only(void) {
     dashboard.scroll = 0U;
 
     CHECK(od_canvas_init(&canvas, 80U, 24U, &error) == OD_OK);
-    od_render_dashboard(&canvas, &dashboard, ".ports.env", "Scan complete", true);
+    od_render_dashboard(&canvas, &dashboard, "Scan complete", true);
     text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "| PORT") != NULL);
-    CHECK(text != NULL && line_has_at_least(text, '+', 6U));
+    CHECK(text != NULL && line_has_at_least(text, '+', 5U));
     free(text);
     od_canvas_free(&canvas);
 }
 
 static void test_conflicts_have_one_whole_plan_action(void) {
-    OdResolutionItem item = {
-        .variable = "API_PORT",
-        .old_port = 3000U,
-        .new_port = 3001U
+    OdResolutionItem items[] = {
+        {
+            .declaration_index = 0U,
+            .old_port = 3000U,
+            .new_port = 3001U,
+            .automatic = true,
+            .source_kind = OD_SOURCE_ENV,
+            .write_kind = OD_WRITE_ENV_LITERAL,
+            .line = 2U,
+            .relative_path = "./.env",
+            .line_before = "- API_PORT=3000",
+            .line_after = "+ API_PORT=3001",
+            .manual_reason = ""
+        },
+        {
+            .declaration_index = 1U,
+            .old_port = 8080U,
+            .new_port = 8081U,
+            .automatic = true,
+            .source_kind = OD_SOURCE_COMPOSE,
+            .write_kind = OD_WRITE_COMPOSE_LITERAL,
+            .line = 5U,
+            .relative_path = "./compose.yaml",
+            .line_before = "-       - \"8080:80\"",
+            .line_after = "+       - \"8081:80\"",
+            .manual_reason = ""
+        },
+        {
+            .declaration_index = 2U,
+            .old_port = 5173U,
+            .new_port = 5174U,
+            .automatic = false,
+            .source_kind = OD_SOURCE_PACKAGE_JSON,
+            .write_kind = OD_WRITE_MANUAL_ONLY,
+            .line = 3U,
+            .relative_path = "./package.json",
+            .line_before = "-     \"dev\": \"vite --port 5173\"",
+            .line_after = "+     \"dev\": \"vite --port 5174\"",
+            .manual_reason = "package.json scripts are manual-only"
+        }
     };
-    OdResolution resolution = {.items = &item, .count = 1U};
+    OdResolution resolution = {
+        .items = items,
+        .count = 3U,
+        .automatic_count = 2U,
+        .manual_count = 1U
+    };
+    CHECK(od_resolution_visual_line_count(&resolution) >= 10U);
     OdCanvas canvas;
     OdError error;
-    CHECK(od_canvas_init(&canvas, 80U, 24U, &error) == OD_OK);
+    CHECK(od_canvas_init(&canvas, 100U, 32U, &error) == OD_OK);
     od_render_conflicts(&canvas, &resolution, 0U, true, true,
                         "Ready to apply", false);
     char *text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "OLD PORT") != NULL);
-    CHECK(text != NULL && strstr(text, "NEW PORT") != NULL);
-    CHECK(text != NULL && strstr(text, "3000") != NULL);
-    CHECK(text != NULL && strstr(text, "3001") != NULL);
-    CHECK(text != NULL && strstr(text, "┬") != NULL);
-    CHECK(text != NULL && strstr(text, "├") != NULL);
-    CHECK(text != NULL && strstr(text, "┼") != NULL);
-    CHECK(text != NULL && strstr(text, "┤") != NULL);
-    CHECK(text != NULL && strstr(text, "┴") != NULL);
+    CHECK(text != NULL && strstr(text, "Automatic changes") != NULL);
+    CHECK(text != NULL && strstr(text, "./.env") != NULL);
+    CHECK(text != NULL && strstr(text, "- API_PORT=3000") != NULL);
+    CHECK(text != NULL && strstr(text, "+ API_PORT=3001") != NULL);
+    CHECK(text != NULL && strstr(text, "./compose.yaml") != NULL);
+    CHECK(text != NULL && strstr(text, "Manual suggestions") != NULL);
+    CHECK(text != NULL && strstr(text, "not applied automatically") != NULL);
+    CHECK(text != NULL && strstr(text, "change line 3 in ./package.json to 5174") != NULL);
+    CHECK(text != NULL && strstr(text, "package.json scripts are manual-only") != NULL);
+    CHECK(text != NULL && strstr(text, "┌") != NULL);
+    CHECK(text != NULL && strstr(text, "└") != NULL);
     CHECK(text != NULL && strstr(text, "Enter Apply all") != NULL);
     CHECK(text != NULL && strstr(text, "q/Esc Cancel") != NULL);
     CHECK(text != NULL && strstr(text, "┌") != NULL);
@@ -222,10 +276,33 @@ static void test_conflicts_have_one_whole_plan_action(void) {
     free(text);
 
     od_render_conflicts(&canvas, &resolution, 0U, false, true,
-                        "Updated 1 port(s)", true);
+                        "Updated 2 port(s); 1 manual suggestion(s)", true);
     text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "Updated 1 port(s)") != NULL);
+    CHECK(text != NULL && strstr(text, "Updated 2 port(s)") != NULL);
     CHECK(text != NULL && strstr(text, "Enter Apply all") == NULL);
+    free(text);
+
+    OdResolution manual_only = {
+        .items = &items[2],
+        .count = 1U,
+        .manual_count = 1U
+    };
+    od_render_conflicts(&canvas, &manual_only, 0U, true, true,
+                        "Manual suggestion only", false);
+    text = rendered_text(&canvas);
+    CHECK(text != NULL && strstr(text, "Manual suggestions") != NULL);
+    CHECK(text != NULL && strstr(text, "Enter Apply all") == NULL);
+    free(text);
+
+    od_canvas_free(&canvas);
+    CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
+    size_t visual_lines = od_resolution_visual_line_count(&resolution);
+    size_t last_scroll = visual_lines > 3U ? visual_lines - 3U : 0U;
+    od_render_conflicts(&canvas, &resolution, last_scroll, true, true,
+                        "Ready", false);
+    text = rendered_text(&canvas);
+    CHECK(text != NULL && strstr(text, "package.json scripts are manual-only") != NULL);
+    CHECK(text != NULL && strstr(text, "Showing") != NULL);
     free(text);
 
     resolution = (OdResolution){0};
@@ -246,7 +323,7 @@ static void test_conflicts_have_one_whole_plan_action(void) {
 
 int main(void) {
     test_menu_dispatch_is_fixed_to_three_items();
-    test_update_is_a_cli_only_action();
+    test_removed_update_and_help_are_unknown_options();
     test_mouse_targets_match_visible_controls();
     test_dashboard_is_read_only();
     test_conflicts_have_one_whole_plan_action();

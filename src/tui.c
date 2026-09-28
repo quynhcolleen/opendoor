@@ -161,81 +161,39 @@ static OdMenuItem run_menu(const char *project, bool ascii, const char *status) 
     return OD_MENU_QUIT;
 }
 
-static OdStatus config_path_for_project(const char *project,
-                                        char *path,
-                                        size_t capacity,
-                                        OdError *error) {
-    size_t length = strlen(project);
-    int written = snprintf(path, capacity, "%s%s.ports.env", project,
-                           length > 0U && project[length - 1U] == '/' ? "" : "/");
-    if (written < 0 || (size_t)written >= capacity) {
-        od_error_set(error, OD_ERROR_INVALID, "wanted-ports path is too long");
-        return OD_ERROR_INVALID;
-    }
-    od_error_clear(error);
-    return OD_OK;
-}
-
-static OdStatus load_wanted(const char *path,
-                            OdAssignments *wanted,
-                            bool *missing,
-                            OdError *error) {
-    od_assignments_init(wanted);
-    *missing = false;
-    if (access(path, F_OK) != 0) {
-        if (errno == ENOENT) {
-            *missing = true;
-            od_error_clear(error);
-            return OD_OK;
-        }
-        od_error_set(error, OD_ERROR_IO, "unable to inspect %s: %s",
-                     path, strerror(errno));
-        return OD_ERROR_IO;
-    }
-    return od_config_load(path, wanted, error);
-}
-
 typedef struct {
-    OdAssignments wanted;
-    uint16_t *occupied;
-    size_t occupied_count;
+    OdProjectDiscovery discovery;
     OdDashboard dashboard;
     char status[OD_ERROR_MESSAGE_CAP];
 } DashboardState;
 
 static void dashboard_state_free(DashboardState *state) {
     od_dashboard_free(&state->dashboard);
-    free(state->occupied);
-    od_assignments_free(&state->wanted);
+    od_project_discovery_free(&state->discovery);
     *state = (DashboardState){0};
 }
 
 static OdStatus refresh_dashboard(DashboardState *state,
-                                  const char *config_path,
+                                  const char *project_root,
                                   uint64_t generation,
                                   OdError *error) {
     dashboard_state_free(state);
-    bool missing = false;
-    OdStatus config_status = load_wanted(config_path, &state->wanted, &missing, error);
-    char config_error[OD_ERROR_MESSAGE_CAP] = {0};
-    if (config_status != OD_OK) {
-        set_status(config_error, sizeof(config_error), "%s", error->message);
-        od_assignments_init(&state->wanted);
-    }
+    OdStatus status = od_discover_project_ports(project_root, &state->discovery,
+                                                error);
+    if (status != OD_OK) return status;
     OdScanSnapshot snapshot;
     od_scan_snapshot_init(&snapshot, generation);
-    OdStatus status = od_scan_host(&snapshot, error);
+    status = od_scan_host(&snapshot, error);
     if (status == OD_OK) {
-        status = od_dashboard_init(&state->dashboard, &state->wanted,
-                                   &snapshot, error);
+        status = od_dashboard_init(&state->dashboard, project_root,
+                                   &state->discovery, &snapshot, error);
     }
     od_scan_snapshot_free(&snapshot);
     if (status != OD_OK) return status;
-    if (config_status != OD_OK) {
-        set_status(state->status, sizeof(state->status), "%s", config_error);
-    } else if (missing) {
+    if (state->discovery.warning_count > 0U) {
         set_status(state->status, sizeof(state->status),
-                   "Wanted-ports file not found; showing occupied ports only");
+                   "Scan complete with %zu warning(s)",
+                   state->discovery.warning_count);
     } else {
         set_status(state->status, sizeof(state->status), "Scan complete");
     }
@@ -244,7 +202,6 @@ static OdStatus refresh_dashboard(DashboardState *state,
 
 typedef struct {
     DashboardState *state;
-    const char *config_path;
     bool ascii;
 } DashboardRenderContext;
 
@@ -253,19 +210,19 @@ static void render_dashboard(OdCanvas *canvas, void *opaque) {
     size_t page_size = canvas->height > 16U ? (canvas->height - 16U) / 2U : 1U;
     if (page_size == 0U) page_size = 1U;
     od_dashboard_set_page_size(&context->state->dashboard, page_size);
-    od_render_dashboard(canvas, &context->state->dashboard, context->config_path,
+    od_render_dashboard(canvas, &context->state->dashboard,
                         context->state->status, context->ascii);
 }
 
-static void run_dashboard(const char *config_path, bool ascii) {
+static void run_dashboard(const char *project_root, bool ascii) {
     DashboardState state = {0};
     OdError error;
     uint64_t generation = 1U;
-    if (refresh_dashboard(&state, config_path, generation, &error) != OD_OK) {
+    if (refresh_dashboard(&state, project_root, generation, &error) != OD_OK) {
         set_status(state.status, sizeof(state.status), "%s", error.message);
     }
     while (!interrupted) {
-        DashboardRenderContext context = {&state, config_path, ascii};
+        DashboardRenderContext context = {&state, ascii};
         (void)draw(render_dashboard, &context);
         int key = wgetch(terminal_window);
         if (key == KEY_MOUSE) {
@@ -294,7 +251,7 @@ static void run_dashboard(const char *config_path, bool ascii) {
             od_dashboard_scroll(&state.dashboard, 1);
         } else if (key == 'r') {
             ++generation;
-            if (refresh_dashboard(&state, config_path, generation, &error) != OD_OK) {
+            if (refresh_dashboard(&state, project_root, generation, &error) != OD_OK) {
                 set_status(state.status, sizeof(state.status), "%s", error.message);
             }
         } else if (key == 'q' || key == 27) {
@@ -305,63 +262,44 @@ static void run_dashboard(const char *config_path, bool ascii) {
 }
 
 typedef struct {
-    OdAssignments wanted;
-    uint16_t *occupied;
-    size_t occupied_count;
-    OdAllocationPlan plan;
+    OdProjectDiscovery discovery;
     OdResolution resolution;
     size_t scroll;
     bool apply_available;
-    bool config_valid;
     bool prepared;
     char status[OD_ERROR_MESSAGE_CAP];
 } ConflictState;
 
 static void conflict_state_free(ConflictState *state) {
     od_resolution_free(&state->resolution);
-    od_allocation_plan_free(&state->plan);
-    free(state->occupied);
-    od_assignments_free(&state->wanted);
+    od_project_discovery_free(&state->discovery);
     *state = (ConflictState){0};
 }
 
 static OdStatus prepare_conflicts(ConflictState *state,
-                                  const char *config_path,
+                                  const char *project_root,
                                   OdError *error) {
     conflict_state_free(state);
-    bool missing = false;
-    OdStatus status = load_wanted(config_path, &state->wanted, &missing, error);
-    if (status != OD_OK) {
-        set_status(state->status, sizeof(state->status), "%s", error->message);
-        return status;
-    }
-    state->config_valid = true;
+    OdStatus status = od_discover_project_ports(project_root, &state->discovery,
+                                                error);
     OdScanSnapshot snapshot;
     od_scan_snapshot_init(&snapshot, 1U);
-    status = od_scan_sockets(&snapshot, error);
-    if (status == OD_OK) {
-        status = od_discover_occupied_ports(&snapshot, &state->occupied,
-                                            &state->occupied_count, error);
-    }
+    if (status == OD_OK) status = od_scan_host(&snapshot, error);
+    if (status == OD_OK) status = od_resolution_build(
+        project_root, &state->discovery, &snapshot, &state->resolution, error);
     od_scan_snapshot_free(&snapshot);
-    if (status == OD_OK) {
-        status = od_allocate(&state->wanted, state->occupied,
-                             state->occupied_count, &state->plan, error);
-    }
-    if (status == OD_OK) {
-        status = od_resolution_init(&state->resolution, &state->plan, error);
-    }
     if (status != OD_OK) {
         set_status(state->status, sizeof(state->status), "%s", error->message);
         return status;
     }
     state->prepared = true;
-    state->apply_available = state->resolution.count > 0U;
-    if (missing) {
-        set_status(state->status, sizeof(state->status),
-                   "Wanted-ports file not found; no configured ports to resolve");
-    } else if (state->resolution.count == 0U) {
+    state->apply_available = state->resolution.automatic_count > 0U;
+    if (state->resolution.count == 0U) {
         set_status(state->status, sizeof(state->status), "No conflicts found");
+    } else if (!state->apply_available) {
+        set_status(state->status, sizeof(state->status),
+                   "%zu manual suggestion(s); nothing will be written",
+                   state->resolution.manual_count);
     } else {
         set_status(state->status, sizeof(state->status),
                    "Press Enter once to apply the complete proposal");
@@ -385,35 +323,51 @@ static void render_conflict_screen(OdCanvas *canvas, void *opaque) {
 }
 
 static void apply_proposal(ConflictState *state,
-                           const char *config_path,
+                           const char *project_root,
                            OdError *error) {
-    if (!state->apply_available || !state->config_valid) return;
-    for (size_t index = 0U; index < state->wanted.count; ++index) {
-        state->wanted.items[index].port = state->plan.items[index].new_port;
+    if (!state->apply_available) return;
+    OdScanSnapshot snapshot;
+    od_scan_snapshot_init(&snapshot, 2U);
+    OdStatus status = od_scan_host(&snapshot, error);
+    if (status == OD_OK) {
+        status = od_resolution_validate_snapshot(project_root, &state->resolution,
+                                                 &snapshot, error);
     }
-    if (od_config_write(config_path, &state->wanted, error) != OD_OK) {
+    od_scan_snapshot_free(&snapshot);
+    size_t updated = 0U;
+    if (status == OD_OK) {
+        status = od_apply_resolution(&state->resolution, &updated, error);
+    }
+    if (status != OD_OK) {
         set_status(state->status, sizeof(state->status), "%s", error->message);
         return;
     }
     state->apply_available = false;
-    set_status(state->status, sizeof(state->status), "Updated %zu port(s)",
-               state->resolution.count);
+    if (state->resolution.manual_count > 0U) {
+        set_status(state->status, sizeof(state->status),
+                   "Updated %zu port(s); %zu manual suggestion(s)",
+                   updated, state->resolution.manual_count);
+    } else {
+        set_status(state->status, sizeof(state->status), "Updated %zu port(s)",
+                   updated);
+    }
 }
 
-static void run_conflicts(const char *config_path, bool ascii) {
+static void run_conflicts(const char *project_root, bool ascii) {
     ConflictState state = {0};
     OdError error;
-    (void)prepare_conflicts(&state, config_path, &error);
+    (void)prepare_conflicts(&state, project_root, &error);
     while (!interrupted) {
         ConflictRenderContext context = {&state, ascii};
         (void)draw(render_conflict_screen, &context);
         int key = wgetch(terminal_window);
         int terminal_height = getmaxy(terminal_window);
-        size_t page_size = terminal_height > 14 ?
-            (size_t)(terminal_height - 14) / 2U : 1U;
+        size_t page_size = terminal_height > 12 ?
+            (size_t)(terminal_height - 12) / 2U : 1U;
         if (page_size == 0U) page_size = 1U;
-        size_t maximum = state.resolution.count > page_size ?
-            state.resolution.count - page_size : 0U;
+        size_t visual_count = od_resolution_visual_line_count(&state.resolution);
+        size_t maximum = visual_count > page_size ?
+            visual_count - page_size : 0U;
         if (state.scroll > maximum) state.scroll = maximum;
         if (key == KEY_MOUSE) {
             MEVENT event;
@@ -444,7 +398,7 @@ static void run_conflicts(const char *config_path, bool ascii) {
         } else if ((key == '\n' || key == '\r' || key == KEY_ENTER) &&
                    getmaxx(terminal_window) >= 60 &&
                    getmaxy(terminal_window) >= 18) {
-            apply_proposal(&state, config_path, &error);
+            apply_proposal(&state, project_root, &error);
         } else if (key == 'q' || key == 27) {
             break;
         }
@@ -454,12 +408,6 @@ static void run_conflicts(const char *config_path, bool ascii) {
 
 int od_tui_run(const OpendoorOptions *options) {
     const char *project = options->project_path == NULL ? "." : options->project_path;
-    char config_path[4096];
-    OdError error;
-    if (config_path_for_project(project, config_path, sizeof(config_path), &error) != OD_OK) {
-        fprintf(stderr, "opendoor: %s\n", error.message);
-        return 3;
-    }
     (void)setlocale(LC_ALL, "");
     struct sigaction action = {0};
     action.sa_handler = handle_signal;
@@ -487,11 +435,11 @@ int od_tui_run(const OpendoorOptions *options) {
         OdMenuItem item = run_menu(project, options->force_ascii, menu_status);
         switch (item) {
             case OD_MENU_DASHBOARD:
-                run_dashboard(config_path, options->force_ascii);
+                run_dashboard(project, options->force_ascii);
                 set_status(menu_status, sizeof(menu_status), "Returned from Dashboard");
                 break;
             case OD_MENU_RESOLVE_CONFLICTS:
-                run_conflicts(config_path, options->force_ascii);
+                run_conflicts(project, options->force_ascii);
                 set_status(menu_status, sizeof(menu_status),
                            "Returned from Resolve conflicts");
                 break;

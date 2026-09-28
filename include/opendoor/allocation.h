@@ -3,6 +3,7 @@
 
 #include "opendoor/dotenv.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,6 +28,13 @@ typedef struct {
 } OdAllocationPlan;
 
 void od_allocation_plan_free(OdAllocationPlan *plan);
+OdStatus od_allocate_selected(const OdAssignments *wanted,
+                              const uint16_t *occupied,
+                              size_t occupied_count,
+                              const bool *must_reassign,
+                              size_t must_reassign_count,
+                              OdAllocationPlan *plan,
+                              OdError *error);
 OdStatus od_allocate(const OdAssignments *wanted,
                      const uint16_t *occupied,
                      size_t occupied_count,

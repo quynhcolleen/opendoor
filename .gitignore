@@ -4,7 +4,8 @@
 /build-release/
 /build-local/
 /dist/
-/tests/
+/tests/*
+!/tests/test_tui_pty.py
 /OPENDOOR_PLAN.md
 /.cache/
 /.superpowers/

@@ -58,14 +58,19 @@ static uint16_t find_replacement(uint16_t old_port,
     return 0U;
 }
 
-OdStatus od_allocate(const OdAssignments *wanted,
-                     const uint16_t *occupied,
-                     size_t occupied_count,
-                     OdAllocationPlan *plan,
-                     OdError *error) {
-    if (wanted == NULL || plan == NULL || (occupied_count > 0U && occupied == NULL)) {
+OdStatus od_allocate_selected(const OdAssignments *wanted,
+                              const uint16_t *occupied,
+                              size_t occupied_count,
+                              const bool *must_reassign,
+                              size_t must_reassign_count,
+                              OdAllocationPlan *plan,
+                              OdError *error) {
+    if (wanted == NULL || plan == NULL ||
+        (occupied_count > 0U && occupied == NULL) ||
+        must_reassign_count != wanted->count ||
+        (must_reassign_count > 0U && must_reassign == NULL)) {
         od_error_set(error, OD_ERROR_INVALID,
-                     "wanted ports, occupied ports, and output plan are required");
+                     "wanted ports, selection mask, occupied ports, and output plan are required");
         return OD_ERROR_INVALID;
     }
     *plan = (OdAllocationPlan){0};
@@ -98,7 +103,7 @@ OdStatus od_allocate(const OdAssignments *wanted,
     OdStatus status = OD_OK;
     for (size_t index = 0U; index < wanted->count && status == OD_OK; ++index) {
         uint16_t port = wanted->items[index].port;
-        if (blocked[port] || used[port]) continue;
+        if (must_reassign[index] || used[port]) continue;
         status = fill_allocation(&plan->items[index], &wanted->items[index], port, error);
         if (status == OD_OK) {
             allocated[index] = true;
@@ -133,5 +138,38 @@ OdStatus od_allocate(const OdAssignments *wanted,
     } else {
         od_error_clear(error);
     }
+    return status;
+}
+
+OdStatus od_allocate(const OdAssignments *wanted,
+                     const uint16_t *occupied,
+                     size_t occupied_count,
+                     OdAllocationPlan *plan,
+                     OdError *error) {
+    if (wanted == NULL || plan == NULL || (occupied_count > 0U && occupied == NULL)) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "wanted ports, occupied ports, and output plan are required");
+        return OD_ERROR_INVALID;
+    }
+    bool *must_reassign = wanted->count == 0U ? NULL :
+        calloc(wanted->count, sizeof(*must_reassign));
+    bool *blocked = calloc(OD_PORT_COUNT, sizeof(*blocked));
+    if ((wanted->count > 0U && must_reassign == NULL) || blocked == NULL) {
+        free(must_reassign);
+        free(blocked);
+        od_error_set(error, OD_ERROR_MEMORY, "unable to select occupied ports");
+        return OD_ERROR_MEMORY;
+    }
+    for (size_t index = 0U; index < occupied_count; ++index) {
+        blocked[occupied[index]] = true;
+    }
+    for (size_t index = 0U; index < wanted->count; ++index) {
+        must_reassign[index] = blocked[wanted->items[index].port];
+    }
+    free(blocked);
+    OdStatus status = od_allocate_selected(
+        wanted, occupied, occupied_count, must_reassign, wanted->count,
+        plan, error);
+    free(must_reassign);
     return status;
 }

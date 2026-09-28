@@ -51,9 +51,9 @@ void od_render_main_menu(OdCanvas *canvas,
                          bool ascii);
 void od_render_dashboard(OdCanvas *canvas,
                          const OdDashboard *dashboard,
-                         const char *config_path,
                          const char *status,
                          bool ascii);
+size_t od_resolution_visual_line_count(const OdResolution *resolution);
 void od_render_conflicts(OdCanvas *canvas,
                          const OdResolution *resolution,
                          size_t scroll,

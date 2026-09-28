@@ -61,7 +61,8 @@ vendored dependencies and generated output are not treated as project
 declarations. It recognizes only:
 
 1. `docker-compose.yml` and `compose.yaml`;
-2. `.env` and names beginning `.env.`;
+2. `.env` and names beginning `.env.`, except template/sample names described
+   below;
 3. `package.json`;
 4. `Makefile`.
 
@@ -77,7 +78,10 @@ tokens, or ports outside 1 through 65535 are not declarations.
 
 A plain direct integer occurrence is a literal and is auto-write eligible when
 the exact integer token is outside a comment. `.env.*` files are scanned the
-same way as `.env`.
+same way as `.env`, except `.env.example`, `.env.sample`, `.env.template`, and
+any `.env.*` name whose final suffix is `.example`, `.sample`, or `.template`.
+Those files are excluded from discovery entirely and cannot supply values for
+environment-variable reference resolution.
 
 ### Compose parsing
 
@@ -141,27 +145,34 @@ bad file does not hide valid declarations elsewhere.
    under the root. If cwd is unavailable, use the parent directory of its
    canonical executable path. A component-boundary containment check prevents
    `/project-other` from matching `/project`.
-4. Discard unrelated machine listeners from Dashboard presentation. Keep them
-   available to Resolve Conflicts.
+4. Do not emit unrelated machine listeners as standalone Dashboard rows. Keep
+   them available to classify declared rows as `in use (other)` and to Resolve
+   Conflicts.
 5. Deduplicate live occurrences by `(pid, port)` and declarations by
    `(source file, port)`.
-6. For each declaration, mark it running when a project-owned live endpoint
-   has the same port and the same relative containing folder. All declaration
-   rows that meet that condition are marked running, and no extra live row is
-   emitted for the endpoint.
-7. Emit unmatched project-owned live endpoints as undeclared rows with source
-   `live`.
-8. Sort by relative folder path, then port number, then source path for a stable
+6. Mark every declaration `running` when any deduplicated project-owned live
+   endpoint has the same port, regardless of folder. When several endpoints
+   share that port, use relative-folder equality first and source path second
+   only to choose the representative endpoint metadata associated with each
+   declaration row. Do not require a folder match for the `running` status.
+7. Mark a declaration `in use (other)` when its port is occupied only by an
+   endpoint outside the project root or by an endpoint whose ownership metadata
+   is unavailable. Project-owned occupancy takes precedence and yields
+   `running` when both kinds exist.
+8. Emit unmatched project-owned live endpoints as undeclared rows with source
+   `live`, except when any declaration already uses that port. Never emit both
+   a `not running` declared row and an undeclared `live` row for one port.
+9. Sort by relative folder path, then port number, then source path for a stable
    tie-break.
 
 Dashboard columns are:
 
 `PORT | RELATIVE FOLDER | STATUS | SOURCE`
 
-Status is exactly `running` or `not running`. Every displayed folder and
-source path begins `./`; no absolute path is rendered. The existing table
-grid, banner, colors, scrolling, refresh key, back keys, and mouse behavior are
-preserved. The screen contains no confirm or write path.
+Status is exactly `running`, `not running`, or `in use (other)`. Every
+displayed folder and source path begins `./`; no absolute path is rendered.
+The existing table grid, banner, colors, scrolling, refresh key, back keys, and
+mouse behavior are preserved. The screen contains no confirm or write path.
 
 ## Conflict and proposal model
 
@@ -255,6 +266,9 @@ are read-only.
   and asks for refresh.
 - No `popen()` or `system()` is added. The existing scan process execution
   pattern is unchanged.
+- Remove the CLI self-update implementation and flags (`src/update.c`,
+  `include/opendoor/update.h`, and `--update`) plus `opendoor_print_help`; do
+  not restore the removed help/settings/theme modules.
 - The process never writes package.json or Makefile and never rewrites a full
   source file through format serialization.
 
@@ -280,7 +294,13 @@ are read-only.
 - `tests/test_ui.c`: fixed menu, Dashboard read-only/mouse behavior, grouped
   preview, single apply-all action, and manual-only no-Enter state.
 - `CMakeLists.txt`, `README.md`, and `THIRD_PARTY_LICENSES.md`: build/test and
-  user-facing scope documentation. No JSON or YAML vendor dependency is added.
+  user-facing scope documentation. README explicitly states that Compose
+  IP-prefixed mappings are unsupported, `.opendoor.bak` files may need a
+  `.gitignore` entry, and changing a host port does not update other references
+  to the old port. It also states that an already-running stack, especially
+  Docker-published ports owned by `docker-proxy`, is classified as external
+  occupancy; Resolve Conflicts is intended to run before the stack starts. No
+  JSON or YAML vendor dependency is added.
 
 ## Verification
 
@@ -291,9 +311,11 @@ Completion requires:
 2. `ctest --test-dir build --output-on-failure` passes.
 3. Discovery tests cover only the four approved formats and reject unrelated
    files.
-4. Dashboard tests cover declared-running, declared-not-running,
-   project-owned undeclared live, unrelated-live filtering, deduplication,
-   relative paths, and folder/port sorting.
+4. Dashboard tests cover port-wide declared-running matching across folders,
+   declared-not-running, declared-in-use-by-other, ownership precedence,
+   project-owned undeclared live, suppression of duplicate declared/live rows,
+   unrelated-live filtering, deduplication, relative paths, and folder/port
+   sorting.
 5. Persistence tests prove only clean `.env` and Compose literals are written,
    manual sources remain byte-identical, comments/formatting survive, and a
    mid-transaction validation failure restores all targets byte-for-byte.

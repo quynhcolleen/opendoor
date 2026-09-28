@@ -72,7 +72,7 @@ static size_t dashboard_table_capacity(size_t height) {
 }
 
 static size_t conflicts_table_capacity(size_t height) {
-    size_t capacity = height > 14U ? (height - 14U) / 2U : 0U;
+    size_t capacity = height > 12U ? (height - 12U) / 2U : 0U;
     return capacity == 0U ? 1U : capacity;
 }
 
@@ -354,7 +354,6 @@ void od_render_main_menu(OdCanvas *canvas,
 
 void od_render_dashboard(OdCanvas *canvas,
                          const OdDashboard *dashboard,
-                         const char *config_path,
                          const char *status,
                          bool ascii) {
     od_canvas_clear(canvas, OD_ROLE_DEFAULT);
@@ -365,10 +364,9 @@ void od_render_dashboard(OdCanvas *canvas,
 
     od_canvas_write(canvas, 2, 1, "OPEN DOOR / Dashboard",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
-    char path[512];
-    (void)snprintf(path, sizeof(path), "Wanted ports  %s",
-                   config_path == NULL ? ".ports.env" : config_path);
-    od_canvas_write(canvas, 2, 2, path, available_width(canvas, 2),
+    od_canvas_write(canvas, 2, 2,
+                    "Project declarations and live endpoints",
+                    available_width(canvas, 2),
                     OD_ROLE_MUTED, 0U);
     od_canvas_write(canvas, 2, 3,
                     "Pre-start check — stop project services before interpreting conflicts",
@@ -384,16 +382,16 @@ void od_render_dashboard(OdCanvas *canvas,
     od_canvas_write(canvas, box_x + 2, box_y, " Ports in use ",
                     (size_t)inner_width, OD_ROLE_PRIMARY, 1U);
 
-    const size_t column_count = 5U;
+    const size_t column_count = 4U;
     int grid_x = box_x + 2;
     int grid_y = box_y + 2;
     int grid_width = box_width - 4;
     int content_width = grid_width - (int)column_count - 1;
-    int widths[5] = {7, 10, 10, 0, 0};
-    int flexible_width = content_width - widths[0] - widths[1] - widths[2];
-    widths[3] = flexible_width >= 48 ? 24 : flexible_width / 2;
-    widths[4] = flexible_width - widths[3];
-    const char *headers[] = {"PORT", "STATUS", "CONFLICT", "PROCESS", "DIRECTORY"};
+    int widths[4] = {7, 0, 16, 0};
+    int flexible_width = content_width - widths[0] - widths[2];
+    widths[1] = flexible_width >= 48 ? flexible_width / 2 : flexible_width * 2 / 5;
+    widths[3] = flexible_width - widths[1];
+    const char *headers[] = {"PORT", "RELATIVE FOLDER", "STATUS", "SOURCE"};
     draw_grid_rule(canvas, grid_x, grid_y, widths, column_count,
                    ascii, OD_GRID_TOP);
     draw_grid_row(canvas, grid_x, grid_y + 1, widths, headers, column_count,
@@ -410,16 +408,18 @@ void od_render_dashboard(OdCanvas *canvas,
         const OdPortRow *row = &dashboard->rows[index];
         char port[16];
         (void)snprintf(port, sizeof(port), "%u", (unsigned)row->port);
+        const char *row_status = "not running";
+        if (row->status == OD_PORT_RUNNING) row_status = "running";
+        if (row->status == OD_PORT_IN_USE_OTHER) row_status = "in use (other)";
         const char *cells[] = {
             port,
-            row->running ? "running" : "free",
-            row->conflict ? "yes" : "no",
-            row->process,
-            row->directory
+            row->relative_folder,
+            row_status,
+            row->source
         };
-        OdStyleRole role = row->conflict ? OD_ROLE_DANGER :
-            (row->running ? OD_ROLE_SUCCESS : OD_ROLE_DEFAULT);
-        unsigned attributes = row->conflict ? 1U : 0U;
+        OdStyleRole role = row->status == OD_PORT_IN_USE_OTHER ? OD_ROLE_DANGER :
+            (row->status == OD_PORT_RUNNING ? OD_ROLE_SUCCESS : OD_ROLE_DEFAULT);
+        unsigned attributes = row->status == OD_PORT_IN_USE_OTHER ? 1U : 0U;
         int row_y = grid_y + 3 + (int)visible * 2;
         draw_grid_row(canvas, grid_x, row_y, widths, cells, column_count,
                       ascii, role, attributes);
@@ -447,6 +447,111 @@ void od_render_dashboard(OdCanvas *canvas,
                sizeof(dashboard_guide) / sizeof(dashboard_guide[0]));
 }
 
+static bool first_automatic_for_path(const OdResolution *resolution,
+                                     size_t item_index) {
+    const OdResolutionItem *item = &resolution->items[item_index];
+    for (size_t index = 0U; index < item_index; ++index) {
+        if (resolution->items[index].automatic &&
+            strcmp(resolution->items[index].relative_path,
+                   item->relative_path) == 0) return false;
+    }
+    return true;
+}
+
+size_t od_resolution_visual_line_count(const OdResolution *resolution) {
+    if (resolution == NULL || resolution->count == 0U) return 0U;
+    size_t count = 0U;
+    if (resolution->automatic_count > 0U) {
+        ++count;
+        for (size_t index = 0U; index < resolution->count; ++index) {
+            if (!resolution->items[index].automatic) continue;
+            if (first_automatic_for_path(resolution, index)) ++count;
+            count += 2U;
+        }
+    }
+    if (resolution->manual_count > 0U) {
+        ++count;
+        count += resolution->manual_count * 2U;
+    }
+    return count;
+}
+
+static bool resolution_visual_line(const OdResolution *resolution,
+                                   size_t requested,
+                                   char *text,
+                                   size_t capacity,
+                                   OdStyleRole *role,
+                                   unsigned *attributes) {
+    size_t line = 0U;
+    *role = OD_ROLE_DEFAULT;
+    *attributes = 0U;
+    if (resolution->automatic_count > 0U) {
+        if (requested == line++) {
+            (void)snprintf(text, capacity, "Automatic changes");
+            *role = OD_ROLE_PRIMARY;
+            *attributes = 1U;
+            return true;
+        }
+        for (size_t index = 0U; index < resolution->count; ++index) {
+            const OdResolutionItem *item = &resolution->items[index];
+            if (!item->automatic) continue;
+            if (first_automatic_for_path(resolution, index)) {
+                if (requested == line++) {
+                    (void)snprintf(text, capacity, "%s",
+                                   item->relative_path == NULL ? "./?" :
+                                   item->relative_path);
+                    *role = OD_ROLE_MUTED;
+                    *attributes = 1U;
+                    return true;
+                }
+            }
+            if (requested == line++) {
+                (void)snprintf(text, capacity, "%s",
+                               item->line_before == NULL ? "-" : item->line_before);
+                *role = OD_ROLE_DANGER;
+                return true;
+            }
+            if (requested == line++) {
+                (void)snprintf(text, capacity, "%s",
+                               item->line_after == NULL ? "+" : item->line_after);
+                *role = OD_ROLE_SUCCESS;
+                return true;
+            }
+        }
+    }
+    if (resolution->manual_count > 0U) {
+        if (requested == line++) {
+            (void)snprintf(text, capacity,
+                           "Manual suggestions — not applied automatically");
+            *role = OD_ROLE_WARNING;
+            *attributes = 1U;
+            return true;
+        }
+        for (size_t index = 0U; index < resolution->count; ++index) {
+            const OdResolutionItem *item = &resolution->items[index];
+            if (item->automatic) continue;
+            if (requested == line++) {
+                (void)snprintf(text, capacity, "change line %zu in %s to %u",
+                               item->line,
+                               item->relative_path == NULL ? "./?" :
+                               item->relative_path,
+                               (unsigned)item->new_port);
+                *role = OD_ROLE_WARNING;
+                return true;
+            }
+            if (requested == line++) {
+                (void)snprintf(text, capacity, "reason: %s",
+                               item->manual_reason == NULL ||
+                               item->manual_reason[0] == '\0' ?
+                               "manual-only declaration" : item->manual_reason);
+                *role = OD_ROLE_MUTED;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void od_render_conflicts(OdCanvas *canvas,
                          const OdResolution *resolution,
                          size_t scroll,
@@ -463,7 +568,7 @@ void od_render_conflicts(OdCanvas *canvas,
     od_canvas_write(canvas, 2, 1, "OPEN DOOR / Resolve conflicts",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
     od_canvas_write(canvas, 2, 2,
-                    "Pre-start check — occupied configured ports are conflicts",
+                    "Pre-start check — external listeners on declared ports are conflicts",
                     available_width(canvas, 2), OD_ROLE_WARNING, 0U);
 
     int box_x = 1;
@@ -476,6 +581,7 @@ void od_render_conflicts(OdCanvas *canvas,
     od_canvas_write(canvas, box_x + 2, box_y, " Proposed changes ",
                     (size_t)inner_width, OD_ROLE_PRIMARY, 1U);
 
+    size_t visual_count = od_resolution_visual_line_count(resolution);
     if (!prepared) {
         write_centered_in(canvas, box_x + 1, box_width - 2,
                           box_y + box_height / 2,
@@ -486,50 +592,43 @@ void od_render_conflicts(OdCanvas *canvas,
                           box_y + box_height / 2, "No conflicts found",
                           OD_ROLE_SUCCESS, 1U);
     } else {
-        const size_t column_count = 2U;
+        size_t capacity = conflicts_table_capacity(canvas->height);
+        size_t maximum = visual_count > capacity ? visual_count - capacity : 0U;
+        if (scroll > maximum) scroll = maximum;
+        size_t end = scroll + capacity;
+        if (end > visual_count) end = visual_count;
         int grid_x = box_x + 2;
         int grid_y = box_y + 2;
         int grid_width = box_width - 4;
-        int content_width = grid_width - (int)column_count - 1;
-        int widths[2] = {content_width / 2,
-                         content_width - content_width / 2};
-        const char *headers[] = {"OLD PORT", "NEW PORT"};
-        draw_grid_rule(canvas, grid_x, grid_y, widths, column_count,
+        int widths[1] = {grid_width - 2};
+        draw_grid_rule(canvas, grid_x, grid_y, widths, 1U,
                        ascii, OD_GRID_TOP);
-        draw_grid_row(canvas, grid_x, grid_y + 1, widths, headers, column_count,
-                      ascii, OD_ROLE_MUTED, 1U);
-        draw_grid_rule(canvas, grid_x, grid_y + 2, widths, column_count,
-                       ascii, OD_GRID_MIDDLE);
-
-        size_t capacity = conflicts_table_capacity(canvas->height);
-        size_t end = scroll + capacity;
-        if (end > resolution->count) end = resolution->count;
-        size_t visible = 0U;
-        for (size_t index = scroll; index < end; ++index, ++visible) {
-            char old_port[16];
-            char new_port[16];
-            (void)snprintf(old_port, sizeof(old_port), "%u",
-                           (unsigned)resolution->items[index].old_port);
-            (void)snprintf(new_port, sizeof(new_port), "%u",
-                           (unsigned)resolution->items[index].new_port);
-            const char *cells[] = {old_port, new_port};
-            int row_y = grid_y + 3 + (int)visible * 2;
-            draw_grid_row(canvas, grid_x, row_y, widths, cells, column_count,
-                          ascii, OD_ROLE_DEFAULT, 0U);
-            draw_grid_rule(canvas, grid_x, row_y + 1, widths, column_count,
-                           ascii,
-                           index + 1U == end ? OD_GRID_BOTTOM : OD_GRID_MIDDLE);
+        for (size_t index = scroll; index < end; ++index) {
+            char line[OD_PATH_CAP + 160U];
+            OdStyleRole role = OD_ROLE_DEFAULT;
+            unsigned attributes = 0U;
+            (void)resolution_visual_line(resolution, index, line, sizeof(line),
+                                         &role, &attributes);
+            const char *cells[] = {line};
+            size_t visible = index - scroll;
+            int row_y = grid_y + 1 + (int)visible * 2;
+            draw_grid_row(canvas, grid_x, row_y, widths, cells, 1U,
+                          ascii, role, attributes);
+            draw_grid_rule(canvas, grid_x, row_y + 1, widths, 1U,
+                           ascii, index + 1U == end ?
+                           OD_GRID_BOTTOM : OD_GRID_MIDDLE);
         }
         char page[96];
-        size_t first = resolution->count == 0U ? 0U : scroll + 1U;
-        (void)snprintf(page, sizeof(page), "Showing %zu–%zu of %zu conflict(s)",
-                       first, end, resolution->count);
+        size_t first = visual_count == 0U ? 0U : scroll + 1U;
+        (void)snprintf(page, sizeof(page), "Showing %zu–%zu of %zu preview line(s)",
+                       first, end, visual_count);
         od_canvas_write(canvas, box_x + 2, box_y + box_height - 2,
                         page, (size_t)inner_width, OD_ROLE_MUTED, 0U);
     }
 
     status_line(canvas, status);
-    if (resolution != NULL && resolution->count > 0U && apply_available) {
+    if (resolution != NULL && resolution->automatic_count > 0U &&
+        apply_available) {
         draw_guide(canvas, (int)canvas->height - 1, conflicts_apply_guide,
                    sizeof(conflicts_apply_guide) / sizeof(conflicts_apply_guide[0]));
     } else {
