@@ -6,6 +6,7 @@
 typedef struct {
     const char *project_path;
     bool force_ascii;
+    bool update_requested;
 } OpendoorOptions;
 
 int opendoor_parse_args(int argc, char **argv, OpendoorOptions *options);

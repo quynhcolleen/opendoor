@@ -1,6 +1,7 @@
 #include "opendoor/screens.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *const banner[] = {
@@ -19,6 +20,12 @@ static const char *const menu_labels[OD_MENU_COUNT] = {
     "Quit"
 };
 
+static const char *const menu_descriptions[OD_MENU_COUNT] = {
+    "Ports in this project",
+    "Find and fix port clashes",
+    NULL
+};
+
 typedef struct {
     const char *key;
     const char *label;
@@ -30,9 +37,13 @@ typedef struct {
     int panel_width;
     int panel_height;
     int first_item_y;
-    int row_stride;
+    int hints_y;
+    int reminder_y;
+    int subtitle_y;
     int top;
     size_t logo_height;
+    bool show_descriptions;
+    bool show_reminder;
 } OdMenuLayout;
 
 typedef enum {
@@ -41,12 +52,16 @@ typedef enum {
     OD_GRID_BOTTOM
 } OdGridRule;
 
-static const OdGuideItem menu_guide[] = {
-    {"Up/Down", "Navigate"}, {"Enter", "Select"}, {"q", "Quit"}
-};
-
 static const OdGuideItem dashboard_guide[] = {
     {"Up/Down", "Scroll"}, {"r", "Refresh"}, {"q/Esc", "Back"}
+};
+
+static const OdGuideItem menu_unicode_guide[] = {
+    {"↑↓", "Navigate"}, {"Enter", "Select"}, {"q", "Quit"}
+};
+
+static const OdGuideItem menu_ascii_guide[] = {
+    {"Up/Down", "Navigate"}, {"Enter", "Select"}, {"q", "Quit"}
 };
 
 static const OdGuideItem conflicts_apply_guide[] = {
@@ -162,6 +177,33 @@ static void draw_guide(OdCanvas *canvas,
     }
 }
 
+static void draw_centered_guide(OdCanvas *canvas,
+                                int y,
+                                const OdGuideItem *items,
+                                size_t count) {
+    size_t total_width = 0U;
+    for (size_t index = 0U; index < count; ++index) {
+        total_width += od_text_columns(items[index].key) + 1U +
+            od_text_columns(items[index].label);
+        if (index + 1U < count) total_width += 3U;
+    }
+    int x = total_width >= canvas->width ? 0 :
+        (int)((canvas->width - total_width) / 2U);
+    for (size_t index = 0U; index < count; ++index) {
+        size_t key_width = od_text_columns(items[index].key);
+        size_t label_width = od_text_columns(items[index].label);
+        od_canvas_write(canvas, x, y, items[index].key, key_width,
+                        OD_ROLE_PRIMARY, 1U);
+        x += (int)key_width;
+        od_canvas_write(canvas, x, y, " ", 1U, OD_ROLE_MUTED, 0U);
+        ++x;
+        od_canvas_write(canvas, x, y, items[index].label, label_width,
+                        OD_ROLE_MUTED, 0U);
+        x += (int)label_width;
+        if (index + 1U < count) x += 3;
+    }
+}
+
 static void status_line(OdCanvas *canvas, const char *status) {
     if (status == NULL || canvas->height < 2U) return;
     od_canvas_write(canvas, 1, (int)canvas->height - 2, status,
@@ -195,28 +237,174 @@ void od_render_resize_required(OdCanvas *canvas) {
 static OdMenuLayout menu_layout(size_t width, size_t height, bool ascii) {
     size_t logo_height = !ascii && width >= 84U && height >= 26U ?
         sizeof(banner) / sizeof(banner[0]) : 1U;
-    int row_stride = height >= 30U ? 2 : 1;
-    int panel_height = 4 + row_stride * (int)OD_MENU_COUNT;
-    int composition_height = (int)logo_height + 4 + panel_height;
-    int usable_height = (int)height - 3;
-    int top = usable_height > composition_height ?
-        (usable_height - composition_height) / 2 : 0;
-    int panel_width = (int)((width * 2U) / 5U);
-    if (panel_width < 52) panel_width = 52;
-    if (panel_width > 84) panel_width = 84;
+    bool show_descriptions = height >= 22U;
+    bool show_reminder = height >= 20U;
+    int panel_height = 7;
+    int composition_height = (int)logo_height + panel_height + 5 +
+        (show_reminder ? 2 : 0);
+    int top = (int)height > composition_height ?
+        ((int)height - composition_height) / 2 : 0;
+    int panel_width = 58;
     if ((size_t)panel_width > width - 4U) panel_width = (int)width - 4;
     int panel_x = ((int)width - panel_width) / 2;
-    int panel_y = top + (int)logo_height + 4;
+    int subtitle_y = top + (int)logo_height + 1;
+    int panel_y = subtitle_y + 2;
+    int hints_y = panel_y + panel_height + 1;
     return (OdMenuLayout){
         .panel_x = panel_x,
         .panel_y = panel_y,
         .panel_width = panel_width,
         .panel_height = panel_height,
         .first_item_y = panel_y + 2,
-        .row_stride = row_stride,
+        .hints_y = hints_y,
+        .reminder_y = hints_y + 2,
+        .subtitle_y = subtitle_y,
         .top = top,
-        .logo_height = logo_height
+        .logo_height = logo_height,
+        .show_descriptions = show_descriptions,
+        .show_reminder = show_reminder
     };
+}
+
+static int menu_item_y(const OdMenuLayout *layout, size_t item) {
+    return layout->first_item_y + (int)item;
+}
+
+static void draw_menu_frame(OdCanvas *canvas,
+                            const OdMenuLayout *layout,
+                            bool ascii) {
+    const char *top_left = ascii ? "+" : "╭";
+    const char *top_right = ascii ? "+" : "╮";
+    const char *bottom_left = ascii ? "+" : "╰";
+    const char *bottom_right = ascii ? "+" : "╯";
+    const char *horizontal = ascii ? "-" : "─";
+    const char *vertical = ascii ? "|" : "│";
+    const char *title = "|OpenDoor|";
+    int right = layout->panel_x + layout->panel_width - 1;
+    int bottom = layout->panel_y + layout->panel_height - 1;
+
+    od_canvas_put(canvas, layout->panel_x, layout->panel_y,
+                  top_left, OD_ROLE_FOCUSED_BORDER, 0U);
+    od_canvas_put(canvas, right, layout->panel_y,
+                  top_right, OD_ROLE_FOCUSED_BORDER, 0U);
+    od_canvas_put(canvas, layout->panel_x, bottom,
+                  bottom_left, OD_ROLE_FOCUSED_BORDER, 0U);
+    od_canvas_put(canvas, right, bottom,
+                  bottom_right, OD_ROLE_FOCUSED_BORDER, 0U);
+    for (int x = layout->panel_x + 1; x < right; ++x) {
+        od_canvas_put(canvas, x, layout->panel_y,
+                      horizontal, OD_ROLE_FOCUSED_BORDER, 0U);
+        od_canvas_put(canvas, x, bottom,
+                      horizontal, OD_ROLE_FOCUSED_BORDER, 0U);
+    }
+    for (int y = layout->panel_y + 1; y < bottom; ++y) {
+        od_canvas_put(canvas, layout->panel_x, y,
+                      vertical, OD_ROLE_FOCUSED_BORDER, 0U);
+        od_canvas_put(canvas, right, y,
+                      vertical, OD_ROLE_FOCUSED_BORDER, 0U);
+    }
+    int title_x = layout->panel_x +
+        (layout->panel_width - (int)strlen(title)) / 2;
+    od_canvas_write(canvas, title_x, layout->panel_y, title, strlen(title),
+                    OD_ROLE_DEFAULT, 1U);
+}
+
+static void compact_project_path(const char *project,
+                                 char *output,
+                                 size_t output_size) {
+    const char *input = project == NULL || project[0] == '\0' ? "." : project;
+    char resolved[OD_PATH_CAP];
+    const char *source = realpath(input, resolved) == NULL ? input : resolved;
+    char normalized[OD_PATH_CAP];
+    (void)snprintf(normalized, sizeof(normalized), "%s", source);
+    size_t length = strlen(normalized);
+    while (length > 1U && normalized[length - 1U] == '/') {
+        normalized[--length] = '\0';
+    }
+
+    const char *home = getenv("HOME");
+    if (home != NULL && home[0] != '\0') {
+        char resolved_home[OD_PATH_CAP];
+        const char *home_source = realpath(home, resolved_home) == NULL ?
+            home : resolved_home;
+        char normalized_home[OD_PATH_CAP];
+        (void)snprintf(normalized_home, sizeof(normalized_home), "%s", home_source);
+        size_t home_length = strlen(normalized_home);
+        while (home_length > 1U && normalized_home[home_length - 1U] == '/') {
+            normalized_home[--home_length] = '\0';
+        }
+        if (strcmp(normalized, normalized_home) == 0) {
+            (void)snprintf(output, output_size, "~");
+            return;
+        }
+        if (strncmp(normalized, normalized_home, home_length) == 0 &&
+            normalized[home_length] == '/') {
+            if (output_size == 0U) return;
+            if (output_size == 1U) {
+                output[0] = '\0';
+                return;
+            }
+            output[0] = '~';
+            size_t suffix_length = strlen(normalized + home_length);
+            size_t available = output_size - 2U;
+            size_t copied = suffix_length < available ?
+                suffix_length : available;
+            memcpy(output + 1, normalized + home_length, copied);
+            output[copied + 1U] = '\0';
+            return;
+        }
+    }
+
+    char components[OD_PATH_CAP];
+    (void)snprintf(components, sizeof(components), "%s", normalized);
+    char *last_separator = strrchr(components, '/');
+    if (last_separator == NULL) {
+        (void)snprintf(output, output_size, "%s",
+                       components[0] == '\0' ? "project" : components);
+        return;
+    }
+    char *last = last_separator + 1;
+    *last_separator = '\0';
+    char *previous_separator = strrchr(components, '/');
+    const char *previous = previous_separator == NULL ? components : previous_separator + 1;
+    if (previous[0] == '\0') {
+        (void)snprintf(output, output_size, "%s",
+                       last[0] == '\0' ? "project" : last);
+    } else {
+        if (output_size == 0U) return;
+        size_t previous_length = strlen(previous);
+        size_t last_length = strlen(last);
+        size_t used = previous_length < output_size - 1U ?
+            previous_length : output_size - 1U;
+        memcpy(output, previous, used);
+        if (used < output_size - 1U) output[used++] = '/';
+        size_t remaining = output_size - 1U - used;
+        size_t copied = last_length < remaining ? last_length : remaining;
+        memcpy(output + used, last, copied);
+        output[used + copied] = '\0';
+    }
+}
+
+static void write_centered_truncated(OdCanvas *canvas,
+                                     int y,
+                                     const char *text,
+                                     size_t maximum_columns,
+                                     bool ascii,
+                                     OdStyleRole role,
+                                     unsigned attributes) {
+    size_t width = od_text_columns(text);
+    if (width <= maximum_columns) {
+        od_canvas_write_centered(canvas, y, text, role, attributes);
+        return;
+    }
+    const char *ellipsis = ascii ? "..." : "…";
+    size_t ellipsis_width = od_text_columns(ellipsis);
+    if (maximum_columns <= ellipsis_width) return;
+    size_t content_width = maximum_columns - ellipsis_width;
+    int x = ((int)canvas->width - (int)maximum_columns) / 2;
+    od_canvas_write(canvas, x, y, text, content_width, role, attributes);
+    od_canvas_write(canvas, x + (int)content_width, y, ellipsis,
+                    ellipsis_width, role, attributes);
 }
 
 static OdMouseAction guide_action_at(const OdGuideItem *items,
@@ -240,14 +428,15 @@ OdMouseTarget od_menu_mouse_target(size_t width,
                                    int y) {
     if (width < 60U || height < 18U) return (OdMouseTarget){0};
     OdMenuLayout layout = menu_layout(width, height, ascii);
-    int relative = y - layout.first_item_y;
-    if (x < layout.panel_x || x >= layout.panel_x + layout.panel_width ||
-        relative < 0 || relative % layout.row_stride != 0) {
+    if (x <= layout.panel_x || x >= layout.panel_x + layout.panel_width - 1) {
         return (OdMouseTarget){0};
     }
-    size_t item = (size_t)(relative / layout.row_stride);
-    if (item >= (size_t)OD_MENU_COUNT) return (OdMouseTarget){0};
-    return (OdMouseTarget){OD_MOUSE_MENU_ITEM, item};
+    for (size_t item = 0U; item < (size_t)OD_MENU_COUNT; ++item) {
+        if (y == menu_item_y(&layout, item)) {
+            return (OdMouseTarget){OD_MOUSE_MENU_ITEM, item};
+        }
+    }
+    return (OdMouseTarget){0};
 }
 
 OdMouseTarget od_dashboard_mouse_target(size_t width,
@@ -325,31 +514,55 @@ void od_render_main_menu(OdCanvas *canvas,
         }
     }
 
-    char project_line[512];
-    (void)snprintf(project_line, sizeof(project_line), "Project  %s",
-                   project == NULL ? "." : project);
-    od_canvas_write_centered(canvas, top + (int)logo_height + 1,
-                             project_line, OD_ROLE_DEFAULT, 1U);
-    od_canvas_write_centered(canvas, top + (int)logo_height + 2,
-                             "Pre-start port check", OD_ROLE_WARNING, 0U);
+    char compact_project[OD_PATH_CAP];
+    compact_project_path(project, compact_project, sizeof(compact_project));
+    char subtitle[OD_PATH_CAP + 64U];
+    (void)snprintf(subtitle, sizeof(subtitle), "%s%s",
+                   ascii ? "Pre-start port check - " : "Pre-start port check · ",
+                   compact_project);
+    write_centered_truncated(canvas, layout.subtitle_y, subtitle,
+                             canvas->width - 4U, ascii,
+                             OD_ROLE_MUTED, 0U);
 
-    od_canvas_box(canvas, layout.panel_x, layout.panel_y,
-                  layout.panel_width, layout.panel_height,
-                  ascii, OD_ROLE_FOCUSED_BORDER);
+    draw_menu_frame(canvas, &layout, ascii);
     for (size_t index = 0U; index < (size_t)OD_MENU_COUNT; ++index) {
-        char line[96];
         bool is_selected = index == selected;
-        (void)snprintf(line, sizeof(line), "%s %s",
-                       is_selected ? ">" : " ", menu_labels[index]);
-        od_canvas_write(canvas, layout.panel_x + 3,
-                        layout.first_item_y + (int)index * layout.row_stride,
-                        line, (size_t)(layout.panel_width - 6),
+        int row_y = menu_item_y(&layout, index);
+        bool has_description = layout.show_descriptions &&
+            menu_descriptions[index] != NULL;
+        if (is_selected) {
+            for (int x = layout.panel_x + 1;
+                 x < layout.panel_x + layout.panel_width - 1; ++x) {
+                od_canvas_put(canvas, x, row_y,
+                              " ", OD_ROLE_SELECTED, 0U);
+            }
+            od_canvas_put(canvas, layout.panel_x + 2, row_y,
+                          ascii ? ">" : "▶", OD_ROLE_SELECTED, 1U);
+        }
+        od_canvas_write(canvas, layout.panel_x + 4, row_y,
+                        menu_labels[index], 17U,
                         is_selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT,
-                        is_selected ? 1U : 0U);
+                        1U);
+        if (has_description) {
+            int description_x = layout.panel_x + 25;
+            int description_width = layout.panel_x + layout.panel_width - 1 -
+                description_x;
+            od_canvas_write(canvas, description_x, row_y,
+                            menu_descriptions[index],
+                            description_width > 0 ?
+                                (size_t)description_width : 0U,
+                            is_selected ? OD_ROLE_SELECTED : OD_ROLE_MUTED,
+                            0U);
+        }
     }
-    status_line(canvas, status);
-    draw_guide(canvas, (int)canvas->height - 1, menu_guide,
-               sizeof(menu_guide) / sizeof(menu_guide[0]));
+    const OdGuideItem *guide = ascii ? menu_ascii_guide : menu_unicode_guide;
+    draw_centered_guide(canvas, layout.hints_y, guide,
+                        sizeof(menu_ascii_guide) / sizeof(menu_ascii_guide[0]));
+    if (layout.show_reminder && status != NULL) {
+        write_centered_truncated(canvas, layout.reminder_y, status,
+                                 canvas->width - 4U, ascii,
+                                 OD_ROLE_MUTED, 0U);
+    }
 }
 
 void od_render_dashboard(OdCanvas *canvas,
@@ -382,16 +595,27 @@ void od_render_dashboard(OdCanvas *canvas,
     od_canvas_write(canvas, box_x + 2, box_y, " Ports in use ",
                     (size_t)inner_width, OD_ROLE_PRIMARY, 1U);
 
-    const size_t column_count = 4U;
+    const size_t column_count = 5U;
     int grid_x = box_x + 2;
     int grid_y = box_y + 2;
     int grid_width = box_width - 4;
     int content_width = grid_width - (int)column_count - 1;
-    int widths[4] = {7, 0, 16, 0};
-    int flexible_width = content_width - widths[0] - widths[2];
-    widths[1] = flexible_width >= 48 ? flexible_width / 2 : flexible_width * 2 / 5;
-    widths[3] = flexible_width - widths[1];
-    const char *headers[] = {"PORT", "RELATIVE FOLDER", "STATUS", "SOURCE"};
+    int widths[5] = {7, 0, 16, 0, 0};
+    if (content_width >= 80) {
+        widths[3] = 24;
+    } else if (content_width >= 60) {
+        widths[3] = 18;
+    } else {
+        widths[3] = 9;
+    }
+    int path_width = content_width - widths[0] - widths[2] - widths[3];
+    widths[4] = path_width * 2 / 5;
+    if (widths[4] < 8) widths[4] = 8;
+    if (path_width - widths[4] < 8) widths[4] = path_width - 8;
+    widths[1] = path_width - widths[4];
+    const char *headers[] = {
+        "PORT", "RELATIVE FOLDER", "STATUS", "PROCESS", "SOURCE"
+    };
     draw_grid_rule(canvas, grid_x, grid_y, widths, column_count,
                    ascii, OD_GRID_TOP);
     draw_grid_row(canvas, grid_x, grid_y + 1, widths, headers, column_count,
@@ -415,6 +639,7 @@ void od_render_dashboard(OdCanvas *canvas,
             port,
             row->relative_folder,
             row_status,
+            row->process,
             row->source
         };
         OdStyleRole role = row->status == OD_PORT_IN_USE_OTHER ? OD_ROLE_DANGER :
@@ -430,7 +655,11 @@ void od_render_dashboard(OdCanvas *canvas,
         draw_grid_rule(canvas, grid_x, grid_y + 3, widths, column_count,
                        ascii, OD_GRID_BOTTOM);
         write_centered_in(canvas, box_x + 1, box_width - 2,
-                          grid_y + 4, "No ports found",
+                          grid_y + 4, "No ports found in this project",
+                          OD_ROLE_MUTED, 0U);
+        write_centered_in(canvas, box_x + 1, box_width - 2,
+                          grid_y + 5,
+                          "Supported: Compose, .env, package.json, Makefile",
                           OD_ROLE_MUTED, 0U);
     }
 

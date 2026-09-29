@@ -19,6 +19,7 @@ typedef struct {
     OdPortStatus status;
     bool declared;
     char relative_folder[OD_PATH_CAP];
+    char process[OD_PROCESS_CAP];
     char source[OD_PATH_CAP];
 } OdPortRow;
 

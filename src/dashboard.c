@@ -10,6 +10,7 @@ typedef struct {
     uint16_t port;
     bool project_owned;
     char relative_folder[OD_PATH_CAP];
+    char process[OD_PROCESS_CAP];
 } LiveRecord;
 
 static bool checked_copy(char *destination, size_t capacity, const char *source) {
@@ -84,6 +85,19 @@ static bool duplicate_declaration_row(const OdDashboard *dashboard,
     return false;
 }
 
+static void store_process_name(char *destination,
+                               size_t capacity,
+                               const OdEndpoint *endpoint) {
+    const char *name = endpoint->process;
+    if (name[0] == '\0' && endpoint->executable[0] != '\0') {
+        const char *slash = strrchr(endpoint->executable, '/');
+        name = slash == NULL ? endpoint->executable : slash + 1;
+    }
+    if (name[0] == '\0' || !checked_copy(destination, capacity, name)) {
+        (void)checked_copy(destination, capacity, "-");
+    }
+}
+
 static bool port_is_declared(const OdDashboard *dashboard, uint16_t port) {
     for (size_t index = 0U; index < dashboard->count; ++index) {
         if (dashboard->rows[index].declared && dashboard->rows[index].port == port) {
@@ -119,13 +133,15 @@ static const LiveRecord *representative_project_record(
     return best;
 }
 
-static bool any_other_record(const LiveRecord *records,
-                             size_t count,
-                             uint16_t port) {
+static const LiveRecord *representative_other_record(const LiveRecord *records,
+                                                     size_t count,
+                                                     uint16_t port) {
     for (size_t index = 0U; index < count; ++index) {
-        if (records[index].port == port && !records[index].project_owned) return true;
+        if (records[index].port == port && !records[index].project_owned) {
+            return &records[index];
+        }
     }
-    return false;
+    return NULL;
 }
 
 static int compare_rows(const void *left, const void *right) {
@@ -197,6 +213,7 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
         LiveRecord *record = &records[record_count++];
         record->pid = endpoint->pid;
         record->port = endpoint->local_port;
+        store_process_name(record->process, sizeof(record->process), endpoint);
         char *owner = NULL;
         if (owner_directory(endpoint, &owner) &&
             relative_owner_folder(canonical_root, owner, record->relative_folder,
@@ -223,10 +240,17 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
             records, record_count, declaration->port, declaration->relative_folder);
         if (owner != NULL) {
             row->status = OD_PORT_RUNNING;
-        } else if (any_other_record(records, record_count, declaration->port)) {
-            row->status = OD_PORT_IN_USE_OTHER;
         } else {
-            row->status = OD_PORT_NOT_RUNNING;
+            owner = representative_other_record(records, record_count,
+                                                declaration->port);
+            row->status = owner == NULL ? OD_PORT_NOT_RUNNING : OD_PORT_IN_USE_OTHER;
+        }
+        const char *process = owner == NULL ? "-" : owner->process;
+        if (!checked_copy(row->process, sizeof(row->process), process)) {
+            od_error_set(error, OD_ERROR_INVALID,
+                         "dashboard process name exceeds its bound");
+            status = OD_ERROR_INVALID;
+            break;
         }
         ++dashboard->count;
     }
@@ -244,6 +268,12 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
         };
         status = store_row_strings(row, record->relative_folder, "live", error);
         if (status != OD_OK) break;
+        if (!checked_copy(row->process, sizeof(row->process), record->process)) {
+            od_error_set(error, OD_ERROR_INVALID,
+                         "dashboard process name exceeds its bound");
+            status = OD_ERROR_INVALID;
+            break;
+        }
         ++dashboard->count;
     }
     free(records);

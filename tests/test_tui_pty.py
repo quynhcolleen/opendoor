@@ -130,6 +130,7 @@ def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_tui_pty.py /path/to/opendoor")
     binary = os.path.abspath(sys.argv[1])
+    helper_process = Path("/proc/self/comm").read_text(encoding="utf-8").strip()
     listener, conflict_port = listening_socket()
     try:
         with tempfile.TemporaryDirectory(prefix="opendoor-tui-pty-") as temporary:
@@ -143,50 +144,94 @@ def main() -> int:
             try:
                 start = 0
                 session.wait_for("Resolve conflicts", start)
+                assert b"\x1b[38;5;245m" in bytes(session.output), \
+                    "256-color menu did not render muted text with color 245"
 
                 dashboard_mark = session.mark()
-                session.click(30, 14)
+                session.click(50, 14)
                 session.wait_for("RELATIVE FOLDER", dashboard_mark)
+                session.wait_for("PROCESS", dashboard_mark)
 
                 scroll_mark = session.mark()
                 session.wheel_down(50, 18)
                 session.wait_for("20010", scroll_mark)
+                owner_mark = session.mark()
+                for _ in range(8):
+                    session.wheel_down(50, 18)
+                session.wait_for(str(conflict_port), owner_mark)
+                session.wait_for(helper_process, owner_mark)
                 session.click(20, 10)
                 session.drain(0.3)
                 assert env_path.read_bytes() == original, "Dashboard row click modified the fixture"
 
+                refreshed = original + b"REFRESH_PORT=10000\n"
+                env_path.write_bytes(refreshed)
                 refresh_mark = session.mark()
                 session.click(20, HEIGHT - 1)
-                session.wait_for("20000", refresh_mark)
-                assert env_path.read_bytes() == original, "Dashboard refresh modified the fixture"
+                session.wait_for("10000", refresh_mark)
+                assert env_path.read_bytes() == refreshed, "Dashboard refresh modified the fixture"
 
                 menu_mark = session.mark()
                 session.click(33, HEIGHT - 1)
                 session.wait_for("Pre-start port check", menu_mark)
 
                 conflicts_mark = session.mark()
-                session.click(30, 16)
+                session.click(50, 15)
                 session.wait_for("Resolve conflicts", conflicts_mark)
                 session.wait_for("Automatic changes", conflicts_mark)
                 session.click(20, 10)
                 session.wheel_down(50, 18)
                 session.drain(0.3)
-                assert env_path.read_bytes() == original, "Resolve row click modified the fixture"
+                assert env_path.read_bytes() == refreshed, "Resolve row click modified the fixture"
 
                 return_mark = session.mark()
                 session.click(40, HEIGHT - 1)
                 session.wait_for("Pre-start port check", return_mark)
-                assert env_path.read_bytes() == original, "Resolve cancel modified the fixture"
+                assert env_path.read_bytes() == refreshed, "Resolve cancel modified the fixture"
                 assert not Path(f"{env_path}.opendoor.bak").exists(), \
                     "Resolve cancel created a backup"
 
-                session.click(30, 18)
+                session.click(50, 16)
                 session.finish()
             except BaseException:
                 session.abort()
                 raise
     finally:
         listener.close()
+
+    with tempfile.TemporaryDirectory(prefix="opendoor-tui-empty-") as temporary:
+        project = Path(temporary)
+        session = Session(binary, project)
+        try:
+            session.wait_for("Resolve conflicts", 0)
+            dashboard_mark = session.mark()
+            session.send(b"\r")
+            session.wait_for("No ports found in this project", dashboard_mark)
+            empty_screen = session.plain_since(dashboard_mark)
+            assert b"Compose" in empty_screen
+            assert b".env" in empty_screen
+            assert b"package.json" in empty_screen
+            assert b"Makefile" in empty_screen
+
+            # A selection key already queued behind q must not cross the screen
+            # boundary and immediately reopen the default Dashboard item.
+            menu_mark = session.mark()
+            session.send(b"q\r")
+            session.wait_for("Pre-start port check", menu_mark)
+            time.sleep(0.2)
+            resolve_mark = session.mark()
+            session.click(50, 15)
+            session.wait_for("OPEN DOOR / Resolve conflicts", resolve_mark,
+                             timeout=2.0)
+
+            back_mark = session.mark()
+            session.send(b"q")
+            session.wait_for("Pre-start port check", back_mark)
+            session.click(50, 16)
+            session.finish()
+        except BaseException:
+            session.abort()
+            raise
     print("PTY mouse checks passed")
     return 0
 
