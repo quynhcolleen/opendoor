@@ -5,8 +5,7 @@
 /build-local/
 /dist/
 /docs/
-/tests/*
-!/tests/test_tui_pty.py
+/tests/
 /OPENDOOR_PLAN.md
 /.cache/
 /.superpowers/
