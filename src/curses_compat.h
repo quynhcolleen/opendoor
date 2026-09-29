@@ -34,6 +34,7 @@ int set_escdelay(int milliseconds);
 void wtimeout(WINDOW *window, int delay);
 int wgetch(WINDOW *window);
 int ungetch(int character);
+int flushinp(void);
 int getmaxx(const WINDOW *window);
 int getmaxy(const WINDOW *window);
 int werase(WINDOW *window);
@@ -46,6 +47,7 @@ int start_color(void);
 int use_default_colors(void);
 int has_colors(void);
 int init_pair(short pair, short foreground, short background);
+extern int COLORS;
 mmask_t mousemask(mmask_t newmask, mmask_t *oldmask);
 int getmouse(MEVENT *event);
 
@@ -69,6 +71,7 @@ int getmouse(MEVENT *event);
 #define BUTTON1_DOUBLE_CLICKED ((mmask_t)0x00000008UL)
 #define BUTTON4_PRESSED ((mmask_t)0x00010000UL)
 #define BUTTON5_PRESSED ((mmask_t)0x00200000UL)
+#define A_DIM 0x00100000
 #define A_REVERSE 0x00040000
 #define A_BOLD 0x00200000
 #define COLOR_PAIR(number) ((number) << 8)

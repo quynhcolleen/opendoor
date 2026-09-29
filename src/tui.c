@@ -25,6 +25,7 @@
 static volatile sig_atomic_t interrupted = 0;
 static WINDOW *terminal_window = NULL;
 static bool terminal_uses_color = false;
+static bool terminal_muted_uses_dim = true;
 
 enum {
     OD_COLOR_BLACK = 0,
@@ -52,12 +53,13 @@ static int role_attributes(OdStyleRole role, unsigned attributes) {
     int result = terminal_uses_color ? (int)COLOR_PAIR((int)role + 1) : 0;
     if ((attributes & 1U) != 0U) result |= A_BOLD;
     if ((attributes & 2U) != 0U) result |= A_REVERSE;
+    if (role == OD_ROLE_MUTED && terminal_muted_uses_dim) result |= A_DIM;
     if (!terminal_uses_color && role == OD_ROLE_SELECTED) result |= A_REVERSE;
     return result;
 }
 
 static bool initialize_colors(void) {
-    static const short foreground[OD_ROLE_COUNT] = {
+    short foreground[OD_ROLE_COUNT] = {
         OD_COLOR_WHITE,
         OD_COLOR_CYAN,
         OD_COLOR_GREEN,
@@ -71,11 +73,22 @@ static bool initialize_colors(void) {
     static const short background[OD_ROLE_COUNT] = {
         -1, -1, -1, -1, -1, -1, OD_COLOR_CYAN, -1, -1
     };
+    terminal_muted_uses_dim = true;
     if (!has_colors() || start_color() == ERR) return false;
     (void)use_default_colors();
+    if (COLORS >= 256) {
+        foreground[OD_ROLE_MUTED] = 245;
+        terminal_muted_uses_dim = false;
+    } else if (COLORS >= 9) {
+        foreground[OD_ROLE_MUTED] = 8;
+        terminal_muted_uses_dim = false;
+    }
     for (size_t role = 0U; role < OD_ROLE_COUNT; ++role) {
         if (init_pair((short)(role + 1U), foreground[role],
-                      background[role]) == ERR) return false;
+                      background[role]) == ERR) {
+            terminal_muted_uses_dim = true;
+            return false;
+        }
     }
     return true;
 }
@@ -430,12 +443,14 @@ int od_tui_run(const OpendoorOptions *options) {
     wtimeout(terminal_window, -1);
 
     bool running = true;
+    bool menu_ascii = options->force_ascii || !terminal_uses_color;
     char menu_status[OD_ERROR_MESSAGE_CAP] = "Run before starting project services";
     while (running && !interrupted) {
-        OdMenuItem item = run_menu(project, options->force_ascii, menu_status);
+        OdMenuItem item = run_menu(project, menu_ascii, menu_status);
         switch (item) {
             case OD_MENU_DASHBOARD:
                 run_dashboard(project, options->force_ascii);
+                (void)flushinp();
                 set_status(menu_status, sizeof(menu_status), "Returned from Dashboard");
                 break;
             case OD_MENU_RESOLVE_CONFLICTS:

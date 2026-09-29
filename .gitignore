@@ -4,6 +4,7 @@
 /build-release/
 /build-local/
 /dist/
+/docs/
 /tests/*
 !/tests/test_tui_pty.py
 /OPENDOOR_PLAN.md
@@ -14,3 +15,5 @@
 *.swp
 .ports.env
 .ports.env.opendoor.bak
+/.agents/
+/.codex/

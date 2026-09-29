@@ -42,6 +42,7 @@ add_library(opendoor_core
   src/dashboard.c
   src/persistence.c
   src/resolution.c
+  src/update.c
 )
 target_include_directories(opendoor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(opendoor_core PUBLIC OPENDOOR_VERSION="${PROJECT_VERSION}")

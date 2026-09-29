@@ -20,6 +20,19 @@
 
 #define OD_PROC_FILE_LIMIT (32U * 1024U * 1024U)
 
+enum {
+    OD_SOCKET_STATE_UDP_UNCONNECTED = 7U,
+    OD_SOCKET_STATE_TCP_LISTEN = 10U
+};
+
+static bool is_bound_endpoint(unsigned protocol,
+                              unsigned state,
+                              uint16_t remote_port) {
+    if (protocol == OD_PROTOCOL_TCP) return state == OD_SOCKET_STATE_TCP_LISTEN;
+    return protocol == OD_PROTOCOL_UDP &&
+           state == OD_SOCKET_STATE_UDP_UNCONNECTED && remote_port == 0U;
+}
+
 static uint64_t fnv1a(const void *data, size_t length, uint64_t hash) {
     const unsigned char *bytes = data;
     for (size_t index = 0U; index < length; ++index) {
@@ -272,6 +285,9 @@ OdStatus od_parse_proc_net(const char *text,
             status = OD_ERROR_INVALID;
             break;
         }
+        if (!is_bound_endpoint(protocol, endpoint.state, endpoint.remote_port)) {
+            continue;
+        }
         endpoint.uid = (uid_t)strtoul(fields[7], &end, 10);
         if (end == fields[7] || *end != '\0') {
             od_error_set(error, OD_ERROR_INVALID, "malformed proc socket uid");
@@ -331,7 +347,9 @@ static OdStatus scan_netlink_query(int socket_fd,
     message.header.nlmsg_seq = sequence;
     message.request.sdiag_family = (uint8_t)family;
     message.request.sdiag_protocol = (uint8_t)ip_protocol;
-    message.request.idiag_states = UINT32_MAX;
+    unsigned requested_state = ip_protocol == IPPROTO_TCP ?
+        OD_SOCKET_STATE_TCP_LISTEN : OD_SOCKET_STATE_UDP_UNCONNECTED;
+    message.request.idiag_states = UINT32_C(1) << requested_state;
     if (send(socket_fd, &message, sizeof(message), 0) < 0) {
         od_error_set(error, OD_ERROR_IO, "unable to request kernel socket diagnostics");
         return OD_ERROR_IO;
@@ -371,6 +389,10 @@ static OdStatus scan_netlink_query(int socket_fd,
             endpoint.remote_port = ntohs(diagnostic->id.idiag_dport);
             endpoint.uid = diagnostic->idiag_uid;
             endpoint.inode = diagnostic->idiag_inode;
+            if (!is_bound_endpoint(endpoint.protocol, endpoint.state,
+                                   endpoint.remote_port)) {
+                continue;
+            }
             diag_address(family, diagnostic->id.idiag_src, endpoint.local_address,
                          sizeof(endpoint.local_address));
             diag_address(family, diagnostic->id.idiag_dst, endpoint.remote_address,

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -93,14 +94,16 @@ static const OdPortDeclaration *find_env_definition(
                                  environment_key);
 }
 
-static void test_proc_socket_parsing_and_deduplication(void) {
+static void test_proc_socket_parsing_keeps_only_listeners_and_bound_udp(void) {
     const char *tcp4 =
         "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
         "   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 11111\n"
-        "   1: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 11111\n";
+        "   1: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 11111\n"
+        "   2: 0100007F:C350 0100007F:01BB 01 00000000:00000000 00:00000000 00000000 1000 0 33333\n";
     const char *udp6 =
         "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
-        "   0: 00000000000000000000000000000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 1001 0 22222\n";
+        "   0: 00000000000000000000000000000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 1001 0 22222\n"
+        "   1: 00000000000000000000000000000000:C351 00000000000000000000000000000000:0035 01 00000000:00000000 00:00000000 00000000 1001 0 44444\n";
     OdScanSnapshot snapshot;
     OdError error;
     od_scan_snapshot_init(&snapshot, 7U);
@@ -116,6 +119,57 @@ static void test_proc_socket_parsing_and_deduplication(void) {
         CHECK(snapshot.endpoints[1].protocol == OD_PROTOCOL_UDP);
     }
     od_scan_snapshot_free(&snapshot);
+}
+
+static void test_live_socket_scan_excludes_established_client_ports(void) {
+    int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(listener >= 0);
+    if (listener < 0) return;
+
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = 0
+    };
+    CHECK(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    CHECK(listen(listener, 1) == 0);
+    socklen_t address_length = sizeof(address);
+    CHECK(getsockname(listener, (struct sockaddr *)&address, &address_length) == 0);
+    uint16_t listener_port = ntohs(address.sin_port);
+
+    int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(client >= 0);
+    if (client < 0) {
+        (void)close(listener);
+        return;
+    }
+    CHECK(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
+    int accepted = accept(listener, NULL, NULL);
+    CHECK(accepted >= 0);
+    struct sockaddr_in client_address = {0};
+    address_length = sizeof(client_address);
+    CHECK(getsockname(client, (struct sockaddr *)&client_address,
+                      &address_length) == 0);
+    uint16_t client_port = ntohs(client_address.sin_port);
+
+    OdScanSnapshot snapshot;
+    OdError error;
+    od_scan_snapshot_init(&snapshot, 8U);
+    CHECK(od_scan_sockets(&snapshot, &error) == OD_OK);
+    bool found_listener = false;
+    bool found_client = false;
+    for (size_t index = 0U; index < snapshot.endpoint_count; ++index) {
+        const OdEndpoint *endpoint = &snapshot.endpoints[index];
+        if (endpoint->protocol != OD_PROTOCOL_TCP) continue;
+        if (endpoint->local_port == listener_port) found_listener = true;
+        if (endpoint->local_port == client_port) found_client = true;
+    }
+    CHECK(found_listener);
+    CHECK(!found_client);
+    od_scan_snapshot_free(&snapshot);
+    if (accepted >= 0) (void)close(accepted);
+    (void)close(client);
+    (void)close(listener);
 }
 
 static void test_socket_inode_target(void) {
@@ -858,7 +912,8 @@ static void test_dashboard_project_ownership_and_all_declaration_matches(void) {
 }
 
 int main(void) {
-    test_proc_socket_parsing_and_deduplication();
+    test_proc_socket_parsing_keeps_only_listeners_and_bound_udp();
+    test_live_socket_scan_excludes_established_client_ports();
     test_socket_inode_target();
     test_occupied_ports_are_unique_and_sorted();
     test_recursive_env_discovery_records_exact_spans();
