@@ -277,6 +277,62 @@ static bool identifier_continue(unsigned char character) {
     return character == '_' || isalnum(character) != 0;
 }
 
+static bool port_key_segment(const char *key, size_t length) {
+    size_t segment_start = 0U;
+    for (size_t cursor = 0U; cursor <= length; ++cursor) {
+        if (cursor < length && key[cursor] != '_') continue;
+        size_t segment_length = cursor - segment_start;
+        if (segment_length == 4U &&
+            toupper((unsigned char)key[segment_start]) == 'P' &&
+            toupper((unsigned char)key[segment_start + 1U]) == 'O' &&
+            toupper((unsigned char)key[segment_start + 2U]) == 'R' &&
+            toupper((unsigned char)key[segment_start + 3U]) == 'T') {
+            return true;
+        }
+        segment_start = cursor + 1U;
+    }
+    return false;
+}
+
+static bool case_insensitive_key(const char *key,
+                                 size_t length,
+                                 const char *expected) {
+    size_t expected_length = strlen(expected);
+    if (length != expected_length) return false;
+    for (size_t index = 0U; index < length; ++index) {
+        if (toupper((unsigned char)key[index]) !=
+            toupper((unsigned char)expected[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool address_key_allowlisted(const char *key, size_t length) {
+    return case_insensitive_key(key, length, "ADDR") ||
+           case_insensitive_key(key, length, "LISTEN") ||
+           case_insensitive_key(key, length, "BIND");
+}
+
+static bool valid_env_host(const char *text, size_t length) {
+    if (length == 0U) return true;
+    size_t label_start = 0U;
+    for (size_t cursor = 0U; cursor <= length; ++cursor) {
+        if (cursor < length && text[cursor] != '.') {
+            unsigned char character = (unsigned char)text[cursor];
+            if (isalnum(character) == 0 && character != '-') return false;
+            continue;
+        }
+        if (cursor == label_start ||
+            isalnum((unsigned char)text[label_start]) == 0 ||
+            isalnum((unsigned char)text[cursor - 1U]) == 0) {
+            return false;
+        }
+        label_start = cursor + 1U;
+    }
+    return true;
+}
+
 static OdStatus parse_env_text(OdProjectDiscovery *result,
                                const char *absolute_path,
                                const char *relative_path,
@@ -310,12 +366,35 @@ static OdStatus parse_env_text(OdProjectDiscovery *result,
                 if (cursor < content_end && (text[cursor] == '\'' || text[cursor] == '"')) {
                     quote = text[cursor++];
                 }
-                size_t port_start = cursor;
-                while (cursor < content_end && isdigit((unsigned char)text[cursor]) != 0) {
-                    ++cursor;
+                bool named_port = port_key_segment(text + key_start,
+                                                   key_end - key_start);
+                bool address_key = address_key_allowlisted(text + key_start,
+                                                           key_end - key_start);
+                size_t port_start = SIZE_MAX;
+                if (named_port || !address_key) {
+                    port_start = cursor;
+                    while (cursor < content_end &&
+                           isdigit((unsigned char)text[cursor]) != 0) {
+                        ++cursor;
+                    }
+                } else if (address_key) {
+                    size_t host_start = cursor;
+                    while (cursor < content_end && text[cursor] != ':' &&
+                           text[cursor] != quote && text[cursor] != ' ' &&
+                           text[cursor] != '\t' && text[cursor] != '#') {
+                        ++cursor;
+                    }
+                    if (cursor < content_end && text[cursor] == ':' &&
+                        valid_env_host(text + host_start, cursor - host_start)) {
+                        port_start = ++cursor;
+                        while (cursor < content_end &&
+                               isdigit((unsigned char)text[cursor]) != 0) {
+                            ++cursor;
+                        }
+                    }
                 }
                 size_t port_end = cursor;
-                bool complete = port_end > port_start;
+                bool complete = port_start != SIZE_MAX && port_end > port_start;
                 if (quote != '\0') {
                     complete = complete && cursor < content_end && text[cursor] == quote;
                     if (complete) ++cursor;
@@ -325,17 +404,14 @@ static OdStatus parse_env_text(OdProjectDiscovery *result,
                 complete = complete && (cursor == content_end || text[cursor] == '#');
                 bool direct_port = false;
                 if (complete) {
-                    unsigned long numeric = 0UL;
-                    for (size_t index = port_start; index < port_end; ++index) {
-                        numeric = numeric * 10UL + (unsigned long)(text[index] - '0');
-                        if (numeric > 65535UL) break;
-                    }
-                    if (numeric >= 1UL && numeric <= 65535UL) {
-                        direct_port = true;
+                    uint16_t port = 0U;
+                    if (parse_port_number(text + port_start,
+                                          port_end - port_start, &port)) {
+                        direct_port = !address_key;
                         OdStatus status = append_env_declaration(
                             result, absolute_path, relative_path, text + line_start,
                             content_end - line_start, text + key_start,
-                            key_end - key_start, (uint16_t)numeric, line_number,
+                            key_end - key_start, port, line_number,
                             port_start - line_start + 1U, port_start,
                             port_end - port_start, length, file_hash, error);
                         if (status != OD_OK) return status;
@@ -1101,7 +1177,117 @@ static bool command_space(char character) {
            character == '\r' || character == '\n';
 }
 
+static bool command_horizontal_space(char character) {
+    return character == ' ' || character == '\t';
+}
+
+static bool command_separator(char character) {
+    return character == ';' || character == '|' || character == '&' ||
+           character == '\r' || character == '\n';
+}
+
+static bool command_source_span_contiguous(const JsonString *command,
+                                           size_t start,
+                                           size_t end) {
+    if (start >= end) return false;
+    for (size_t index = start + 1U; index < end; ++index) {
+        if (command->source_offsets[index] !=
+            command->source_offsets[start] + index - start) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool package_assignment_prefix_end(const JsonString *command,
+                                          size_t *assignment_end) {
+    size_t cursor = 0U;
+    while (cursor < command->length &&
+           command_horizontal_space(command->bytes[cursor])) {
+        ++cursor;
+    }
+    bool found_assignment = false;
+    while (cursor < command->length) {
+        if (!identifier_start((unsigned char)command->bytes[cursor])) {
+            return found_assignment && !command_separator(command->bytes[cursor]);
+        }
+        ++cursor;
+        while (cursor < command->length &&
+               identifier_continue((unsigned char)command->bytes[cursor])) {
+            ++cursor;
+        }
+        if (cursor >= command->length || command->bytes[cursor] != '=') {
+            return found_assignment;
+        }
+        ++cursor;
+        while (cursor < command->length && !command_space(command->bytes[cursor])) {
+            if (command_separator(command->bytes[cursor])) break;
+            ++cursor;
+        }
+        found_assignment = true;
+        *assignment_end = cursor;
+        if (cursor >= command->length || command_separator(command->bytes[cursor])) {
+            return false;
+        }
+        while (cursor < command->length &&
+               command_horizontal_space(command->bytes[cursor])) {
+            ++cursor;
+        }
+        if (cursor >= command->length) return false;
+    }
+    return false;
+}
+
+static bool scan_package_assignment_prefix(JsonParser *parser,
+                                           const JsonString *command) {
+    size_t assignment_end = 0U;
+    if (!package_assignment_prefix_end(command, &assignment_end)) return true;
+    size_t cursor = 0U;
+    while (cursor < assignment_end &&
+           command_horizontal_space(command->bytes[cursor])) {
+        ++cursor;
+    }
+    while (cursor < assignment_end) {
+        size_t key_start = cursor++;
+        while (cursor < assignment_end &&
+               identifier_continue((unsigned char)command->bytes[cursor])) {
+            ++cursor;
+        }
+        size_t key_end = cursor;
+        ++cursor;
+        size_t value_start = cursor;
+        while (cursor < assignment_end &&
+               !command_horizontal_space(command->bytes[cursor])) {
+            ++cursor;
+        }
+        size_t value_end = cursor;
+        uint16_t port = 0U;
+        if (port_key_segment(command->bytes + key_start, key_end - key_start) &&
+            parse_port_number(command->bytes + value_start,
+                              value_end - value_start, &port) &&
+            command_source_span_contiguous(command, value_start, value_end)) {
+            OdStatus status = append_manual_declaration(
+                parser->result, OD_SOURCE_PACKAGE_JSON, OD_DECLARATION_LITERAL,
+                parser->absolute_path, parser->relative_path, parser->text,
+                parser->length, parser->file_hash, port,
+                command->bytes + key_start, key_end - key_start,
+                command->source_offsets[value_start], value_end - value_start,
+                "package.json scripts are manual-only", parser->error);
+            if (status != OD_OK) {
+                parser->status = status;
+                return false;
+            }
+        }
+        while (cursor < assignment_end &&
+               command_horizontal_space(command->bytes[cursor])) {
+            ++cursor;
+        }
+    }
+    return true;
+}
+
 static bool scan_package_command(JsonParser *parser, const JsonString *command) {
+    if (!scan_package_assignment_prefix(parser, command)) return false;
     size_t cursor = 0U;
     while (cursor < command->length) {
         size_t flag_length = 0U;
@@ -1128,13 +1314,8 @@ static bool scan_package_command(JsonParser *parser, const JsonString *command) 
         uint16_t port = 0U;
         bool boundary = number_end == command->length ||
                         command_space(command->bytes[number_end]);
-        bool contiguous = number_end > number_start;
-        for (size_t index = number_start + 1U; contiguous && index < number_end; ++index) {
-            if (command->source_offsets[index] !=
-                command->source_offsets[number_start] + index - number_start) {
-                contiguous = false;
-            }
-        }
+        bool contiguous = command_source_span_contiguous(command, number_start,
+                                                         number_end);
         if (boundary && contiguous &&
             parse_port_number(command->bytes + number_start,
                               number_end - number_start, &port)) {
@@ -1570,13 +1751,24 @@ static OdStatus parse_make_text(OdProjectDiscovery *result,
         while (cursor < content_end &&
                (text[cursor] == ' ' || text[cursor] == '\t')) ++cursor;
         if (cursor < content_end && identifier_start((unsigned char)text[cursor])) {
-            ++cursor;
+            size_t declaration_key_start = cursor++;
             while (cursor < content_end &&
                    identifier_continue((unsigned char)text[cursor])) ++cursor;
+            size_t declaration_key_end = cursor;
             while (cursor < content_end &&
                    (text[cursor] == ' ' || text[cursor] == '\t')) ++cursor;
+            size_t operator_length = 0U;
             if (cursor < content_end && text[cursor] == '=') {
-                ++cursor;
+                operator_length = 1U;
+            } else if (cursor + 1U < content_end &&
+                       (text[cursor] == '?' || text[cursor] == ':') &&
+                       text[cursor + 1U] == '=') {
+                operator_length = 2U;
+            }
+            if (operator_length > 0U &&
+                port_key_segment(text + declaration_key_start,
+                                 declaration_key_end - declaration_key_start)) {
+                cursor += operator_length;
                 while (cursor < content_end &&
                        (text[cursor] == ' ' || text[cursor] == '\t')) ++cursor;
                 size_t value_start = cursor;
@@ -1591,7 +1783,9 @@ static OdStatus parse_make_text(OdProjectDiscovery *result,
                     OdStatus status = append_manual_declaration(
                         result, OD_SOURCE_MAKEFILE, OD_DECLARATION_LITERAL,
                         absolute_path, relative_path, text, length, file_hash,
-                        port, NULL, 0U, value_start, value_end - value_start,
+                        port, text + declaration_key_start,
+                        declaration_key_end - declaration_key_start,
+                        value_start, value_end - value_start,
                         "Makefile declarations are manual-only", error);
                     if (status != OD_OK) return status;
                 } else {
@@ -1785,6 +1979,7 @@ static OdStatus resolve_environment_references(OdProjectDiscovery *result,
         OdPortDeclaration *reference = &result->items[reference_index];
         if ((reference->source_kind != OD_SOURCE_COMPOSE &&
              reference->source_kind != OD_SOURCE_MAKEFILE) ||
+            reference->declaration_kind != OD_DECLARATION_ENV_REFERENCE ||
             reference->environment_key == NULL ||
             reference->environment_key[0] == '\0') {
             continue;
@@ -1861,6 +2056,57 @@ static OdStatus resolve_environment_references(OdProjectDiscovery *result,
     return OD_OK;
 }
 
+static OdStatus prune_unreferenced_non_port_env_literals(
+    OdProjectDiscovery *result,
+    OdError *error) {
+    if (result->count == 0U) return OD_OK;
+    bool *referenced = calloc(result->count, sizeof(*referenced));
+    size_t *new_index = malloc(result->count * sizeof(*new_index));
+    if (referenced == NULL || new_index == NULL) {
+        free(referenced);
+        free(new_index);
+        od_error_set(error, OD_ERROR_MEMORY,
+                     "unable to filter environment declarations");
+        return OD_ERROR_MEMORY;
+    }
+    for (size_t index = 0U; index < result->count; ++index) {
+        new_index[index] = SIZE_MAX;
+        size_t definition = result->items[index].definition_index;
+        if (definition < result->count) referenced[definition] = true;
+    }
+
+    size_t write_index = 0U;
+    for (size_t read_index = 0U; read_index < result->count; ++read_index) {
+        OdPortDeclaration *declaration = &result->items[read_index];
+        bool named_port = declaration->environment_key != NULL &&
+            port_key_segment(declaration->environment_key,
+                             strlen(declaration->environment_key));
+        bool keep = declaration->source_kind != OD_SOURCE_ENV || named_port ||
+                    (declaration->environment_key != NULL &&
+                     address_key_allowlisted(declaration->environment_key,
+                                             strlen(declaration->environment_key))) ||
+                    referenced[read_index];
+        if (!keep) {
+            declaration_free(declaration);
+            continue;
+        }
+        new_index[read_index] = write_index;
+        if (write_index != read_index) {
+            result->items[write_index] = *declaration;
+            *declaration = (OdPortDeclaration){0};
+        }
+        ++write_index;
+    }
+    result->count = write_index;
+    for (size_t index = 0U; index < result->count; ++index) {
+        size_t definition = result->items[index].definition_index;
+        if (definition != SIZE_MAX) result->items[index].definition_index = new_index[definition];
+    }
+    free(referenced);
+    free(new_index);
+    return OD_OK;
+}
+
 OdStatus od_discover_project_ports(const char *project_root,
                                    OdProjectDiscovery *result,
                                    OdError *error) {
@@ -1887,8 +2133,16 @@ OdStatus od_discover_project_ports(const char *project_root,
         od_project_discovery_free(result);
         return status;
     }
-    qsort(result->items, result->count, sizeof(*result->items), compare_declarations);
+    if (result->count > 1U) {
+        qsort(result->items, result->count, sizeof(*result->items),
+              compare_declarations);
+    }
     status = resolve_environment_references(result, error);
+    if (status != OD_OK) {
+        od_project_discovery_free(result);
+        return status;
+    }
+    status = prune_unreferenced_non_port_env_literals(result, error);
     if (status != OD_OK) {
         od_project_discovery_free(result);
         return status;

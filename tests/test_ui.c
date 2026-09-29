@@ -378,14 +378,15 @@ static void test_dashboard_is_read_only(void) {
     od_canvas_free(&canvas);
 }
 
-static void test_dashboard_renders_compact_process_names(void) {
+static void test_dashboard_renders_declaration_names_and_live_processes(void) {
     char project_root[OD_PATH_CAP];
     CHECK(getcwd(project_root, sizeof(project_root)) != NULL);
 
     OdPortDeclaration declaration = {
         .port = 37955U,
         .relative_path = "./services/backend/config/.env.production",
-        .relative_folder = "./services/backend"
+        .relative_folder = "./services/backend",
+        .environment_key = "API_PORT"
     };
     OdProjectDiscovery discovery = {
         .items = &declaration,
@@ -417,7 +418,8 @@ static void test_dashboard_renders_compact_process_names(void) {
     od_render_dashboard(&canvas, &dashboard, "Scan complete", true);
     char *text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "PROCESS") != NULL);
-    CHECK(text != NULL && strstr(text, "project-worker-12345") != NULL);
+    CHECK(text != NULL && strstr(text, "API") != NULL);
+    CHECK(text != NULL && strstr(text, "project-worker-12345") == NULL);
     CHECK(text != NULL && strstr(text, "node") != NULL);
     CHECK(text != NULL &&
           strstr(text, "./services/backend/config/.env.production") == NULL);
@@ -567,7 +569,7 @@ int main(void) {
     test_update_is_cli_only_and_must_be_used_alone();
     test_mouse_targets_match_visible_controls();
     test_dashboard_is_read_only();
-    test_dashboard_renders_compact_process_names();
+    test_dashboard_renders_declaration_names_and_live_processes();
     test_empty_dashboard_explains_supported_project_sources();
     test_conflicts_have_one_whole_plan_action();
     if (failures != 0) {

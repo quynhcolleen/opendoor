@@ -233,7 +233,7 @@ static void test_recursive_env_discovery_records_exact_spans(void) {
     OdProjectDiscovery result;
     OdError error;
     CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
-    CHECK(result.count == 4U);
+    CHECK(result.count == 3U);
 
     const OdPortDeclaration *api_port = find_declaration(&result, "./.env", 3000U);
     CHECK(api_port != NULL);
@@ -259,10 +259,7 @@ static void test_recursive_env_discovery_records_exact_spans(void) {
         CHECK(quoted->byte_offset == 36U);
         CHECK(quoted->byte_length == 4U);
     }
-    const OdPortDeclaration *duplicate =
-        find_env_definition(&result, "./.env", "DUP");
-    CHECK(duplicate != NULL);
-    if (duplicate != NULL) CHECK(duplicate->port == 3000U);
+    CHECK(find_env_definition(&result, "./.env", "DUP") == NULL);
     const OdPortDeclaration *worker =
         find_declaration(&result, "./services/api/.env.local", 9000U);
     CHECK(worker != NULL);
@@ -279,6 +276,132 @@ static void test_recursive_env_discovery_records_exact_spans(void) {
     CHECK(unlink(root_env) == 0);
     CHECK(rmdir(api) == 0);
     CHECK(rmdir(services) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static void test_env_literals_require_a_delimited_port_key(void) {
+    char root[] = "/tmp/opendoor-discovery-env-key-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char env_path[512];
+    (void)snprintf(env_path, sizeof(env_path), "%s/.env", root);
+    write_text_file(env_path,
+                    "MAX_RETRIES=3\n"
+                    "TIMEOUT=30\n"
+                    "WORKERS=4\n"
+                    "PORTAL_URL=5000\n"
+                    "PORT=3000\n"
+                    "API_PORT=3001\n"
+                    "WEB_PORT=3002\n"
+                    "lower_port=3003\n"
+                    "ZERO_PORT=0\n"
+                    "MAX_PORT=65535\n"
+                    "TOO_HIGH_PORT=65536\n");
+
+    OdProjectDiscovery result;
+    OdError error;
+    CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
+    CHECK(result.count == 5U);
+    CHECK(find_env_definition(&result, "./.env", "MAX_RETRIES") == NULL);
+    CHECK(find_env_definition(&result, "./.env", "TIMEOUT") == NULL);
+    CHECK(find_env_definition(&result, "./.env", "WORKERS") == NULL);
+    CHECK(find_env_definition(&result, "./.env", "PORTAL_URL") == NULL);
+    CHECK(find_env_definition(&result, "./.env", "PORT") != NULL);
+    CHECK(find_env_definition(&result, "./.env", "API_PORT") != NULL);
+    CHECK(find_env_definition(&result, "./.env", "WEB_PORT") != NULL);
+    CHECK(find_env_definition(&result, "./.env", "lower_port") != NULL);
+    CHECK(find_env_definition(&result, "./.env", "ZERO_PORT") == NULL);
+    const OdPortDeclaration *maximum =
+        find_env_definition(&result, "./.env", "MAX_PORT");
+    CHECK(maximum != NULL && maximum->port == 65535U);
+    CHECK(find_env_definition(&result, "./.env", "TOO_HIGH_PORT") == NULL);
+
+    od_project_discovery_free(&result);
+    CHECK(unlink(env_path) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static void test_env_key_filter_does_not_block_compose_reference_resolution(void) {
+    char root[] = "/tmp/opendoor-discovery-env-reference-key-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char env_path[512];
+    char compose_path[512];
+    (void)snprintf(env_path, sizeof(env_path), "%s/.env", root);
+    (void)snprintf(compose_path, sizeof(compose_path), "%s/compose.yaml", root);
+    write_text_file(env_path, "SERVICE=27027\n");
+    write_text_file(compose_path,
+                    "services:\n"
+                    "  api:\n"
+                    "    ports:\n"
+                    "      - \"${SERVICE}:80\"\n");
+
+    OdProjectDiscovery result;
+    OdError error;
+    CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
+    const OdPortDeclaration *reference =
+        find_reference(&result, "./compose.yaml", "SERVICE");
+    CHECK(reference != NULL);
+    if (reference != NULL) {
+        CHECK(reference->port == 27027U);
+        CHECK(reference->declaration_kind == OD_DECLARATION_ENV_REFERENCE);
+        CHECK(reference->definition_index < result.count);
+        if (reference->definition_index < result.count) {
+            const OdPortDeclaration *definition =
+                &result.items[reference->definition_index];
+            CHECK(definition->source_kind == OD_SOURCE_ENV);
+            CHECK(strcmp(definition->environment_key, "SERVICE") == 0);
+            CHECK(definition->port == 27027U);
+        }
+    }
+
+    od_project_discovery_free(&result);
+    CHECK(unlink(compose_path) == 0);
+    CHECK(unlink(env_path) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static void test_env_address_keys_extract_auto_write_port_spans(void) {
+    char root[] = "/tmp/opendoor-discovery-env-address-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char env_path[512];
+    (void)snprintf(env_path, sizeof(env_path), "%s/.env", root);
+    const char *env_text =
+        "ADDR=:8080\n"
+        "listen=service.local:9000\n"
+        "BiNd='127.0.0.1:5000' # loopback\n"
+        "HOST=service.local:6000\n"
+        "ADDR=8081\n"
+        "LISTEN=http://service.local:7000\n"
+        "BIND=bad_host:7001\n"
+        "ADDR=:0\n"
+        "LISTEN=host:65536\n";
+    write_text_file(env_path, env_text);
+
+    OdProjectDiscovery result;
+    OdError error;
+    CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
+    CHECK(result.count == 3U);
+    static const uint16_t ports[] = {8080U, 9000U, 5000U};
+    static const char *const keys[] = {"ADDR", "listen", "BiNd"};
+    for (size_t index = 0U; index < sizeof(ports) / sizeof(ports[0]); ++index) {
+        const OdPortDeclaration *item =
+            find_env_definition(&result, "./.env", keys[index]);
+        CHECK(item != NULL);
+        if (item != NULL) {
+            CHECK(item->port == ports[index]);
+            CHECK(item->write_kind == OD_WRITE_ENV_LITERAL);
+            CHECK(item->byte_length == 4U);
+            CHECK(strncmp(env_text + item->byte_offset,
+                          index == 0U ? "8080" : index == 1U ? "9000" : "5000",
+                          4U) == 0);
+        }
+    }
+    CHECK(find_declaration(&result, "./.env", 6000U) == NULL);
+    CHECK(find_declaration(&result, "./.env", 8081U) == NULL);
+    CHECK(find_declaration(&result, "./.env", 7000U) == NULL);
+    CHECK(find_declaration(&result, "./.env", 7001U) == NULL);
+
+    od_project_discovery_free(&result);
+    CHECK(unlink(env_path) == 0);
     CHECK(rmdir(root) == 0);
 }
 
@@ -407,7 +530,8 @@ static void test_env_reference_requires_one_direct_assignment(void) {
     CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
     const OdPortDeclaration *a = find_env_definition(&result, "./.env", "A");
     const OdPortDeclaration *b = find_env_definition(&result, "./.env", "B");
-    CHECK(a != NULL && b != NULL && a != b);
+    CHECK(a == NULL);
+    CHECK(b != NULL);
     const OdPortDeclaration *b_reference =
         find_reference(&result, "./compose.yaml", "B");
     CHECK(b_reference != NULL);
@@ -643,6 +767,13 @@ static void test_package_scripts_are_manual_only(void) {
         "    \"dev\": \"vite --port 5173\",\n"
         "    \"short\": \"serve -p 8080\",\n"
         "    \"escaped\": \"node app --port\\u00209090\",\n"
+        "    \"inline\": \"NODE_ENV=production API_PORT=3000 node server.js\",\n"
+        "    \"lower-inline\": \"web_port=3001 node server.js\",\n"
+        "    \"newline-inline\": \"BREAK_PORT=3004\\nnode server.js\",\n"
+        "    \"portal-inline\": \"PORTAL=3002 node server.js\",\n"
+        "    \"late-inline\": \"node LATE_PORT=3003\",\n"
+        "    \"zero-inline\": \"ZERO_PORT=0 node server.js\",\n"
+        "    \"high-inline\": \"HIGH_PORT=65536 node server.js\",\n"
         "    \"equals\": \"vite --port=7000\",\n"
         "    \"number\": \"echo 7100\"\n"
         "  },\n"
@@ -661,10 +792,18 @@ static void test_package_scripts_are_manual_only(void) {
         find_declaration(&result, "./package.json", 8080U);
     const OdPortDeclaration *escaped =
         find_declaration(&result, "./package.json", 9090U);
+    const OdPortDeclaration *inline_port = find_source_reference(
+        &result, OD_SOURCE_PACKAGE_JSON, "./package.json", "API_PORT");
+    const OdPortDeclaration *lower_inline = find_source_reference(
+        &result, OD_SOURCE_PACKAGE_JSON, "./package.json", "web_port");
     CHECK(long_flag != NULL);
     CHECK(short_flag != NULL);
     CHECK(escaped != NULL);
-    const OdPortDeclaration *items[] = {long_flag, short_flag, escaped};
+    CHECK(inline_port != NULL && inline_port->port == 3000U);
+    CHECK(lower_inline != NULL && lower_inline->port == 3001U);
+    const OdPortDeclaration *items[] = {
+        long_flag, short_flag, escaped, inline_port, lower_inline
+    };
     for (size_t index = 0U; index < sizeof(items) / sizeof(items[0]); ++index) {
         if (items[index] == NULL) continue;
         CHECK(items[index]->source_kind == OD_SOURCE_PACKAGE_JSON);
@@ -677,6 +816,9 @@ static void test_package_scripts_are_manual_only(void) {
         CHECK(strncmp(package_text + escaped->byte_offset, "9090", 4U) == 0);
     }
     CHECK(find_declaration(&result, "./package.json", 6000U) == NULL);
+    CHECK(find_declaration(&result, "./package.json", 3002U) == NULL);
+    CHECK(find_declaration(&result, "./package.json", 3003U) == NULL);
+    CHECK(find_declaration(&result, "./package.json", 3004U) == NULL);
     CHECK(find_declaration(&result, "./package.json", 7000U) == NULL);
     CHECK(find_declaration(&result, "./package.json", 7100U) == NULL);
     CHECK(find_declaration(&result, "./invalid/package.json", 6200U) == NULL);
@@ -704,12 +846,18 @@ static void test_makefile_ports_are_manual_only(void) {
                     "ADMIN_PORT=4200\n");
     const char *make_text =
         "PORT = 3000\n"
+        "DEFAULT_PORT ?= 3001\n"
+        "WEB_PORT := 3002\n"
+        "lower_port?=3003\n"
+        "COMMENT_PORT ?= 6100 # 6101 is documentation\n"
+        "WORKERS = 4\n"
+        "PORTAL := 5000\n"
         "serve:\n"
         "\tvite --port 5173\n"
         "\tserver -p 8080\n"
         "\tproxy --port $API_PORT\n"
         "\tadmin -p ${ADMIN_PORT}\n"
-        "COMMENTED = 6000 # 6100 is documentation\n"
+        "COMMENTED = 6000\n"
         "# PORT=6200\n"
         "COMPUTED = $$(expr 6300 + 1)\n"
         "NESTED = $(shell echo 6400)\n"
@@ -721,7 +869,9 @@ static void test_makefile_ports_are_manual_only(void) {
     OdProjectDiscovery result;
     OdError error;
     CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
-    static const uint16_t literal_ports[] = {3000U, 5173U, 6000U, 8080U};
+    static const uint16_t literal_ports[] = {
+        3000U, 3001U, 3002U, 3003U, 5173U, 6100U, 8080U
+    };
     for (size_t index = 0U;
          index < sizeof(literal_ports) / sizeof(literal_ports[0]); ++index) {
         const OdPortDeclaration *item =
@@ -733,6 +883,14 @@ static void test_makefile_ports_are_manual_only(void) {
             CHECK(item->write_kind == OD_WRITE_MANUAL_ONLY);
         }
     }
+    const OdPortDeclaration *conditional =
+        find_declaration(&result, "./Makefile", 3001U);
+    const OdPortDeclaration *immediate =
+        find_declaration(&result, "./Makefile", 3002U);
+    CHECK(conditional != NULL &&
+          strcmp(conditional->environment_key, "DEFAULT_PORT") == 0);
+    CHECK(immediate != NULL &&
+          strcmp(immediate->environment_key, "WEB_PORT") == 0);
     const OdPortDeclaration *api = find_source_reference(
         &result, OD_SOURCE_MAKEFILE, "./Makefile", "API_PORT");
     const OdPortDeclaration *admin = find_source_reference(
@@ -749,7 +907,10 @@ static void test_makefile_ports_are_manual_only(void) {
         CHECK(admin->definition_index < result.count);
         CHECK(admin->write_kind == OD_WRITE_MANUAL_ONLY);
     }
-    CHECK(find_declaration(&result, "./Makefile", 6100U) == NULL);
+    CHECK(find_declaration(&result, "./Makefile", 6101U) == NULL);
+    CHECK(find_declaration(&result, "./Makefile", 4U) == NULL);
+    CHECK(find_declaration(&result, "./Makefile", 5000U) == NULL);
+    CHECK(find_declaration(&result, "./Makefile", 6000U) == NULL);
     CHECK(find_declaration(&result, "./Makefile", 6200U) == NULL);
     CHECK(find_declaration(&result, "./Makefile", 6300U) == NULL);
     CHECK(find_declaration(&result, "./Makefile", 6400U) == NULL);
@@ -771,6 +932,154 @@ static const OdPortRow *find_dashboard_row(const OdDashboard *dashboard,
         }
     }
     return NULL;
+}
+
+static void test_dashboard_merges_env_definition_with_compose_reference(void) {
+    char root[] = "/tmp/opendoor-dashboard-reference-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char env_path[512];
+    char compose_path[512];
+    (void)snprintf(env_path, sizeof(env_path), "%s/.env", root);
+    (void)snprintf(compose_path, sizeof(compose_path), "%s/docker-compose.yml", root);
+    write_text_file(env_path, "SOME_PORT=27027\n");
+    write_text_file(compose_path,
+                    "services:\n"
+                    "  app:\n"
+                    "    ports:\n"
+                    "      - \"${SOME_PORT}:80\"\n");
+
+    OdProjectDiscovery discovery;
+    OdScanSnapshot snapshot = {0};
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_discover_project_ports(root, &discovery, &error) == OD_OK);
+    CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
+    CHECK(dashboard.count == 1U);
+    if (dashboard.count == 1U) {
+        CHECK(dashboard.rows[0].port == 27027U);
+        CHECK(strcmp(dashboard.rows[0].source,
+                     "./.env, ./docker-compose.yml") == 0);
+        CHECK(strcmp(dashboard.rows[0].process, "SOME") == 0);
+    }
+
+    od_dashboard_free(&dashboard);
+    od_project_discovery_free(&discovery);
+    CHECK(unlink(compose_path) == 0);
+    CHECK(unlink(env_path) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static void test_dashboard_keeps_linked_source_when_same_file_port_is_deduplicated(void) {
+    char root[] = "/tmp/opendoor-dashboard-reference-duplicate-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char env_path[512];
+    char compose_path[512];
+    (void)snprintf(env_path, sizeof(env_path), "%s/.env", root);
+    (void)snprintf(compose_path, sizeof(compose_path), "%s/compose.yaml", root);
+    write_text_file(env_path,
+                    "API_PORT=3000\n"
+                    "WEB_PORT=3000\n");
+    write_text_file(compose_path,
+                    "services:\n"
+                    "  app:\n"
+                    "    ports:\n"
+                    "      - \"${WEB_PORT}:80\"\n");
+
+    OdProjectDiscovery discovery;
+    OdScanSnapshot snapshot = {0};
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_discover_project_ports(root, &discovery, &error) == OD_OK);
+    CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
+    CHECK(dashboard.count == 1U);
+    if (dashboard.count == 1U) {
+        CHECK(strcmp(dashboard.rows[0].source, "./.env, ./compose.yaml") == 0);
+    }
+
+    od_dashboard_free(&dashboard);
+    od_project_discovery_free(&discovery);
+    CHECK(unlink(compose_path) == 0);
+    CHECK(unlink(env_path) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static void test_dashboard_declared_rows_show_variable_or_source_kind(void) {
+    char root[] = "/tmp/opendoor-dashboard-label-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char env_path[512];
+    char compose_path[512];
+    (void)snprintf(env_path, sizeof(env_path), "%s/.env", root);
+    (void)snprintf(compose_path, sizeof(compose_path), "%s/compose.yaml", root);
+    write_text_file(env_path,
+                    "API_PORT=3000\n"
+                    "PORT=3001\n"
+                    "SUPPORT_PORT=3002\n"
+                    "API_PORT_SERVER=3003\n"
+                    "API_PORT_PORT_SERVER=3004\n");
+    write_text_file(compose_path,
+                    "services:\n"
+                    "  web:\n"
+                    "    ports:\n"
+                    "      - \"4000:80\"\n");
+
+    OdProjectDiscovery discovery;
+    OdError error;
+    CHECK(od_discover_project_ports(root, &discovery, &error) == OD_OK);
+    OdEndpoint endpoint = {.local_port = 5000U, .pid = 50};
+    (void)snprintf(endpoint.directory, sizeof(endpoint.directory), "%s", root);
+    (void)snprintf(endpoint.process, sizeof(endpoint.process), "codex");
+    OdScanSnapshot snapshot = {.endpoints = &endpoint, .endpoint_count = 1U};
+    OdDashboard dashboard;
+    CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
+    CHECK(dashboard.count == 7U);
+    const OdPortRow *env = find_dashboard_row(&dashboard, 3000U, "./.env");
+    const OdPortRow *bare = find_dashboard_row(&dashboard, 3001U, "./.env");
+    const OdPortRow *support = find_dashboard_row(&dashboard, 3002U, "./.env");
+    const OdPortRow *middle = find_dashboard_row(&dashboard, 3003U, "./.env");
+    const OdPortRow *repeated = find_dashboard_row(&dashboard, 3004U, "./.env");
+    const OdPortRow *compose =
+        find_dashboard_row(&dashboard, 4000U, "./compose.yaml");
+    const OdPortRow *live = find_dashboard_row(&dashboard, 5000U, "live");
+    CHECK(env != NULL && strcmp(env->process, "API") == 0);
+    CHECK(bare != NULL && strcmp(bare->process, "env") == 0);
+    CHECK(support != NULL && strcmp(support->process, "SUPPORT") == 0);
+    CHECK(middle != NULL && strcmp(middle->process, "API_SERVER") == 0);
+    CHECK(repeated != NULL && strcmp(repeated->process, "API_SERVER") == 0);
+    CHECK(compose != NULL && strcmp(compose->process, "compose") == 0);
+    CHECK(live != NULL && strcmp(live->process, "codex") == 0);
+
+    od_dashboard_free(&dashboard);
+    od_project_discovery_free(&discovery);
+    CHECK(unlink(compose_path) == 0);
+    CHECK(unlink(env_path) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static void test_dashboard_long_declaration_name_falls_back_to_source_kind(void) {
+    char root[] = "/tmp/opendoor-dashboard-long-label-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char key[OD_PROCESS_CAP + 16U];
+    memset(key, 'A', sizeof(key));
+    memcpy(key + sizeof(key) - 6U, "_PORT", 6U);
+    OdPortDeclaration declaration = {
+        .source_kind = OD_SOURCE_ENV,
+        .declaration_kind = OD_DECLARATION_LITERAL,
+        .port = 3000U,
+        .relative_path = "./.env",
+        .relative_folder = "./",
+        .environment_key = key
+    };
+    OdProjectDiscovery discovery = {.items = &declaration, .count = 1U};
+    OdScanSnapshot snapshot = {0};
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
+    CHECK(dashboard.count == 1U);
+    if (dashboard.count == 1U) {
+        CHECK(strcmp(dashboard.rows[0].process, "env") == 0);
+    }
+    od_dashboard_free(&dashboard);
+    CHECK(rmdir(root) == 0);
 }
 
 static void test_dashboard_project_ownership_and_all_declaration_matches(void) {
@@ -911,12 +1220,29 @@ static void test_dashboard_project_ownership_and_all_declaration_matches(void) {
     CHECK(rmdir(root) == 0);
 }
 
+static void test_empty_dashboard_initializes_without_rows(void) {
+    char root[] = "/tmp/opendoor-dashboard-empty-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    OdProjectDiscovery discovery = {0};
+    OdScanSnapshot snapshot = {0};
+    OdDashboard dashboard;
+    OdError error;
+    CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
+    CHECK(dashboard.count == 0U);
+    CHECK(dashboard.rows == NULL);
+    od_dashboard_free(&dashboard);
+    CHECK(rmdir(root) == 0);
+}
+
 int main(void) {
     test_proc_socket_parsing_keeps_only_listeners_and_bound_udp();
     test_live_socket_scan_excludes_established_client_ports();
     test_socket_inode_target();
     test_occupied_ports_are_unique_and_sorted();
     test_recursive_env_discovery_records_exact_spans();
+    test_env_literals_require_a_delimited_port_key();
+    test_env_key_filter_does_not_block_compose_reference_resolution();
+    test_env_address_keys_extract_auto_write_port_spans();
     test_env_template_and_unrelated_files_are_ignored();
     test_compose_block_scalars_are_not_port_sections();
     test_env_reference_requires_one_direct_assignment();
@@ -924,7 +1250,12 @@ int main(void) {
     test_compose_rejects_unsupported_or_ambiguous_mappings();
     test_package_scripts_are_manual_only();
     test_makefile_ports_are_manual_only();
+    test_dashboard_merges_env_definition_with_compose_reference();
+    test_dashboard_keeps_linked_source_when_same_file_port_is_deduplicated();
+    test_dashboard_declared_rows_show_variable_or_source_kind();
+    test_dashboard_long_declaration_name_falls_back_to_source_kind();
     test_dashboard_project_ownership_and_all_declaration_matches();
+    test_empty_dashboard_initializes_without_rows();
     if (failures != 0) {
         fprintf(stderr, "%d scan checks failed\n", failures);
         return 1;

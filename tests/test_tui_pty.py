@@ -130,7 +130,6 @@ def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_tui_pty.py /path/to/opendoor")
     binary = os.path.abspath(sys.argv[1])
-    helper_process = Path("/proc/self/comm").read_text(encoding="utf-8").strip()
     listener, conflict_port = listening_socket()
     try:
         with tempfile.TemporaryDirectory(prefix="opendoor-tui-pty-") as temporary:
@@ -159,7 +158,7 @@ def main() -> int:
                 for _ in range(8):
                     session.wheel_down(50, 18)
                 session.wait_for(str(conflict_port), owner_mark)
-                session.wait_for(helper_process, owner_mark)
+                session.wait_for("CONFLICT", owner_mark)
                 session.click(20, 10)
                 session.drain(0.3)
                 assert env_path.read_bytes() == original, "Dashboard row click modified the fixture"
