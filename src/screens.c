@@ -1,5 +1,6 @@
 #include "opendoor/screens.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,18 @@ static const OdGuideItem conflicts_apply_guide[] = {
 
 static const OdGuideItem conflicts_back_guide[] = {
     {"Up/Down", "Scroll"}, {"q/Esc", "Back"}
+};
+
+static const OdGuideItem history_ready_guide[] = {
+    {"Up/Down", "Select"}, {"Enter", "Revert"}, {"r", "Refresh"}, {"q/Esc", "Back"}
+};
+
+static const OdGuideItem history_back_guide[] = {
+    {"Up/Down", "Select"}, {"r", "Refresh"}, {"q/Esc", "Back"}
+};
+
+static const OdGuideItem history_confirm_guide[] = {
+    {"y", "Confirm revert"}, {"n/q/Esc", "Cancel"}
 };
 
 OdMenuItem od_menu_dispatch(size_t selected) {
@@ -866,4 +879,227 @@ void od_render_conflicts(OdCanvas *canvas,
         draw_guide(canvas, (int)canvas->height - 1, conflicts_back_guide,
                    sizeof(conflicts_back_guide) / sizeof(conflicts_back_guide[0]));
     }
+}
+
+size_t od_history_page_size(size_t height) {
+    size_t capacity = height > 12U ? (height - 12U) / 2U : 0U;
+    return capacity == 0U ? 1U : capacity;
+}
+
+size_t od_history_visible_scroll(size_t count, size_t selected,
+                                 size_t scroll, size_t height) {
+    if (count == 0U) return 0U;
+    if (selected >= count) selected = count - 1U;
+    size_t capacity = od_history_page_size(height);
+    size_t maximum = count > capacity ? count - capacity : 0U;
+    if (scroll > maximum) scroll = maximum;
+    if (selected < scroll) scroll = selected;
+    if (selected - scroll >= capacity) scroll = selected - capacity + 1U;
+    return scroll;
+}
+
+static bool history_ready(const OdHistory *history, size_t selected) {
+    return history != NULL && selected < history->count &&
+        history->items[selected].availability == OD_HISTORY_READY;
+}
+
+/* At 60 columns every header and the widest port change still fit. */
+static void history_column_widths(size_t width, int widths[4]) {
+    widths[0] = width >= 80U ? 26 : 8;
+    widths[2] = 16;
+    widths[3] = 17;
+    widths[1] = (int)width - 7 - widths[0] - widths[2] - widths[3];
+}
+
+OdMouseTarget od_history_mouse_target(size_t width,
+                                      size_t height,
+                                      const OdHistory *history,
+                                      size_t selected,
+                                      size_t scroll,
+                                      bool confirming,
+                                      int x,
+                                      int y) {
+    if (width < 60U || height < 18U || x < 0 || y < 0 ||
+        (size_t)x >= width || (size_t)y >= height) return (OdMouseTarget){0};
+    if (confirming) {
+        static const OdMouseAction actions[] = {OD_MOUSE_HISTORY_CONFIRM, OD_MOUSE_BACK};
+        if ((size_t)y != height - 1U) return (OdMouseTarget){0};
+        return (OdMouseTarget){guide_action_at(history_confirm_guide, actions, 2U, x), 0U};
+    }
+    size_t count = history == NULL ? 0U : history->count;
+    if (count > 0U && selected >= count) selected = count - 1U;
+    if ((size_t)y == height - 1U) {
+        static const OdMouseAction ready_actions[] = {
+            OD_MOUSE_NONE, OD_MOUSE_HISTORY_REVERT, OD_MOUSE_REFRESH, OD_MOUSE_BACK
+        };
+        static const OdMouseAction back_actions[] = {
+            OD_MOUSE_NONE, OD_MOUSE_REFRESH, OD_MOUSE_BACK
+        };
+        bool ready = history_ready(history, selected);
+        return (OdMouseTarget){
+            guide_action_at(ready ? history_ready_guide : history_back_guide,
+                            ready ? ready_actions : back_actions, ready ? 4U : 3U, x),
+            selected
+        };
+    }
+    if (x <= 1 || (size_t)x >= width - 2U || y < 7 || (y - 7) % 2 != 0) {
+        return (OdMouseTarget){0};
+    }
+    scroll = od_history_visible_scroll(count, selected, scroll, height);
+    size_t visible = (size_t)(y - 7) / 2U;
+    if (visible >= od_history_page_size(height) || visible >= count - scroll) {
+        return (OdMouseTarget){0};
+    }
+    size_t item = scroll + visible;
+    int action_x = (int)width - 18;
+    OdMouseAction action = history_ready(history, item) &&
+        x >= action_x && x < action_x + 8 ? OD_MOUSE_HISTORY_REVERT : OD_MOUSE_HISTORY_ROW;
+    return (OdMouseTarget){action, item};
+}
+
+/* Write full detail components directly, clipping only at the canvas edge. */
+static void history_detail_part(OdCanvas *canvas, int *x, const char *text) {
+    if (text == NULL || *x >= (int)canvas->width - 1) return;
+    size_t available = canvas->width - 1U - (size_t)*x;
+    od_canvas_write(canvas, *x, (int)canvas->height - 2, text, available,
+                    OD_ROLE_MUTED, 0U);
+    size_t columns = od_text_columns(text);
+    *x += (int)(columns > available ? available : columns);
+}
+
+static void history_detail(OdCanvas *canvas, const OdHistoryRecord *record) {
+    char change[40];
+    (void)snprintf(change, sizeof(change), " | %u -> %u",
+                   (unsigned)record->old_port, (unsigned)record->new_port);
+    int x = 1;
+    history_detail_part(canvas, &x, record->relative_path);
+    history_detail_part(canvas, &x, " | ");
+    history_detail_part(canvas, &x, record->environment_key == NULL ||
+                         record->environment_key[0] == '\0' ? "-" : record->environment_key);
+    history_detail_part(canvas, &x, change);
+    if (record->availability != OD_HISTORY_READY) {
+        history_detail_part(canvas, &x, " | ");
+        history_detail_part(canvas, &x, record->reason == NULL ?
+                             "Availability has not been checked" : record->reason);
+    }
+}
+
+void od_render_history(OdCanvas *canvas,
+                        const OdHistory *history,
+                        size_t selected,
+                        size_t scroll,
+                        const char *status,
+                        bool ascii) {
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    size_t count = history == NULL ? 0U : history->count;
+    if (count > 0U && selected >= count) selected = count - 1U;
+    /* A refusal message may outlive its selection. Keep record reasons in
+     * the selected detail line even after navigating to another entry. */
+    for (size_t index = 0U; status != NULL && index < count; ++index) {
+        const OdHistoryRecord *record = &history->items[index];
+        if (record->availability != OD_HISTORY_READY && record->reason != NULL &&
+            strcmp(status, record->reason) == 0) {
+            status = "Revert unavailable; select the change for details";
+            break;
+        }
+    }
+    od_canvas_write(canvas, 2, 1, "OPEN DOOR / History",
+                    available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
+    od_canvas_write(canvas, 2, 2, status == NULL ?
+                    "Recorded port changes, newest first" : status,
+                    available_width(canvas, 2), OD_ROLE_MUTED, 0U);
+    if (history != NULL && history->warning_count > 0U) {
+        char warning[OD_ERROR_MESSAGE_CAP + 64U];
+        (void)snprintf(warning, sizeof(warning), "%zu history warning(s): %s",
+                       history->warning_count, history->warnings[0]);
+        od_canvas_write(canvas, 2, 3, warning, available_width(canvas, 2),
+                        OD_ROLE_WARNING, 0U);
+    }
+
+    int widths[4];
+    history_column_widths(canvas->width, widths);
+    const char *headers[] = {"WHEN", "FILE / KEY", "CHANGE", "ACTION / STATUS"};
+    draw_grid_rule(canvas, 1, 4, widths, 4U, ascii, OD_GRID_TOP);
+    draw_grid_row(canvas, 1, 5, widths, headers, 4U, ascii, OD_ROLE_MUTED, 1U);
+    draw_grid_rule(canvas, 1, 6, widths, 4U, ascii, OD_GRID_MIDDLE);
+    scroll = od_history_visible_scroll(count, selected, scroll, canvas->height);
+    size_t visible = count - scroll;
+    size_t capacity = od_history_page_size(canvas->height);
+    if (visible > capacity) visible = capacity;
+    for (size_t offset = 0U; offset < visible; ++offset) {
+        size_t index = scroll + offset;
+        const OdHistoryRecord *record = &history->items[index];
+        int y = 7 + (int)offset * 2;
+        OdStyleRole role = index == selected ? OD_ROLE_SELECTED : OD_ROLE_DEFAULT;
+        if (index == selected) {
+            for (int x = 2; x < (int)canvas->width - 2; ++x) {
+                od_canvas_put(canvas, x, y, " ", role, 0U);
+            }
+        }
+        char file_key[OD_PATH_CAP + 256U];
+        (void)snprintf(file_key, sizeof(file_key), "%s%s%s",
+                       record->relative_path == NULL ? "" : record->relative_path,
+                       record->environment_key == NULL || record->environment_key[0] == '\0' ?
+                       "" : " / ", record->environment_key == NULL ? "" : record->environment_key);
+        char change[32];
+        (void)snprintf(change, sizeof(change), "%u -> %u",
+                       (unsigned)record->old_port, (unsigned)record->new_port);
+        const char *cells[] = {record->timestamp, file_key, change, ""};
+        draw_grid_row(canvas, 1, y, widths, cells, 4U, ascii, role, 0U);
+        bool ready = record->availability == OD_HISTORY_READY;
+        od_canvas_write(canvas, (int)canvas->width - 18, y,
+                        ready ? "[Revert]" : "Unavailable", 15U,
+                        ready ? OD_ROLE_PRIMARY : OD_ROLE_DANGER, 1U);
+        draw_grid_rule(canvas, 1, y + 1, widths, 4U, ascii,
+                       offset + 1U == visible ? OD_GRID_BOTTOM : OD_GRID_MIDDLE);
+    }
+    if (count == 0U) {
+        draw_grid_rule(canvas, 1, 7, widths, 4U, ascii, OD_GRID_BOTTOM);
+        od_canvas_write_centered(canvas, 9, "No history yet", OD_ROLE_MUTED, 0U);
+    } else {
+        history_detail(canvas, &history->items[selected]);
+    }
+    char page[96];
+    (void)snprintf(page, sizeof(page), "Showing %zu%s%zu of %zu change(s)",
+                   count == 0U ? 0U : scroll + 1U, ascii ? "-" : "–",
+                   scroll + visible, count);
+    od_canvas_write(canvas, 2, (int)canvas->height - 4, page,
+                    available_width(canvas, 2), OD_ROLE_MUTED, 0U);
+    bool ready = history_ready(history, selected);
+    draw_guide(canvas, (int)canvas->height - 1,
+               ready ? history_ready_guide : history_back_guide, ready ? 4U : 3U);
+}
+
+void od_render_history_confirmation(OdCanvas *canvas,
+                                     const OdHistoryRecord *record,
+                                     bool ascii) {
+    (void)ascii;
+    od_canvas_clear(canvas, OD_ROLE_DEFAULT);
+    if (canvas->width < 60U || canvas->height < 18U) {
+        od_render_resize_required(canvas);
+        return;
+    }
+    od_canvas_write(canvas, 2, 1, "OPEN DOOR / History",
+                    available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
+    if (record == NULL) return;
+    char heading[80];
+    (void)snprintf(heading, sizeof(heading), "Confirm revert #%" PRIu64, record->id);
+    od_canvas_write(canvas, 2, 4, heading, available_width(canvas, 2), OD_ROLE_WARNING, 1U);
+    od_canvas_write(canvas, 2, 6, record->relative_path,
+                    available_width(canvas, 2), OD_ROLE_DEFAULT, 0U);
+    od_canvas_write(canvas, 2, 7, "Key: ", 5U, OD_ROLE_MUTED, 0U);
+    od_canvas_write(canvas, 7, 7, record->environment_key == NULL ||
+                    record->environment_key[0] == '\0' ? "-" : record->environment_key,
+                    available_width(canvas, 7), OD_ROLE_DEFAULT, 0U);
+    char change[40];
+    (void)snprintf(change, sizeof(change), "Revert %u -> %u",
+                   (unsigned)record->new_port, (unsigned)record->old_port);
+    od_canvas_write(canvas, 2, 9, change, available_width(canvas, 2), OD_ROLE_WARNING, 1U);
+    od_canvas_write(canvas, 2, 11, "Only y or Confirm revert writes. Enter does nothing.",
+                    available_width(canvas, 2), OD_ROLE_MUTED, 0U);
+    draw_guide(canvas, (int)canvas->height - 1, history_confirm_guide, 2U);
 }

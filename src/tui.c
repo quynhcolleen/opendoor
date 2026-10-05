@@ -13,6 +13,7 @@
 #include "opendoor/ui.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <locale.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -421,9 +422,177 @@ static void run_conflicts(const char *project_root, bool ascii) {
     conflict_state_free(&state);
 }
 
-static void run_history(char *menu_status, size_t capacity) {
-    /* The History screen will replace this non-writing entry point. */
-    set_status(menu_status, capacity, "Returned from History");
+typedef struct {
+    OdHistory history;
+    size_t selected;
+    size_t scroll;
+    bool confirming;
+    uint64_t pending_id;
+    char status[OD_ERROR_MESSAGE_CAP * 2U];
+} HistoryState;
+
+static size_t history_index_for_id(const OdHistory *history, uint64_t id) {
+    for (size_t index = 0U; index < history->count; ++index) {
+        if (history->items[index].id == id) return index;
+    }
+    return history->count;
+}
+
+static OdStatus reload_history(HistoryState *state, const char *project_root,
+                                OdError *error) {
+    uint64_t selected_id = state->selected < state->history.count ?
+        state->history.items[state->selected].id : 0U;
+    OdHistory loaded = {0};
+    OdStatus result = od_history_load(project_root, &loaded, error);
+    if (result == OD_OK) result = od_history_refresh(project_root, &loaded, error);
+    if (result != OD_OK) {
+        /* A partially classified refresh must not leave any write target. */
+        for (size_t index = 0U; index < loaded.count; ++index) {
+            loaded.items[index].availability = OD_HISTORY_UNCHECKED;
+        }
+    }
+    od_history_free(&state->history);
+    state->history = loaded;
+    state->selected = history_index_for_id(&loaded, selected_id);
+    if (state->selected == loaded.count) state->selected = 0U;
+    if (result == OD_OK) {
+        set_status(state->status, sizeof(state->status),
+                   "Loaded %zu change(s), newest first", loaded.count);
+    } else {
+        set_status(state->status, sizeof(state->status), "%s", error->message);
+    }
+    return result;
+}
+
+static void begin_history_confirmation(HistoryState *state, const char *project_root) {
+    if (state->selected >= state->history.count ||
+        state->history.items[state->selected].availability != OD_HISTORY_READY) return;
+    uint64_t id = state->history.items[state->selected].id;
+    OdError error;
+    if (reload_history(state, project_root, &error) != OD_OK) return;
+    size_t index = history_index_for_id(&state->history, id);
+    if (index == state->history.count) {
+        set_status(state->status, sizeof(state->status), "Selected history entry no longer exists");
+        return;
+    }
+    state->selected = index;
+    if (state->history.items[index].availability != OD_HISTORY_READY) {
+        set_status(state->status, sizeof(state->status), "Selected change is unavailable");
+        return;
+    }
+    state->pending_id = id;
+    state->confirming = true;
+}
+
+static void confirm_history_revert(HistoryState *state, const char *project_root) {
+    uint64_t id = state->pending_id;
+    OdError error;
+    size_t updated = 0U;
+    OdStatus result = od_history_revert(project_root, id, &updated, &error);
+    char outcome[OD_ERROR_MESSAGE_CAP];
+    if (result == OD_OK) {
+        set_status(outcome, sizeof(outcome), "Reverted history #%" PRIu64 "; updated %zu port(s)",
+                   id, updated);
+    } else {
+        set_status(outcome, sizeof(outcome), "%s", error.message);
+    }
+    state->confirming = false;
+    state->pending_id = 0U;
+    if (reload_history(state, project_root, &error) == OD_OK) {
+        set_status(state->status, sizeof(state->status), "%s", outcome);
+    } else {
+        set_status(state->status, sizeof(state->status), "%s; refresh failed: %s",
+                   outcome, error.message);
+    }
+}
+
+typedef struct {
+    HistoryState *state;
+    bool ascii;
+} HistoryRenderContext;
+
+static void render_history_screen(OdCanvas *canvas, void *opaque) {
+    HistoryRenderContext *context = opaque;
+    HistoryState *state = context->state;
+    if (state->confirming) {
+        size_t index = history_index_for_id(&state->history, state->pending_id);
+        od_render_history_confirmation(canvas, index < state->history.count ?
+                                         &state->history.items[index] : NULL, context->ascii);
+    } else {
+        state->scroll = od_history_visible_scroll(state->history.count, state->selected,
+                                                   state->scroll, canvas->height);
+        od_render_history(canvas, &state->history, state->selected, state->scroll,
+                            state->status, context->ascii);
+    }
+}
+
+static void run_history(const char *project_root, bool ascii) {
+    HistoryState state = {0};
+    OdError error;
+    (void)reload_history(&state, project_root, &error);
+    while (!interrupted) {
+        HistoryRenderContext context = {&state, ascii};
+        (void)draw(render_history_screen, &context);
+        int key = wgetch(terminal_window);
+        int width = getmaxx(terminal_window);
+        int height = getmaxy(terminal_window);
+        bool usable = width >= 60 && height >= 18;
+        if (key == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                if (!state.confirming && (event.bstate & BUTTON4_PRESSED) != 0U) {
+                    state.selected = od_page_target(state.selected, state.history.count, 3U, -1);
+                    continue;
+                }
+                if (!state.confirming && (event.bstate & BUTTON5_PRESSED) != 0U) {
+                    state.selected = od_page_target(state.selected, state.history.count, 3U, 1);
+                    continue;
+                }
+                if ((event.bstate & BUTTON1_CLICKED) != 0U && usable) {
+                    OdMouseTarget target = od_history_mouse_target(
+                        (size_t)width, (size_t)height, &state.history,
+                        state.selected, state.scroll, state.confirming, event.x, event.y);
+                    if (target.action == OD_MOUSE_HISTORY_ROW) {
+                        state.selected = target.item;
+                    } else if (target.action == OD_MOUSE_HISTORY_REVERT) {
+                        state.selected = target.item;
+                        begin_history_confirmation(&state, project_root);
+                        continue;
+                    } else if (target.action == OD_MOUSE_HISTORY_CONFIRM) {
+                        key = 'y';
+                    } else if (target.action == OD_MOUSE_REFRESH) {
+                        key = 'r';
+                    } else if (target.action == OD_MOUSE_BACK) {
+                        key = 'q';
+                    }
+                }
+            }
+        }
+        /* A pending ID stays frozen until explicit confirmation or cancel.
+         * Navigation, Enter, wheel, row clicks and refresh are inert here. */
+        if (state.confirming) {
+            if (key == 'n' || key == 'q' || key == 27) {
+                state.confirming = false;
+                state.pending_id = 0U;
+                set_status(state.status, sizeof(state.status), "Revert cancelled");
+            } else if (key == 'y' && usable) {
+                confirm_history_revert(&state, project_root);
+            }
+            continue;
+        }
+        if (key == KEY_UP) {
+            state.selected = od_page_target(state.selected, state.history.count, 1U, -1);
+        } else if (key == KEY_DOWN) {
+            state.selected = od_page_target(state.selected, state.history.count, 1U, 1);
+        } else if (key == 'r') {
+            (void)reload_history(&state, project_root, &error);
+        } else if ((key == '\n' || key == '\r' || key == KEY_ENTER) && usable) {
+            begin_history_confirmation(&state, project_root);
+        } else if (key == 'q' || key == 27) {
+            break;
+        }
+    }
+    od_history_free(&state.history);
 }
 
 int od_tui_run(const OpendoorOptions *options) {
@@ -466,7 +635,9 @@ int od_tui_run(const OpendoorOptions *options) {
                            "Returned from Resolve conflicts");
                 break;
             case OD_MENU_HISTORY:
-                run_history(menu_status, sizeof(menu_status));
+                run_history(project, options->force_ascii);
+                (void)flushinp();
+                set_status(menu_status, sizeof(menu_status), "Returned from History");
                 break;
             case OD_MENU_QUIT:
             case OD_MENU_COUNT:

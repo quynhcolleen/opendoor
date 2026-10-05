@@ -202,10 +202,16 @@ def main() -> int:
 
                 history_mark = session.mark()
                 session.click(50, 16)
-                session.wait_for("Returned from History", history_mark)
+                session.wait_for("OPEN DOOR / History", history_mark)
+                session.wait_for("No history yet", history_mark)
                 assert env_path.read_bytes() == refreshed, "History modified the fixture"
                 assert not (project / ".opendoor").exists(), \
                     "History created project state"
+
+                history_back = session.mark()
+                session.send(b"q\r")
+                session.wait_for("Pre-start port check", history_back)
+                session.drain(0.2)
 
                 session.click(50, 17)
                 session.finish()

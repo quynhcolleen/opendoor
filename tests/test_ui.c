@@ -1,4 +1,5 @@
 #include "opendoor/app.h"
+#include "opendoor/history.h"
 #include "opendoor/screens.h"
 
 #include <stdio.h>
@@ -593,6 +594,269 @@ static void test_conflicts_have_one_whole_plan_action(void) {
     od_canvas_free(&canvas);
 }
 
+static char *rendered_line(OdCanvas *canvas, size_t y) {
+    OdCanvas line = {canvas->width, 1U, canvas->cells + y * canvas->width};
+    return rendered_text(&line);
+}
+
+static void history_fixture(OdHistoryRecord records[12], OdHistory *history) {
+    static char *paths[] = {
+        "./row-00/.env", "./row-01/.env", "./row-02/.env", "./row-03/.env",
+        "./row-04/.env", "./row-05/.env", "./row-06/.env", "./row-07/.env",
+        "./row-08/.env", "./row-09/.env", "./row-10/.env", "./row-11/.env"
+    };
+    for (size_t index = 0U; index < 12U; ++index) {
+        records[index] = (OdHistoryRecord){
+            .id = 120U - index,
+            .timestamp = "2026-10-05T08:14:22.123Z",
+            .relative_path = paths[index],
+            .environment_key = "PORT",
+            .old_port = (uint16_t)(2000U + index),
+            .new_port = (uint16_t)(3000U + index),
+            .availability = index % 2U == 0U ? OD_HISTORY_READY : OD_HISTORY_UNAVAILABLE,
+            .reason = index % 2U == 0U ? NULL :
+                "The declaration moved; its exact byte span no longer matches. "
+                "Restore the recorded location before trying again."
+        };
+    }
+    *history = (OdHistory){.items = records, .count = 12U};
+}
+
+/* Catches wrapped reasons, unequal row heights, incorrect action text, and
+ * selection paint overwriting the explicit unavailable/ready action roles. */
+static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
+    OdHistoryRecord records[12];
+    OdHistory history;
+    history_fixture(records, &history);
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 240U, 32U, &error) == OD_OK);
+    od_render_history(&canvas, &history, 1U, 0U, "History loaded", true);
+    char *text = rendered_text(&canvas);
+    CHECK(strstr(text, "OPEN DOOR / History") != NULL);
+    CHECK(strstr(text, "WHEN") != NULL);
+    CHECK(strstr(text, "FILE / KEY") != NULL);
+    CHECK(strstr(text, "CHANGE") != NULL);
+    CHECK(strstr(text, "ACTION / STATUS") != NULL);
+    CHECK(strstr(text, "Showing 1-10 of 12 change(s)") != NULL);
+    CHECK(substring_count(text, records[1].reason) == 1U);
+    free(text);
+    for (size_t index = 0U; index < 10U; ++index) {
+        size_t y = 7U + index * 2U;
+        char *line = rendered_line(&canvas, y);
+        char expected[64];
+        (void)snprintf(expected, sizeof(expected), "%u -> %u",
+                       (unsigned)records[index].old_port,
+                       (unsigned)records[index].new_port);
+        CHECK(strstr(line, records[index].relative_path) != NULL);
+        CHECK(strstr(line, expected) != NULL);
+        const char *action = index % 2U == 0U ? "[Revert]" : "Unavailable";
+        CHECK(strstr(line, action) != NULL);
+        CHECK(strstr(line, "declaration") == NULL);
+        CHECK(strstr(line, "Restore") == NULL);
+        CHECK(strcmp(canvas_cell(&canvas, 222U, y)->glyph,
+                     index % 2U == 0U ? "[" : "U") == 0);
+        CHECK(strcmp(canvas_cell(&canvas, 222U + strlen(action), y)->glyph, " ") == 0);
+        for (size_t glyph = 0U; glyph < strlen(action); ++glyph) {
+            const OdCell *cell = canvas_cell(&canvas, 222U + glyph, y);
+            CHECK(cell->role == (index % 2U == 0U ? OD_ROLE_PRIMARY : OD_ROLE_DANGER));
+            CHECK(cell->attributes == 1U);
+        }
+        CHECK(strcmp(canvas_cell(&canvas, 1U, y + 1U)->glyph, "+") == 0);
+        char *separator = rendered_line(&canvas, y + 1U);
+        CHECK(strstr(separator, "Unavailable") == NULL);
+        CHECK(strstr(separator, "declaration") == NULL);
+        free(separator);
+        free(line);
+    }
+    for (size_t y = 0U; y < 30U; ++y) {
+        char *line = rendered_line(&canvas, y);
+        CHECK(strstr(line, "The declaration moved") == NULL);
+        CHECK(strstr(line, "Restore the recorded location") == NULL);
+        free(line);
+    }
+    char *detail = rendered_line(&canvas, 30U);
+    CHECK(strstr(detail, "./row-01/.env | PORT | 2001 -> 3001") != NULL);
+    CHECK(strstr(detail, records[1].reason) != NULL);
+    CHECK(canvas_cell(&canvas, 3U, 9U)->role == OD_ROLE_SELECTED);
+    free(detail);
+
+    /* A refused revert can return the same text as its fresh classification.
+     * That reason still belongs only in the selected bottom status line. */
+    od_render_history(&canvas, &history, 1U, 0U, records[1].reason, true);
+    text = rendered_text(&canvas);
+    CHECK(substring_count(text, records[1].reason) == 1U);
+    free(text);
+
+    od_render_history(&canvas, &history, 0U, 0U, records[1].reason, true);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, records[1].reason) == NULL);
+    free(text);
+
+    od_render_history(&canvas, &history, 0U, 0U, NULL, false);
+    for (size_t glyph = 0U; glyph < 8U; ++glyph) {
+        CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->role == OD_ROLE_PRIMARY);
+        CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->attributes == 1U);
+    }
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "┼") != NULL);
+    CHECK(strstr(text, "The declaration moved") == NULL);
+    free(text);
+    od_canvas_free(&canvas);
+}
+
+/* Catches visual-line pagination, off-by-one row indexes, and text escaping
+ * its cell or the terminal at the existing minimum size. */
+static void test_history_pagination_clipping_and_empty_state(void) {
+    OdHistoryRecord records[12];
+    OdHistory history;
+    history_fixture(records, &history);
+    CHECK(od_history_page_size(18U) == 3U);
+    CHECK(od_history_page_size(32U) == 10U);
+    CHECK(od_history_visible_scroll(12U, 3U, 0U, 18U) == 1U);
+    CHECK(od_history_visible_scroll(12U, 0U, 9U, 18U) == 0U);
+    CHECK(od_history_visible_scroll(12U, 11U, 0U, 18U) == 9U);
+    CHECK(od_history_visible_scroll(12U, SIZE_MAX, SIZE_MAX, 18U) == 9U);
+    CHECK(od_history_visible_scroll(0U, SIZE_MAX, SIZE_MAX, 18U) == 0U);
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
+    od_render_history(&canvas, &history, 11U, SIZE_MAX, NULL, true);
+    char *text = rendered_text(&canvas);
+    CHECK(strstr(text, "Showing 10-12 of 12 change(s)") != NULL);
+    CHECK(strstr(text, "2009 -> 3009") != NULL);
+    CHECK(strstr(text, "2010 -> 3010") != NULL);
+    CHECK(strstr(text, "2011 -> 3011") != NULL);
+    CHECK(strstr(text, "2008 -> 3008") == NULL);
+    CHECK(strstr(text, "ACTION / STATUS") != NULL);
+    CHECK(strstr(text, "FILE / KEY") != NULL);
+    CHECK(strcmp(canvas_cell(&canvas, 58U, 7U)->glyph, "|") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 42U, 7U)->glyph, "U") == 0);
+    free(text);
+    records[10].relative_path = "./a-very-long-directory/another-directory/file.env";
+    records[10].environment_key = "A_VERY_LONG_ENVIRONMENT_KEY";
+    od_render_history(&canvas, &history, 10U, 9U, NULL, true);
+    CHECK(strcmp(canvas_cell(&canvas, 23U, 9U)->glyph, "|") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 25U, 9U)->glyph, "2") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 42U, 9U)->glyph, "[") == 0);
+    char *warnings[] = {"Skipped malformed history line"};
+    OdHistory empty = {.warnings = warnings, .warning_count = 1U};
+    od_render_history(&canvas, &empty, 0U, 0U, NULL, true);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "No history yet") != NULL);
+    CHECK(strstr(text, "Skipped malformed history line") != NULL);
+    CHECK(strstr(text, "Showing 0-0 of 0 change(s)") != NULL);
+    CHECK(strstr(text, "Enter Revert") == NULL);
+    free(text);
+    od_canvas_free(&canvas);
+    CHECK(od_canvas_init(&canvas, 59U, 17U, &error) == OD_OK);
+    od_render_history(&canvas, &history, 0U, 0U, NULL, true);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "Terminal too small") != NULL);
+    CHECK(strstr(text, "[Revert]") == NULL);
+    free(text);
+    od_canvas_free(&canvas);
+}
+
+static void check_history_target(size_t width, size_t height, const OdHistory *history,
+                                 size_t selected, size_t scroll, bool confirming,
+                                 int x, int y, OdMouseAction action, size_t item) {
+    OdMouseTarget target = od_history_mouse_target(width, height, history,
+                                                   selected, scroll, confirming, x, y);
+    CHECK(target.action == action);
+    if (action == OD_MOUSE_HISTORY_ROW || action == OD_MOUSE_HISTORY_REVERT) {
+        CHECK(target.item == item);
+    }
+}
+
+/* Catches broad action hit boxes, unavailable writes, separator/empty-row
+ * selection, and underlying list controls leaking into confirmation. */
+static void test_history_targets_match_only_visible_actions(void) {
+    OdHistoryRecord records[12];
+    OdHistory history;
+    history_fixture(records, &history);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 20, 7,
+                          OD_MOUSE_HISTORY_ROW, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 81, 7,
+                          OD_MOUSE_HISTORY_ROW, 0U);
+    for (int x = 82; x < 90; ++x) {
+        check_history_target(100U, 32U, &history, 0U, 0U, false, x, 7,
+                              OD_MOUSE_HISTORY_REVERT, 0U);
+    }
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 90, 7,
+                          OD_MOUSE_HISTORY_ROW, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 82, 9,
+                          OD_MOUSE_HISTORY_ROW, 1U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 82, 8,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 1, 7,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 98, 7,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(60U, 18U, &history, 10U, 9U, false, 42, 9,
+                          OD_MOUSE_HISTORY_REVERT, 10U);
+    check_history_target(60U, 18U, &history, 10U, 9U, false, 42, 13,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 18, 31,
+                          OD_MOUSE_HISTORY_REVERT, 0U);
+    check_history_target(100U, 32U, &history, 1U, 0U, false, 18, 31,
+                          OD_MOUSE_REFRESH, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 33, 31,
+                          OD_MOUSE_REFRESH, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, false, 45, 31,
+                          OD_MOUSE_BACK, 0U);
+    check_history_target(100U, 32U, NULL, 0U, 0U, false, 20, 7,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, 82, 7,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, 32, 31,
+                          OD_MOUSE_BACK, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, 1, 31,
+                          OD_MOUSE_HISTORY_CONFIRM, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, 16, 31,
+                          OD_MOUSE_HISTORY_CONFIRM, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, 17, 31,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, -1, 31,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(100U, 32U, &history, 0U, 0U, true, 100, 31,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(59U, 18U, &history, 0U, 0U, true, 1, 17,
+                          OD_MOUSE_NONE, 0U);
+    check_history_target(60U, 17U, &history, 0U, 0U, false, 42, 7,
+                          OD_MOUSE_NONE, 0U);
+}
+
+static void test_history_confirmation_names_exact_reverse_operation(void) {
+    OdHistoryRecord records[12];
+    OdHistory history;
+    history_fixture(records, &history);
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 100U, 32U, &error) == OD_OK);
+    od_render_history_confirmation(&canvas, &records[0], true);
+    char *text = rendered_text(&canvas);
+    CHECK(strstr(text, "OPEN DOOR / History") != NULL);
+    CHECK(strstr(text, "Confirm revert #120") != NULL);
+    CHECK(strstr(text, "./row-00/.env") != NULL);
+    CHECK(strstr(text, "Key: PORT") != NULL);
+    CHECK(strstr(text, "3000 -> 2000") != NULL);
+    CHECK(strstr(text, "2000 -> 3000") == NULL);
+    CHECK(strstr(text, "Enter does nothing") != NULL);
+    CHECK(strstr(text, "y Confirm revert") != NULL);
+    CHECK(strstr(text, "n/q/Esc Cancel") != NULL);
+    CHECK(strstr(text, "WHEN") == NULL);
+    free(text);
+    od_canvas_free(&canvas);
+    CHECK(od_canvas_init(&canvas, 59U, 17U, &error) == OD_OK);
+    od_render_history_confirmation(&canvas, &records[0], true);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "Terminal too small") != NULL);
+    CHECK(strstr(text, "Confirm revert") == NULL);
+    free(text);
+    od_canvas_free(&canvas);
+}
+
 int main(void) {
     test_menu_dispatch_is_fixed_to_four_items();
     test_menu_degrades_at_minimum_size();
@@ -602,6 +866,10 @@ int main(void) {
     test_dashboard_renders_declaration_names_and_live_processes();
     test_empty_dashboard_explains_supported_project_sources();
     test_conflicts_have_one_whole_plan_action();
+    test_history_rows_are_uniform_and_reasons_stay_in_status();
+    test_history_pagination_clipping_and_empty_state();
+    test_history_targets_match_only_visible_actions();
+    test_history_confirmation_names_exact_reverse_operation();
     if (failures != 0) {
         fprintf(stderr, "%d menu/screen checks failed\n", failures);
         return 1;
