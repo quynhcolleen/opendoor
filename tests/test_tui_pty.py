@@ -236,6 +236,8 @@ def history_records(path: Path) -> list[dict]:
 def exercise_recorded_changes(session: Session, project: Path,
                               refreshed: bytes, conflict_port: int) -> None:
     env_path = project / ".env"
+    assert refreshed == f"CONFLICT_PORT={conflict_port}\n".encode(), \
+        "recorded-change fixture must contain only the reserved conflict declaration"
     backup = Path(f"{env_path}.opendoor.bak")
     log = project / ".opendoor" / "history.log"
     apply_mark = session.mark()
@@ -348,6 +350,24 @@ def exercise_recorded_changes(session: Session, project: Path,
     menu_mark = session.mark()
     session.send(b"q")
     session.wait_for("Pre-start port check", menu_mark)
+
+
+def exercise_single_conflict_workflow(binary: str, conflict_port: int) -> None:
+    # The Dashboard fixture deliberately contains unreserved sample ports.
+    # Keep apply's one-change contract independent of listeners on those ports.
+    with tempfile.TemporaryDirectory(prefix="opendoor-tui-recorded-") as temporary:
+        project = Path(temporary)
+        original = f"CONFLICT_PORT={conflict_port}\n".encode()
+        (project / ".env").write_bytes(original)
+        session = Session(binary, project)
+        try:
+            session.wait_for("Resolve conflicts", 0)
+            exercise_recorded_changes(session, project, original, conflict_port)
+            session.click(50, 17)
+            session.finish()
+        except BaseException:
+            session.abort()
+            raise
 
 
 def exercise_history_pagination(binary: str) -> None:
@@ -510,12 +530,12 @@ def main() -> int:
                 session.wait_for("Pre-start port check", history_back)
                 session.drain(0.2)
 
-                exercise_recorded_changes(session, project, refreshed, conflict_port)
                 session.click(50, 17)
                 session.finish()
             except BaseException:
                 session.abort()
                 raise
+        exercise_single_conflict_workflow(binary, conflict_port)
     finally:
         listener.close()
 
