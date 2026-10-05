@@ -411,7 +411,7 @@ static void test_env_template_and_unrelated_files_are_ignored(void) {
     CHECK(mkdtemp(root) != NULL);
     CHECK(mkdtemp(outside) != NULL);
     static const char *const skipped[] = {
-        ".git", "node_modules", "vendor", "build", "build-debug", "dist"
+        ".git", ".opendoor", "node_modules", "vendor", "build", "build-debug", "dist"
     };
     char path[512];
     char nested[512];
