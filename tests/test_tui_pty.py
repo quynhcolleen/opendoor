@@ -267,7 +267,7 @@ def exercise_recorded_changes(session: Session, project: Path,
     session.wait_for("Pre-start port check", back_mark)
     history_mark = session.mark()
     session.click(50, 16)
-    session.wait_for("OPEN DOOR / History", history_mark)
+    session.wait_for("OPENDOOR / History", history_mark)
     session.wait_for_line("[Revert]", 7)
     confirm_mark = session.mark()
     session.send(b"\r")
@@ -399,7 +399,7 @@ def exercise_history_pagination(binary: str) -> None:
             session.wait_for("Resolve conflicts", 0)
             history_mark = session.mark()
             session.click(50, 16)
-            session.wait_for("OPEN DOOR / History", history_mark)
+            session.wait_for("OPENDOOR / History", history_mark)
             session.wait_for_line("Showing 1-10 of 12 change(s)", HEIGHT - 4)
             rows = session.screen_lines()
             for visible, identity in enumerate(range(12, 2, -1)):
@@ -519,7 +519,7 @@ def main() -> int:
 
                 history_mark = session.mark()
                 session.click(50, 16)
-                session.wait_for("OPEN DOOR / History", history_mark)
+                session.wait_for("OPENDOOR / History", history_mark)
                 session.wait_for("No history yet", history_mark)
                 assert env_path.read_bytes() == refreshed, "History modified the fixture"
                 assert not (project / ".opendoor").exists(), \
@@ -561,7 +561,7 @@ def main() -> int:
             time.sleep(0.2)
             resolve_mark = session.mark()
             session.click(50, 15)
-            session.wait_for("OPEN DOOR / Resolve conflicts", resolve_mark,
+            session.wait_for("OPENDOOR / Resolve conflicts", resolve_mark,
                              timeout=2.0)
 
             back_mark = session.mark()

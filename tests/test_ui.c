@@ -633,7 +633,7 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
     CHECK(od_canvas_init(&canvas, 240U, 32U, &error) == OD_OK);
     od_render_history(&canvas, &history, 1U, 0U, "History loaded", NULL, true);
     char *text = rendered_text(&canvas);
-    CHECK(strstr(text, "OPEN DOOR / History") != NULL);
+    CHECK(strstr(text, "OPENDOOR / History") != NULL);
     CHECK(strstr(text, "WHEN") != NULL);
     CHECK(strstr(text, "FILE / KEY") != NULL);
     CHECK(strstr(text, "CHANGE") != NULL);
@@ -824,7 +824,7 @@ static void test_history_confirmation_names_exact_reverse_operation(void) {
     CHECK(od_canvas_init(&canvas, 100U, 32U, &error) == OD_OK);
     od_render_history_confirmation(&canvas, &records[0], true);
     char *text = rendered_text(&canvas);
-    CHECK(strstr(text, "OPEN DOOR / History") != NULL);
+    CHECK(strstr(text, "OPENDOOR / History") != NULL);
     CHECK(strstr(text, "Confirm revert #120") != NULL);
     CHECK(strstr(text, "./row-00/.env") != NULL);
     CHECK(strstr(text, "Key: PORT") != NULL);

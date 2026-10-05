@@ -518,7 +518,7 @@ void od_render_main_menu(OdCanvas *canvas,
     int top = layout.top;
 
     if (logo_height == 1U) {
-        od_canvas_write_centered(canvas, top, "OPEN DOOR", OD_ROLE_PRIMARY, 1U);
+        od_canvas_write_centered(canvas, top, "OPENDOOR", OD_ROLE_PRIMARY, 1U);
     } else {
         const size_t banner_width = 80U;
         int logo_x = banner_width >= canvas->width ? 0 :
@@ -590,7 +590,7 @@ void od_render_dashboard(OdCanvas *canvas,
         return;
     }
 
-    od_canvas_write(canvas, 2, 1, "OPEN DOOR / Dashboard",
+    od_canvas_write(canvas, 2, 1, "OPENDOOR / Dashboard",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
     od_canvas_write(canvas, 2, 2,
                     "Project declarations and live endpoints",
@@ -809,7 +809,7 @@ void od_render_conflicts(OdCanvas *canvas,
         return;
     }
 
-    od_canvas_write(canvas, 2, 1, "OPEN DOOR / Resolve conflicts",
+    od_canvas_write(canvas, 2, 1, "OPENDOOR / Resolve conflicts",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
     od_canvas_write(canvas, 2, 2,
                     "Pre-start check — external listeners on declared ports are conflicts",
@@ -999,7 +999,7 @@ void od_render_history(OdCanvas *canvas,
     }
     size_t count = history == NULL ? 0U : history->count;
     if (count > 0U && selected >= count) selected = count - 1U;
-    od_canvas_write(canvas, 2, 1, "OPEN DOOR / History",
+    od_canvas_write(canvas, 2, 1, "OPENDOOR / History",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
     od_canvas_write(canvas, 2, 2, status == NULL ?
                     "Recorded port changes, newest first" : status,
@@ -1080,7 +1080,7 @@ void od_render_history_confirmation(OdCanvas *canvas,
         od_render_resize_required(canvas);
         return;
     }
-    od_canvas_write(canvas, 2, 1, "OPEN DOOR / History",
+    od_canvas_write(canvas, 2, 1, "OPENDOOR / History",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
     if (record == NULL) return;
     char heading[80];
