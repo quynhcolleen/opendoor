@@ -36,6 +36,7 @@ add_library(opendoor_core
   src/allocation.c
   src/scan.c
   src/discovery.c
+  src/history.c
   src/ui.c
   src/screens.c
   src/tui.c
@@ -65,6 +66,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_discovery PRIVATE opendoor_core)
   target_compile_options(test_discovery PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   add_test(NAME scan_contracts COMMAND test_discovery)
+
+  add_executable(test_history tests/test_history.c)
+  target_link_libraries(test_history PRIVATE opendoor_core)
+  target_compile_options(test_history PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME history_contracts COMMAND test_history)
 
   add_executable(test_persistence tests/test_persistence.c)
   target_link_libraries(test_persistence PRIVATE opendoor_core)

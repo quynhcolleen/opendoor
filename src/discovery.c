@@ -79,7 +79,8 @@ static char *display_folder(const char *relative_path) {
 }
 
 static bool skipped_directory(const char *name) {
-    return strcmp(name, ".git") == 0 || strcmp(name, "node_modules") == 0 ||
+    return strcmp(name, ".git") == 0 || strcmp(name, ".opendoor") == 0 ||
+           strcmp(name, "node_modules") == 0 ||
            strcmp(name, "vendor") == 0 || strcmp(name, "build") == 0 ||
            strncmp(name, "build-", 6U) == 0 || strcmp(name, "dist") == 0;
 }

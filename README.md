@@ -1,6 +1,6 @@
 # OpenDoor
 
-OpenDoor is a focused Linux ncurses application for inspecting project ports and resolving conflicts before a stack starts. Its fixed menu has exactly three items: `Dashboard`, `Resolve conflicts`, and `Quit`.
+OpenDoor is a focused Linux ncurses application for inspecting project ports and resolving conflicts before a stack starts. Its fixed menu has exactly four items, in order: `Dashboard`, `Resolve conflicts`, `History`, and `Quit`.
 
 ## Project discovery
 
@@ -11,7 +11,7 @@ OpenDoor recursively scans the selected project folder and its subfolders. It re
 - `package.json`: string values directly inside the top-level `scripts` object containing `--port PORT` or `-p PORT`;
 - `Makefile`: direct integer assignments and recipe commands containing the same two port flags.
 
-`.env.example`, `.env.sample`, `.env.template`, and any `.env.*` filename whose last suffix is `.example`, `.sample`, or `.template` are excluded completely. OpenDoor also skips `.git`, `node_modules`, `vendor`, `build`, `build-*`, and `dist`, and it does not follow symlinks.
+`.env.example`, `.env.sample`, `.env.template`, and any `.env.*` filename whose last suffix is `.example`, `.sample`, or `.template` are excluded completely. OpenDoor also skips `.git`, `.opendoor`, `node_modules`, `vendor`, `build`, `build-*`, and `dist`, and it does not follow symlinks. `.opendoor` is reserved for local History artifacts and is never scanned for port declarations.
 
 Direct `$KEY` and `${KEY}` references, plus Compose defaults such as `${KEY:-3000}`, are resolved only through one direct sibling `.env` assignment. The exact sibling `.env` takes priority; otherwise exactly one matching `.env.*` definition is required. OpenDoor does not evaluate nested or computed variable expressions.
 
@@ -47,6 +47,18 @@ Enter is the single confirmation: it applies every automatic proposal exactly as
 
 Before writing, OpenDoor verifies that the source files and exact token spans have not changed and rescans sockets to ensure the proposal is still valid. For every touched source it creates `<file>.opendoor.bak`, patches only the recorded byte spans, writes through a same-directory temporary file, calls `fsync`, renames atomically, and validates the result. A failure restores every file touched by that confirmation byte-for-byte; partial apply is not allowed.
 
+## History
+
+Every successful automatic declaration change appends one flat JSON object to the project's `.opendoor/history.log`. The file is UTF-8 JSON Lines (JSONL), with one record per changed declaration, including the time, relative file, key, exact token span, and old and new ports. History is local, append-only, and retained without a size or age limit; OpenDoor never rotates, prunes, or clears successful records. Opening an empty History screen does not create the directory or log.
+
+The screen paginates all valid records newest-first in `WHEN | FILE / KEY | CHANGE | ACTION / STATUS`. Each entry occupies one content line. An entry shows `[Revert]` only when exactly one currently writable declaration matches its recorded file, key, format, byte offset, and token length, and its current port equals the recorded new port. Missing, moved, changed, or unsafe declarations show the explicit danger-colored label `Unavailable`. Unavailable rows remain selectable; the selected row's full relative path, key, change, and reason appear in the bottom status line, with the reason kept out of the table.
+
+Revert changes only that exact declaration from its recorded new port back to its old port. OpenDoor checks availability before opening confirmation and again immediately before writing. Only lowercase `y` or a click on the explicit `Confirm revert` target confirms; Enter does not write. There is no force option, guessed location, declaration relocation, merge, or whole-file snapshot restoration. External edits can make an entry stale and unavailable, while restoring its exact recorded state can make it available again.
+
+A successful revert appends an inverse record naming the entry it reverses and leaves the original record intact. The inverse can itself be reverted as a redo when its exact recorded state still matches. Revert does not choose a different port or check whether the old port is currently occupied.
+
+Apply and revert share the same backup, atomic replacement, validation, and rollback transaction. Every `<file>.opendoor.bak` is created before any source changes. The locked history log is appended and synced only after source validation; a history commit failure removes its uncommitted tail and rolls back the source changes. Incomplete recovery is reported explicitly. These operations do not provide a multi-file crash-recovery journal. Malformed, unsupported, duplicate, oversized, and torn records are skipped with a visible warning and cannot be reverted.
+
 ## Pre-start requirement and limitations
 
 Run Resolve Conflicts **before starting the project stack**. If the stack is already running, its ports can look externally occupied. This is especially common for Docker-published ports held by `docker-proxy`, whose process ownership is outside the selected project path. OpenDoor will treat those ports as conflicts because this feature is intentionally a pre-start check.
@@ -54,7 +66,7 @@ Run Resolve Conflicts **before starting the project stack**. If the stack is alr
 Additional limitations:
 
 - IP-prefixed Compose mappings such as `127.0.0.1:3000:80` are unsupported.
-- Generated `.opendoor.bak` files may need to be added to the project's `.gitignore`.
+- Generated `.opendoor.bak` files and the local `.opendoor/` History directory may need to be added to the project's `.gitignore`.
 - Changing a host port does not update other references to the old port.
 - OpenDoor never starts or stops services, kills processes, invokes `sudo`, or evaluates arbitrary project code.
 
@@ -77,6 +89,21 @@ Resolve Conflicts:
 - Up/Down or mouse wheel: scroll the preview;
 - Enter or the footer apply-all target: apply all automatic changes once;
 - `q`, Escape, or the footer cancel target: return without writing.
+
+History:
+
+- Up/Down: select one entry;
+- mouse wheel: move selection three entries and keep it visible across pages;
+- ordinary row click: select only;
+- Enter, the footer Revert target, or the exact `[Revert]` cell: revalidate a ready entry and open confirmation;
+- `r` or the footer refresh target: reload the log and current availability;
+- `q`, Escape, or the footer back target: return to the menu.
+
+History confirmation:
+
+- lowercase `y` or the explicit `Confirm revert` mouse target: revalidate and perform the exact revert;
+- `n`, `q`, Escape, or the footer cancel target: cancel without writing;
+- Enter, arrows, mouse wheel, row clicks, and refresh: do nothing.
 
 Clicks inside Dashboard rows or Resolve preview rows have no action.
 
