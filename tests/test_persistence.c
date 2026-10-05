@@ -12,6 +12,7 @@
 
 static int failures = 0;
 
+
 #define CHECK(condition)                                                         \
     do {                                                                         \
         if (!(condition)) {                                                       \
@@ -566,7 +567,120 @@ static void test_failed_rollback_does_not_claim_nothing_changed(void) {
     CHECK(rmdir(root) == 0);
 }
 
+typedef struct {
+    const OdResolutionItem *items;
+    size_t written;
+    size_t calls;
+    bool reject_commit;
+    bool reject_written;
+} CommitContext;
+
+static OdStatus count_written(OdPortSourceKind kind, const char *path,
+                               const char *text, size_t length,
+                               OdPatchValidationPhase phase, void *opaque,
+                               OdError *error) {
+    (void)path;
+    CommitContext *context = opaque;
+    if (phase == OD_PATCH_VALIDATE_WRITTEN) {
+        ++context->written;
+        if (context->reject_written && context->written == 2U) {
+            od_error_set(error, OD_ERROR_INVALID, "written validation rejected");
+            return OD_ERROR_INVALID;
+        }
+    }
+    return od_validate_discovery_text(kind, text, length, error);
+}
+
+static OdStatus inspect_committed(const OdCommittedEdit *edits, size_t count,
+                                   void *opaque, OdError *error) {
+    CommitContext *context = opaque;
+    ++context->calls;
+    CHECK(context->written == 2U);
+    CHECK(count == 4U);
+    if (count != 4U) return OD_ERROR_INVALID;
+    const size_t offsets[] = {28U, 6U, 19U, 5U};
+    const size_t lengths[] = {4U, 5U, 2U, 4U};
+    const size_t lines[] = {3U, 1U, 2U, 1U};
+    const size_t columns[] = {7U, 7U, 8U, 6U};
+    const char *after = "FIRST=10000\nSECOND=80\nTHIRD=3001\n";
+    for (size_t index = 0U; index < count; ++index) {
+        CHECK(edits[index].item == &context->items[index]);
+        CHECK(edits[index].byte_offset == offsets[index]);
+        CHECK(edits[index].byte_length == lengths[index]);
+        CHECK(edits[index].line == lines[index]);
+        CHECK(edits[index].column == columns[index]);
+        CHECK(edits[index].file_size == (index < 3U ? 33U : 10U));
+        const char *expected = index < 3U ? after : "PORT=4001\n";
+        CHECK(edits[index].file_hash == hash_text(expected, strlen(expected)));
+        size_t length = 0U;
+        char *actual = read_text_file(edits[index].item->absolute_path, &length);
+        CHECK(actual != NULL && strcmp(actual, expected) == 0);
+        free(actual);
+    }
+    if (context->reject_commit) {
+        od_error_set(error, OD_ERROR_IO, "commit intentionally rejected");
+        return OD_ERROR_IO;
+    }
+    return OD_OK;
+}
+
+static void test_commit_metadata_and_all_source_rollback(void) {
+    for (int mode = 0; mode < 3; ++mode) {
+        char root[] = "/tmp/opendoor-commit-XXXXXX";
+        CHECK(mkdtemp(root) != NULL);
+        char first[512], second[512];
+        (void)snprintf(first, sizeof(first), "%s/.env", root);
+        (void)snprintf(second, sizeof(second), "%s/.env.local", root);
+        const char *before = "FIRST=9\nSECOND=10000\nTHIRD=3000\n";
+        write_text_file(first, before, 0640);
+        write_text_file(second, "PORT=4000\n", 0600);
+        OdResolutionItem items[] = {
+            resolution_item(first, "./.env", before, "3000", 3000U, 3001U,
+                            OD_SOURCE_ENV, OD_WRITE_ENV_LITERAL, true),
+            resolution_item(first, "./.env", before, "9", 9U, 10000U,
+                            OD_SOURCE_ENV, OD_WRITE_ENV_LITERAL, true),
+            resolution_item(first, "./.env", before, "10000", 10000U, 80U,
+                            OD_SOURCE_ENV, OD_WRITE_ENV_LITERAL, true),
+            resolution_item(second, "./.env.local", "PORT=4000\n", "4000", 4000U, 4001U,
+                            OD_SOURCE_ENV, OD_WRITE_ENV_LITERAL, true),
+            {.automatic = false}
+        };
+        OdResolution resolution = {.items = items, .count = 5U, .project_root = root};
+        CommitContext context = {.items = items, .reject_commit = mode == 1,
+                                  .reject_written = mode == 2};
+        size_t updated = 99U;
+        OdError error;
+        OdStatus status = od_apply_resolution_with_commit(
+            &resolution, count_written, &context, inspect_committed, &context,
+            &updated, &error);
+        CHECK(status == (mode == 0 ? OD_OK : mode == 1 ? OD_ERROR_IO : OD_ERROR_INVALID));
+        CHECK(updated == (mode == 0 ? 4U : 0U));
+        CHECK(context.calls == (mode == 2 ? 0U : 1U));
+        if (mode != 0) {
+            CHECK(strstr(error.message, "rollback completed") != NULL);
+            size_t length = 0U;
+            char *actual = read_text_file(first, &length);
+            CHECK(actual != NULL && strcmp(actual, before) == 0);
+            free(actual);
+            actual = read_text_file(second, &length);
+            CHECK(actual != NULL && strcmp(actual, "PORT=4000\n") == 0);
+            free(actual);
+        }
+        struct stat information;
+        CHECK(stat(first, &information) == 0 && (information.st_mode & 0777) == 0640);
+        char backup[544];
+        backup_path(backup, sizeof(backup), first);
+        CHECK(unlink(backup) == 0);
+        backup_path(backup, sizeof(backup), second);
+        CHECK(unlink(backup) == 0);
+        CHECK(unlink(first) == 0);
+        CHECK(unlink(second) == 0);
+        CHECK(rmdir(root) == 0);
+    }
+}
+
 int main(void) {
+    test_commit_metadata_and_all_source_rollback();
     test_flat_config_round_trip();
     test_flat_config_rejects_invalid_input();
     test_plain_overwrite_and_load();

@@ -3,13 +3,18 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int failures = 0;
+
 
 #define CHECK(condition)                                                         \
     do {                                                                         \
@@ -442,7 +447,289 @@ static void test_storage_symlinks_and_nonregular_logs_are_refused(void) {
     CHECK(rmdir(root) == 0);
 }
 
+typedef struct {
+    char root[128];
+    char env[512];
+    char compose[512];
+    char directory[512];
+    char log[512];
+    OdProjectDiscovery discovery;
+    OdResolutionItem items[4];
+    OdResolution resolution;
+} TransactionFixture;
+
+static const char env_before[] = "PORT=9999\nSECOND_PORT=10000\n";
+static const char compose_before[] = "services:\n  app:\n    ports:\n      - \"4000:80\"\n";
+
+static void write_source(const char *path, const char *text) {
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    CHECK(descriptor >= 0);
+    if (descriptor >= 0) {
+        write_bytes(descriptor, text, strlen(text));
+        CHECK(close(descriptor) == 0);
+    }
+}
+
+static void check_file(const char *path, const char *expected) {
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    CHECK(descriptor >= 0);
+    if (descriptor < 0) return;
+    char text[2048];
+    ssize_t count = read(descriptor, text, sizeof(text));
+    CHECK(count >= 0 && (size_t)count == strlen(expected));
+    CHECK(count >= 0 && (size_t)count == strlen(expected) &&
+          memcmp(text, expected, strlen(expected)) == 0);
+    CHECK(close(descriptor) == 0);
+}
+
+static void init_transaction(TransactionFixture *fixture) {
+    *fixture = (TransactionFixture){0};
+    (void)snprintf(fixture->root, sizeof(fixture->root), "/tmp/opendoor-history-txn-XXXXXX");
+    CHECK(mkdtemp(fixture->root) != NULL);
+    (void)snprintf(fixture->env, sizeof(fixture->env), "%s/.env", fixture->root);
+    (void)snprintf(fixture->compose, sizeof(fixture->compose), "%s/compose.yaml", fixture->root);
+    (void)snprintf(fixture->directory, sizeof(fixture->directory), "%s/.opendoor", fixture->root);
+    (void)snprintf(fixture->log, sizeof(fixture->log), "%s/.opendoor/history.log", fixture->root);
+    write_source(fixture->env, env_before);
+    write_source(fixture->compose, compose_before);
+    OdError error;
+    CHECK(od_discover_project_ports(fixture->root, &fixture->discovery, &error) == OD_OK);
+    CHECK(fixture->discovery.count == 3U);
+    for (size_t index = 0U; index < fixture->discovery.count && index < 3U; ++index) {
+        const OdPortDeclaration *declaration = &fixture->discovery.items[index];
+        fixture->items[index] = (OdResolutionItem){
+            .automatic = true, .variable = declaration->environment_key,
+            .old_port = declaration->port,
+            .new_port = declaration->port == 9999U ? 10000U :
+                        declaration->port == 10000U ? 80U : 4001U,
+            .source_kind = declaration->source_kind, .write_kind = declaration->write_kind,
+            .line = declaration->line, .column = declaration->column,
+            .byte_offset = declaration->byte_offset, .byte_length = declaration->byte_length,
+            .file_size = declaration->file_size, .file_hash = declaration->file_hash,
+            .absolute_path = declaration->absolute_path, .relative_path = declaration->relative_path
+        };
+    }
+    fixture->items[3] = (OdResolutionItem){.automatic = false};
+    fixture->resolution = (OdResolution){.items = fixture->items, .count = 4U,
+        .automatic_count = 3U, .manual_count = 1U, .project_root = fixture->root};
+}
+
+static void cleanup_transaction(TransactionFixture *fixture) {
+    od_project_discovery_free(&fixture->discovery);
+    char backup[544];
+    (void)snprintf(backup, sizeof(backup), "%s.opendoor.bak", fixture->env);
+    CHECK(unlink(backup) == 0 || errno == ENOENT);
+    (void)snprintf(backup, sizeof(backup), "%s.opendoor.bak", fixture->compose);
+    CHECK(unlink(backup) == 0 || errno == ENOENT);
+    CHECK(unlink(fixture->env) == 0);
+    CHECK(unlink(fixture->compose) == 0);
+    CHECK(unlink(fixture->log) == 0 || errno == ENOENT);
+    CHECK(rmdir(fixture->directory) == 0 || errno == ENOENT);
+    CHECK(rmdir(fixture->root) == 0);
+}
+
+static void test_recorded_apply_has_one_flat_record_per_automatic_edit(void) {
+    TransactionFixture fixture;
+    init_transaction(&fixture);
+    size_t updated = 99U;
+    OdError error;
+    mode_t previous_umask = umask(0);
+    OdStatus status = od_history_apply_resolution(&fixture.resolution, OD_HISTORY_APPLY,
+                                                   NULL, &updated, &error);
+    (void)umask(previous_umask);
+    CHECK(status == OD_OK && updated == 3U);
+    check_file(fixture.env, "PORT=10000\nSECOND_PORT=80\n");
+    struct stat information;
+    CHECK(stat(fixture.directory, &information) == 0 && (information.st_mode & 0777) == 0700);
+    CHECK(stat(fixture.log, &information) == 0 && (information.st_mode & 0777) == 0600);
+    OdHistory history = {0};
+    CHECK(od_history_load(fixture.root, &history, &error) == OD_OK);
+    CHECK(history.count == 3U && history.warning_count == 0U);
+    for (size_t index = 0U; index < history.count; ++index) {
+        const OdHistoryRecord *record = &history.items[index];
+        CHECK(record->id == 3U - index);
+        CHECK(record->kind == OD_HISTORY_APPLY && !record->has_reverts);
+        CHECK(record->timestamp != NULL && strlen(record->timestamp) == 24U);
+        CHECK(record->relative_path[0] != '/');
+        if (record->old_port == 9999U) {
+            CHECK(record->new_port == 10000U && record->byte_offset == 5U && record->byte_length == 5U);
+            CHECK(record->line == 1U && record->column == 6U);
+            CHECK(record->environment_key != NULL && strcmp(record->environment_key, "PORT") == 0);
+        } else if (record->old_port == 10000U) {
+            CHECK(record->new_port == 80U && record->byte_offset == 23U && record->byte_length == 2U);
+            CHECK(record->line == 2U && record->column == 13U);
+        } else {
+            CHECK(record->old_port == 4000U && record->new_port == 4001U);
+            CHECK(record->source_kind == OD_SOURCE_COMPOSE && record->environment_key == NULL);
+        }
+    }
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_recorded_append_uses_maximum_id_and_accepts_revert_metadata(void) {
+    TransactionFixture fixture;
+    init_transaction(&fixture);
+    int descriptor = create_log(fixture.root, fixture.directory, fixture.log);
+    write_line(descriptor, apply_json);
+    write_line(descriptor, "malformed but retained");
+    char *older = json_with_id(7U);
+    if (older != NULL) write_line(descriptor, older);
+    free(older);
+    CHECK(close(descriptor) == 0);
+    fixture.resolution.count = 1U;
+    uint64_t target = 42U;
+    size_t updated = 99U;
+    OdError error;
+    CHECK(od_history_apply_resolution(&fixture.resolution, OD_HISTORY_REVERT, &target,
+                                       &updated, &error) == OD_OK);
+    CHECK(updated == 1U);
+    OdHistory history = {0};
+    CHECK(od_history_load(fixture.root, &history, &error) == OD_OK);
+    CHECK(history.count == 3U && history.warning_count == 1U);
+    if (history.count == 3U) {
+        CHECK(history.items[0].id == 43U && history.items[1].id == 42U && history.items[2].id == 7U);
+        CHECK(history.items[0].kind == OD_HISTORY_REVERT && history.items[0].has_reverts);
+        CHECK(history.items[0].reverts == 42U);
+    }
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_short_history_append_restores_sources_and_original_log_bytes(void) {
+    TransactionFixture fixture;
+    init_transaction(&fixture);
+    int descriptor = create_log(fixture.root, fixture.directory, fixture.log);
+    write_line(descriptor, apply_json);
+    CHECK(close(descriptor) == 0);
+    /* A real filesystem short write: source/backup files fit below this limit,
+     * but the append can write only 17 bytes before the kernel returns EFBIG. */
+    struct rlimit original, limited;
+    CHECK(getrlimit(RLIMIT_FSIZE, &original) == 0);
+    limited = original;
+    limited.rlim_cur = (rlim_t)(strlen(apply_json) + 1U + 17U);
+    void (*previous_handler)(int) = signal(SIGXFSZ, SIG_IGN);
+    CHECK(previous_handler != SIG_ERR);
+    CHECK(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+    size_t updated = 99U;
+    OdError error;
+    OdStatus status = od_history_apply_resolution(&fixture.resolution, OD_HISTORY_APPLY,
+                                                   NULL, &updated, &error);
+    CHECK(setrlimit(RLIMIT_FSIZE, &original) == 0);
+    CHECK(signal(SIGXFSZ, previous_handler) != SIG_ERR);
+    CHECK(status == OD_ERROR_IO && updated == 0U);
+    CHECK(strstr(error.message, "rollback completed") != NULL);
+    check_file(fixture.env, env_before);
+    check_file(fixture.compose, compose_before);
+    char original_log[1024];
+    (void)snprintf(original_log, sizeof(original_log), "%s\n", apply_json);
+    check_file(fixture.log, original_log);
+    OdHistory history = {0};
+    CHECK(od_history_load(fixture.root, &history, &error) == OD_OK);
+    CHECK(history.count == 1U && history.warning_count == 0U);
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_manual_only_resolution_does_not_create_history(void) {
+    TransactionFixture fixture;
+    init_transaction(&fixture);
+    fixture.resolution.items = &fixture.items[3];
+    fixture.resolution.count = 1U;
+    size_t updated = 99U;
+    OdError error;
+    CHECK(od_history_apply_resolution(&fixture.resolution, OD_HISTORY_APPLY, NULL,
+                                       &updated, &error) == OD_OK && updated == 0U);
+    CHECK(access(fixture.directory, F_OK) != 0 && errno == ENOENT);
+    check_file(fixture.env, env_before);
+    cleanup_transaction(&fixture);
+}
+
+static void test_unsafe_torn_or_exhausted_log_blocks_before_source_mutation(void) {
+    for (int mode = 0; mode < 5; ++mode) {
+        TransactionFixture fixture;
+        init_transaction(&fixture);
+        if (mode < 2) {
+            int descriptor = create_log(fixture.root, fixture.directory, fixture.log);
+            if (mode == 0) write_bytes(descriptor, apply_json, strlen(apply_json));
+            else {
+                char *last = json_with_id(UINT64_MAX);
+                if (last != NULL) write_line(descriptor, last);
+                free(last);
+            }
+            CHECK(close(descriptor) == 0);
+        } else if (mode == 2) CHECK(symlink(".", fixture.directory) == 0);
+        else {
+            CHECK(mkdir(fixture.directory, 0700) == 0);
+            if (mode == 3) CHECK(symlink(fixture.env, fixture.log) == 0);
+            else CHECK(mkfifo(fixture.log, 0600) == 0);
+        }
+        size_t updated = 99U;
+        OdError error;
+        CHECK(od_history_apply_resolution(&fixture.resolution, OD_HISTORY_APPLY, NULL,
+                                           &updated, &error) != OD_OK);
+        CHECK(updated == 0U);
+        if (mode == 0) {
+            CHECK(strstr(error.message, "torn") != NULL);
+            check_file(fixture.log, apply_json);
+        }
+        check_file(fixture.env, env_before);
+        check_file(fixture.compose, compose_before);
+        char backup[544];
+        (void)snprintf(backup, sizeof(backup), "%s.opendoor.bak", fixture.env);
+        CHECK(access(backup, F_OK) != 0 && errno == ENOENT);
+        if (mode == 2) CHECK(unlink(fixture.directory) == 0);
+        cleanup_transaction(&fixture);
+    }
+}
+
+static void test_history_lock_precedes_source_mutation(void) {
+    TransactionFixture fixture;
+    init_transaction(&fixture);
+    int descriptor = create_log(fixture.root, fixture.directory, fixture.log);
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    CHECK(fcntl(descriptor, F_SETLK, &lock) == 0);
+    int channel[2];
+    CHECK(pipe(channel) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        (void)close(descriptor);
+        (void)close(channel[0]);
+        write_bytes(channel[1], "s", 1U);
+        size_t updated = 0U;
+        OdError error;
+        OdStatus status = od_history_apply_resolution(&fixture.resolution, OD_HISTORY_APPLY,
+                                                       NULL, &updated, &error);
+        write_bytes(channel[1], status == OD_OK && updated == 3U ? "y" : "n", 1U);
+        _exit(0);
+    }
+    CHECK(close(channel[1]) == 0);
+    char message = 0;
+    CHECK(read(channel[0], &message, 1U) == 1 && message == 's');
+    struct pollfd pending = {.fd = channel[0], .events = POLLIN};
+    CHECK(poll(&pending, 1U, 100) == 0);
+    check_file(fixture.env, env_before);
+    char backup[544];
+    (void)snprintf(backup, sizeof(backup), "%s.opendoor.bak", fixture.env);
+    CHECK(access(backup, F_OK) != 0 && errno == ENOENT);
+    lock.l_type = F_UNLCK;
+    CHECK(fcntl(descriptor, F_SETLK, &lock) == 0);
+    CHECK(close(descriptor) == 0);
+    CHECK(read(channel[0], &message, 1U) == 1 && message == 'y');
+    CHECK(close(channel[0]) == 0);
+    int child_status = 0;
+    CHECK(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    cleanup_transaction(&fixture);
+}
+
 int main(void) {
+    test_recorded_apply_has_one_flat_record_per_automatic_edit();
+    test_recorded_append_uses_maximum_id_and_accepts_revert_metadata();
+    test_short_history_append_restores_sources_and_original_log_bytes();
+    test_manual_only_resolution_does_not_create_history();
+    test_unsafe_torn_or_exhausted_log_blocks_before_source_mutation();
+    test_history_lock_precedes_source_mutation();
     test_flat_record_round_trip();
     test_revert_and_nullable_key_round_trip();
     test_escaping_unicode_and_unknown_fields();

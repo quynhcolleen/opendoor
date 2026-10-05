@@ -1,4 +1,5 @@
 #include "opendoor/history.h"
+#include "opendoor/persistence.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -740,5 +742,262 @@ OdStatus od_history_load(const char *project_root, OdHistory *history,
         if (history->count > 1U) qsort(history->items, history->count, sizeof(*history->items), newest_first);
         od_error_clear(error);
     }
+    return status;
+}
+
+typedef struct {
+    int log;
+    off_t original_length;
+    uint64_t next_id;
+    OdHistoryKind kind;
+    uint64_t reverts;
+    bool rollback_incomplete;
+} HistoryTransaction;
+
+typedef struct {
+    char *text;
+    size_t length;
+} HistoryTailLine;
+
+static OdStatus history_io_error(OdError *error, const char *operation) {
+    od_error_set(error, OD_ERROR_IO, "%s: %s", operation, strerror(errno));
+    return OD_ERROR_IO;
+}
+
+static OdStatus open_history_transaction(const char *project_root,
+                                          size_t count,
+                                          HistoryTransaction *transaction,
+                                          OdError *error) {
+    int root = -1;
+    OdStatus status = open_root(project_root, &root, error);
+    if (status != OD_OK) return status;
+    if (mkdirat(root, ".opendoor", 0700) != 0 && errno != EEXIST) {
+        status = history_io_error(error, "unable to create history directory");
+        (void)close(root);
+        return status;
+    }
+    int directory = openat(root, ".opendoor", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) status = history_io_error(error, "unable to open history directory safely");
+    if (status == OD_OK && fsync(root) != 0) status = history_io_error(error, "unable to sync history project root");
+    (void)close(root);
+    if (status != OD_OK) {
+        if (directory >= 0) (void)close(directory);
+        return status;
+    }
+    transaction->log = openat(directory, "history.log",
+        O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (transaction->log < 0) status = history_io_error(error, "unable to open history log safely");
+    struct stat information;
+    if (status == OD_OK &&
+        (fstat(transaction->log, &information) != 0 || !S_ISREG(information.st_mode))) {
+        od_error_set(error, OD_ERROR_IO, "history log must be a regular file");
+        status = OD_ERROR_IO;
+    }
+    if (status == OD_OK && fsync(directory) != 0) status = history_io_error(error, "unable to sync history directory");
+    (void)close(directory);
+    if (status != OD_OK) return status;
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    int locked;
+    do { locked = fcntl(transaction->log, F_SETLKW, &lock); } while (locked < 0 && errno == EINTR);
+    if (locked < 0) return history_io_error(error, "unable to lock history log");
+    if (fstat(transaction->log, &information) != 0 || information.st_size < 0) {
+        return history_io_error(error, "unable to size history log");
+    }
+    transaction->original_length = information.st_size;
+    if (information.st_size > 0) {
+        char last;
+        ssize_t read_count;
+        do { read_count = pread(transaction->log, &last, 1U, information.st_size - 1); }
+        while (read_count < 0 && errno == EINTR);
+        if (read_count != 1) return history_io_error(error, "unable to read history tail");
+        if (last != '\n') {
+            od_error_set(error, OD_ERROR_CHANGED,
+                         "history log has a torn final record; retained without writing sources");
+            return OD_ERROR_CHANGED;
+        }
+    }
+    OdHistory existing = {0};
+    status = read_log(transaction->log, &existing, error);
+    uint64_t maximum = 0U;
+    if (status == OD_OK) {
+        for (size_t index = 0U; index < existing.count; ++index) {
+            if (existing.items[index].id > maximum) maximum = existing.items[index].id;
+        }
+        if (maximum > UINT64_MAX - count) {
+            od_error_set(error, OD_ERROR_INVALID, "history record IDs are exhausted");
+            status = OD_ERROR_INVALID;
+        } else transaction->next_id = maximum + 1U;
+    }
+    od_history_free(&existing);
+    return status;
+}
+
+static OdStatus append_history_bytes(int log, const char *text, size_t length,
+                                      OdError *error) {
+    size_t used = 0U;
+    while (used < length) {
+        ssize_t count = write(log, text + used, length - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return history_io_error(error, "unable to append history record");
+        used += (size_t)count;
+    }
+    return OD_OK;
+}
+
+static OdStatus prepare_history_tail(const OdCommittedEdit *edits, size_t count,
+                                      const HistoryTransaction *transaction,
+                                      HistoryTailLine *lines, OdError *error) {
+    struct timespec now;
+    struct tm utc;
+    char timestamp[25], seconds[21];
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || gmtime_r(&now.tv_sec, &utc) == NULL ||
+        strftime(seconds, sizeof(seconds), "%Y-%m-%dT%H:%M:%S", &utc) != 19U) {
+        od_error_set(error, OD_ERROR_IO, "unable to timestamp history records");
+        return OD_ERROR_IO;
+    }
+    (void)snprintf(timestamp, sizeof(timestamp), "%.19s.%03uZ", seconds,
+                   (unsigned int)(now.tv_nsec / 1000000L) % 1000U);
+    for (size_t index = 0U; index < count; ++index) {
+        const OdCommittedEdit *edit = &edits[index];
+        const OdResolutionItem *item = edit->item;
+        OdHistoryRecord record = {
+            .version = OD_HISTORY_VERSION, .id = transaction->next_id + index,
+            .timestamp = timestamp, .kind = transaction->kind,
+            .has_reverts = transaction->kind == OD_HISTORY_REVERT,
+            .reverts = transaction->reverts, .relative_path = item->relative_path,
+            .source_kind = item->source_kind, .write_kind = item->write_kind,
+            .environment_key = item->variable != NULL && item->variable[0] != '\0' ? item->variable : NULL,
+            .line = edit->line, .column = edit->column,
+            .byte_offset = edit->byte_offset, .byte_length = edit->byte_length,
+            .old_port = item->old_port, .new_port = item->new_port
+        };
+        OdStatus status = od_history_record_render(&record, &lines[index].text,
+                                                   &lines[index].length, error);
+        if (status != OD_OK) return status;
+        /* Renderer reserves a terminating byte; use it for the JSONL newline. */
+        lines[index].text[lines[index].length++] = '\n';
+    }
+    return OD_OK;
+}
+
+static OdStatus validate_history_tail(const HistoryTransaction *transaction,
+                                       const HistoryTailLine *lines, size_t count,
+                                       OdError *error) {
+    char *actual = malloc(OD_HISTORY_RECORD_MAX_BYTES + 1U);
+    if (actual == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to validate appended history");
+        return OD_ERROR_MEMORY;
+    }
+    off_t position = transaction->original_length;
+    OdStatus status = OD_OK;
+    for (size_t index = 0U; index < count && status == OD_OK; ++index) {
+        size_t used = 0U;
+        while (used < lines[index].length) {
+            ssize_t received = pread(transaction->log, actual + used,
+                                      lines[index].length - used, position);
+            if (received < 0 && errno == EINTR) continue;
+            if (received <= 0) {
+                od_error_set(error, OD_ERROR_IO, "unable to read appended history record");
+                status = OD_ERROR_IO;
+                break;
+            }
+            used += (size_t)received;
+            position += received;
+        }
+        if (status != OD_OK) break;
+        if (memcmp(actual, lines[index].text, used) != 0) {
+            od_error_set(error, OD_ERROR_CHANGED, "appended history bytes changed during commit");
+            status = OD_ERROR_CHANGED;
+            break;
+        }
+        OdHistoryRecord record = {0};
+        status = od_history_record_parse(actual, used - 1U, &record, error);
+        od_history_record_free(&record);
+    }
+    free(actual);
+    struct stat information;
+    if (status == OD_OK &&
+        (fstat(transaction->log, &information) != 0 || information.st_size != position)) {
+        od_error_set(error, OD_ERROR_CHANGED, "history length changed during commit");
+        status = OD_ERROR_CHANGED;
+    }
+    return status;
+}
+
+static OdStatus commit_history(const OdCommittedEdit *edits, size_t count,
+                                 void *opaque, OdError *error) {
+    HistoryTransaction *transaction = opaque;
+    HistoryTailLine *lines = calloc(count, sizeof(*lines));
+    if (lines == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to prepare history append");
+        return OD_ERROR_MEMORY;
+    }
+    OdStatus status = prepare_history_tail(edits, count, transaction, lines, error);
+    bool append_started = false;
+    for (size_t index = 0U; index < count && status == OD_OK; ++index) {
+        append_started = true;
+        status = append_history_bytes(transaction->log, lines[index].text,
+                                        lines[index].length, error);
+    }
+    if (status == OD_OK && fsync(transaction->log) != 0) {
+        status = history_io_error(error, "unable to sync appended history");
+    }
+    if (status == OD_OK) status = validate_history_tail(transaction, lines, count, error);
+    for (size_t index = 0U; index < count; ++index) free(lines[index].text);
+    free(lines);
+    if (status != OD_OK && append_started) {
+        /* Only this uncommitted tail may be removed, never a successful record. */
+        bool restored = ftruncate(transaction->log, transaction->original_length) == 0;
+        if (fsync(transaction->log) != 0) restored = false;
+        struct stat information;
+        if (fstat(transaction->log, &information) != 0 ||
+            information.st_size != transaction->original_length) restored = false;
+        transaction->rollback_incomplete = !restored;
+    }
+    return status;
+}
+
+OdStatus od_history_apply_resolution(const OdResolution *resolution,
+                                      OdHistoryKind kind, const uint64_t *reverts,
+                                      size_t *updated, OdError *error) {
+    if (updated != NULL) *updated = 0U;
+    if (resolution == NULL || updated == NULL ||
+        (resolution->count > 0U && resolution->items == NULL) ||
+        (kind != OD_HISTORY_APPLY && kind != OD_HISTORY_REVERT) ||
+        (kind == OD_HISTORY_APPLY && reverts != NULL) ||
+        (kind == OD_HISTORY_REVERT && (reverts == NULL || *reverts == 0U))) {
+        od_error_set(error, OD_ERROR_INVALID, "invalid recorded resolution or history kind");
+        return OD_ERROR_INVALID;
+    }
+    size_t count = 0U;
+    for (size_t index = 0U; index < resolution->count; ++index) {
+        if (resolution->items[index].automatic) ++count;
+    }
+    if (count == 0U) return od_apply_resolution(resolution, updated, error);
+    if (resolution->project_root == NULL || (kind == OD_HISTORY_REVERT && count != 1U)) {
+        od_error_set(error, OD_ERROR_INVALID, "recorded edits require a project root and reverts require one edit");
+        return OD_ERROR_INVALID;
+    }
+    HistoryTransaction transaction = {.log = -1, .kind = kind,
+                                       .reverts = reverts == NULL ? 0U : *reverts};
+    OdStatus status = open_history_transaction(resolution->project_root, count, &transaction, error);
+    if (status == OD_OK && kind == OD_HISTORY_REVERT && *reverts >= transaction.next_id) {
+        od_error_set(error, OD_ERROR_INVALID, "revert target must precede the new history record");
+        status = OD_ERROR_INVALID;
+    }
+    if (status == OD_OK) {
+        status = od_apply_resolution_with_commit(resolution, NULL, NULL,
+                                                  commit_history, &transaction,
+                                                  updated, error);
+    }
+    if (transaction.rollback_incomplete) {
+        bool sources_incomplete = strstr(error->message, "rollback incomplete") != NULL;
+        od_error_set(error, status,
+                     "history log rollback incomplete; source rollback %s; backups retained; inspect history.log before retrying",
+                     sources_incomplete ? "incomplete" : "completed");
+    }
+    /* The commit hook has already fsynced and validated the log while source
+     * rollback was live. Closing releases the advisory lock after persistence. */
+    if (transaction.log >= 0) (void)close(transaction.log);
     return status;
 }

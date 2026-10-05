@@ -2,6 +2,7 @@
 #define OPENDOOR_HISTORY_H
 
 #include "opendoor/discovery.h"
+#include "opendoor/resolution.h"
 
 #define OD_HISTORY_VERSION 1U
 #define OD_HISTORY_RECORD_MAX_BYTES (64U * 1024U)
@@ -59,6 +60,15 @@ OdStatus od_history_record_render(const OdHistoryRecord *record,
                                    char **text, size_t *length, OdError *error);
 OdStatus od_history_load(const char *project_root, OdHistory *history,
                           OdError *error);
+/* Records each automatic edit under an exclusive history lock. Normal apply
+ * uses OD_HISTORY_APPLY and NULL; revert uses OD_HISTORY_REVERT and a target ID.
+ * Eligibility for a revert must be checked by the caller. Logging errors roll
+ * back the uncommitted log tail and every changed source. */
+OdStatus od_history_apply_resolution(const OdResolution *resolution,
+                                      OdHistoryKind kind,
+                                      const uint64_t *reverts,
+                                      size_t *updated,
+                                      OdError *error);
 void od_history_record_free(OdHistoryRecord *record);
 void od_history_free(OdHistory *history);
 

@@ -593,13 +593,16 @@ static OdStatus build_patched_file(PatchFile *file,
         size_t replacement_length = (size_t)written;
         size_t new_length = file->patched_length - item->byte_length +
                             replacement_length;
-        char *patched = realloc(file->patched, new_length + 1U);
-        if (patched == NULL) {
-            free(items);
-            od_error_set(error, OD_ERROR_MEMORY, "unable to build patched file");
-            return OD_ERROR_MEMORY;
+        /* A shorter token still needs the original suffix during memmove. */
+        if (new_length > file->patched_length) {
+            char *patched = realloc(file->patched, new_length + 1U);
+            if (patched == NULL) {
+                free(items);
+                od_error_set(error, OD_ERROR_MEMORY, "unable to build patched file");
+                return OD_ERROR_MEMORY;
+            }
+            file->patched = patched;
         }
-        file->patched = patched;
         memmove(file->patched + item->byte_offset + replacement_length,
                 file->patched + item->byte_offset + item->byte_length,
                 file->patched_length - item->byte_offset - item->byte_length);
@@ -644,19 +647,64 @@ static OdStatus production_validator(OdPortSourceKind source_kind,
     return od_validate_discovery_text(source_kind, text, length, error);
 }
 
-OdStatus od_apply_resolution_with_validator(const OdResolution *resolution,
-                                            OdPatchValidator validator,
-                                            void *context,
-                                            size_t *updated,
-                                            OdError *error) {
-    if (resolution == NULL || validator == NULL || updated == NULL ||
+static OdStatus committed_edits(const OdResolution *resolution,
+                                 const PatchFile *files, size_t file_count,
+                                 size_t count, OdCommittedEdit **output,
+                                 OdError *error) {
+    OdCommittedEdit *edits = calloc(count, sizeof(*edits));
+    if (edits == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to prepare committed edits");
+        return OD_ERROR_MEMORY;
+    }
+    size_t used = 0U;
+    for (size_t index = 0U; index < resolution->count; ++index) {
+        const OdResolutionItem *item = &resolution->items[index];
+        if (!item->automatic) continue;
+        size_t file_index = find_patch_file(files, file_count, item->absolute_path);
+        const PatchFile *file = &files[file_index];
+        size_t offset = item->byte_offset;
+        char digits[6];
+        size_t length = (size_t)snprintf(digits, sizeof(digits), "%u", (unsigned)item->new_port);
+        for (size_t other = 0U; other < resolution->count; ++other) {
+            const OdResolutionItem *lower = &resolution->items[other];
+            if (!lower->automatic || lower->byte_offset >= item->byte_offset ||
+                strcmp(lower->absolute_path, item->absolute_path) != 0) continue;
+            size_t replacement = (size_t)snprintf(digits, sizeof(digits), "%u", (unsigned)lower->new_port);
+            offset = offset - lower->byte_length + replacement;
+        }
+        size_t line = 1U, column = 1U;
+        for (size_t byte = 0U; byte < offset; ++byte) {
+            if (file->patched[byte] == '\n') { ++line; column = 1U; }
+            else ++column;
+        }
+        edits[used++] = (OdCommittedEdit){
+            .item = item, .line = line, .column = column,
+            .byte_offset = offset, .byte_length = length,
+            .file_size = file->patched_length,
+            .file_hash = hash_bytes(file->patched, file->patched_length)
+        };
+    }
+    *output = edits;
+    return OD_OK;
+}
+
+OdStatus od_apply_resolution_with_commit(const OdResolution *resolution,
+                                         OdPatchValidator validator,
+                                         void *context,
+                                         OdPatchCommitHook commit,
+                                         void *commit_context,
+                                         size_t *updated,
+                                         OdError *error) {
+    if (resolution == NULL || updated == NULL ||
         (resolution->count > 0U && resolution->items == NULL)) {
         od_error_set(error, OD_ERROR_INVALID,
-                     "resolution, validator, and update count are required");
+                     "resolution and update count are required");
         return OD_ERROR_INVALID;
     }
+    if (validator == NULL) validator = production_validator;
     *updated = 0U;
     PatchFile *files = NULL;
+    OdCommittedEdit *edits = NULL;
     size_t file_count = 0U;
     size_t automatic_count = 0U;
     OdStatus status = OD_OK;
@@ -707,6 +755,10 @@ OdStatus od_apply_resolution_with_validator(const OdResolution *resolution,
         status = build_patched_file(&files[index], resolution, validator,
                                     context, error);
     }
+    if (status == OD_OK && commit != NULL && automatic_count > 0U) {
+        status = committed_edits(resolution, files, file_count, automatic_count,
+                                  &edits, error);
+    }
     for (size_t index = 0U; index < file_count && status == OD_OK; ++index) {
         status = atomic_replace_at(files[index].parent_fd,
                                    files[index].backup_name,
@@ -740,6 +792,10 @@ OdStatus od_apply_resolution_with_validator(const OdResolution *resolution,
         }
         free(written_text);
     }
+    if (status == OD_OK && commit != NULL && automatic_count > 0U) {
+        status = commit(edits, automatic_count, commit_context, error);
+    }
+    free(edits);
     if (status != OD_OK) {
         OdStatus original_status = status;
         char original_message[OD_ERROR_MESSAGE_CAP];
@@ -780,6 +836,20 @@ OdStatus od_apply_resolution_with_validator(const OdResolution *resolution,
     patch_files_free(files, file_count);
     od_error_clear(error);
     return OD_OK;
+}
+
+OdStatus od_apply_resolution_with_validator(const OdResolution *resolution,
+                                            OdPatchValidator validator,
+                                            void *context,
+                                            size_t *updated,
+                                            OdError *error) {
+    if (validator == NULL) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "resolution, validator, and update count are required");
+        return OD_ERROR_INVALID;
+    }
+    return od_apply_resolution_with_commit(resolution, validator, context,
+                                            NULL, NULL, updated, error);
 }
 
 OdStatus od_apply_resolution(const OdResolution *resolution,

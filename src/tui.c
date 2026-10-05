@@ -6,6 +6,7 @@
 #include "opendoor/dashboard.h"
 #include "opendoor/discovery.h"
 #include "opendoor/persistence.h"
+#include "opendoor/history.h"
 #include "opendoor/resolution.h"
 #include "opendoor/scan.h"
 #include "opendoor/screens.h"
@@ -349,7 +350,8 @@ static void apply_proposal(ConflictState *state,
     od_scan_snapshot_free(&snapshot);
     size_t updated = 0U;
     if (status == OD_OK) {
-        status = od_apply_resolution(&state->resolution, &updated, error);
+        status = od_history_apply_resolution(&state->resolution, OD_HISTORY_APPLY,
+                                              NULL, &updated, error);
     }
     if (status != OD_OK) {
         set_status(state->status, sizeof(state->status), "%s", error->message);
