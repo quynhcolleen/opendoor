@@ -631,7 +631,7 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
     OdCanvas canvas;
     OdError error;
     CHECK(od_canvas_init(&canvas, 240U, 32U, &error) == OD_OK);
-    od_render_history(&canvas, &history, 1U, 0U, "History loaded", true);
+    od_render_history(&canvas, &history, 1U, 0U, "History loaded", NULL, true);
     char *text = rendered_text(&canvas);
     CHECK(strstr(text, "OPEN DOOR / History") != NULL);
     CHECK(strstr(text, "WHEN") != NULL);
@@ -681,19 +681,7 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
     CHECK(canvas_cell(&canvas, 3U, 9U)->role == OD_ROLE_SELECTED);
     free(detail);
 
-    /* A refused revert can return the same text as its fresh classification.
-     * That reason still belongs only in the selected bottom status line. */
-    od_render_history(&canvas, &history, 1U, 0U, records[1].reason, true);
-    text = rendered_text(&canvas);
-    CHECK(substring_count(text, records[1].reason) == 1U);
-    free(text);
-
-    od_render_history(&canvas, &history, 0U, 0U, records[1].reason, true);
-    text = rendered_text(&canvas);
-    CHECK(strstr(text, records[1].reason) == NULL);
-    free(text);
-
-    od_render_history(&canvas, &history, 0U, 0U, NULL, false);
+    od_render_history(&canvas, &history, 0U, 0U, NULL, NULL, false);
     for (size_t glyph = 0U; glyph < 8U; ++glyph) {
         CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->role == OD_ROLE_PRIMARY);
         CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->attributes == 1U);
@@ -721,7 +709,7 @@ static void test_history_pagination_clipping_and_empty_state(void) {
     OdCanvas canvas;
     OdError error;
     CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
-    od_render_history(&canvas, &history, 11U, SIZE_MAX, NULL, true);
+    od_render_history(&canvas, &history, 11U, SIZE_MAX, NULL, NULL, true);
     char *text = rendered_text(&canvas);
     CHECK(strstr(text, "Showing 10-12 of 12 change(s)") != NULL);
     CHECK(strstr(text, "2009 -> 3009") != NULL);
@@ -735,13 +723,13 @@ static void test_history_pagination_clipping_and_empty_state(void) {
     free(text);
     records[10].relative_path = "./a-very-long-directory/another-directory/file.env";
     records[10].environment_key = "A_VERY_LONG_ENVIRONMENT_KEY";
-    od_render_history(&canvas, &history, 10U, 9U, NULL, true);
+    od_render_history(&canvas, &history, 10U, 9U, NULL, NULL, true);
     CHECK(strcmp(canvas_cell(&canvas, 23U, 9U)->glyph, "|") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 25U, 9U)->glyph, "2") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 42U, 9U)->glyph, "[") == 0);
     char *warnings[] = {"Skipped malformed history line"};
     OdHistory empty = {.warnings = warnings, .warning_count = 1U};
-    od_render_history(&canvas, &empty, 0U, 0U, NULL, true);
+    od_render_history(&canvas, &empty, 0U, 0U, NULL, NULL, true);
     text = rendered_text(&canvas);
     CHECK(strstr(text, "No history yet") != NULL);
     CHECK(strstr(text, "Skipped malformed history line") != NULL);
@@ -750,7 +738,7 @@ static void test_history_pagination_clipping_and_empty_state(void) {
     free(text);
     od_canvas_free(&canvas);
     CHECK(od_canvas_init(&canvas, 59U, 17U, &error) == OD_OK);
-    od_render_history(&canvas, &history, 0U, 0U, NULL, true);
+    od_render_history(&canvas, &history, 0U, 0U, NULL, NULL, true);
     text = rendered_text(&canvas);
     CHECK(strstr(text, "Terminal too small") != NULL);
     CHECK(strstr(text, "[Revert]") == NULL);
@@ -857,6 +845,51 @@ static void test_history_confirmation_names_exact_reverse_operation(void) {
     od_canvas_free(&canvas);
 }
 
+/* Refusal feedback must not rely on an exact match with loaded reasons: a
+ * refresh error, changed classification, or removed record must stay below. */
+static void test_history_refusal_and_refresh_errors_never_reach_top_line(void) {
+    OdHistoryRecord records[12];
+    OdHistory history;
+    history_fixture(records, &history);
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 360U, 32U, &error) == OD_OK);
+    const char *refusal = "Current port is 9999; expected 3001";
+    const char *failure = "Current port is 9999; expected 3001; refresh failed: history log is unreadable";
+    records[1].reason = "Source file is missing";
+    const char *summary = "Revert failed for history #119; refresh failed";
+    od_render_history(&canvas, &history, 1U, 0U, summary, failure, true);
+    char *top = rendered_line(&canvas, 2U);
+    CHECK(strstr(top, summary) != NULL);
+    CHECK(strstr(top, refusal) == NULL);
+    CHECK(strstr(top, "history log is unreadable") == NULL);
+    free(top);
+    char *bottom = rendered_line(&canvas, 30U);
+    CHECK(strstr(bottom, "Source file is missing") != NULL);
+    CHECK(strstr(bottom, failure) != NULL);
+    free(bottom);
+
+    records[1].availability = OD_HISTORY_READY;
+    records[1].reason = NULL;
+    od_render_history(&canvas, &history, 1U, 0U, summary, failure, true);
+    top = rendered_line(&canvas, 2U);
+    CHECK(strstr(top, refusal) == NULL);
+    free(top);
+    bottom = rendered_line(&canvas, 30U);
+    CHECK(strstr(bottom, failure) != NULL);
+    free(bottom);
+
+    OdHistory empty = {0};
+    od_render_history(&canvas, &empty, 0U, 0U, summary, failure, true);
+    top = rendered_line(&canvas, 2U);
+    CHECK(strstr(top, refusal) == NULL);
+    free(top);
+    bottom = rendered_line(&canvas, 30U);
+    CHECK(strstr(bottom, failure) != NULL);
+    free(bottom);
+    od_canvas_free(&canvas);
+}
+
 int main(void) {
     test_menu_dispatch_is_fixed_to_four_items();
     test_menu_degrades_at_minimum_size();
@@ -870,6 +903,7 @@ int main(void) {
     test_history_pagination_clipping_and_empty_state();
     test_history_targets_match_only_visible_actions();
     test_history_confirmation_names_exact_reverse_operation();
+    test_history_refusal_and_refresh_errors_never_reach_top_line();
     if (failures != 0) {
         fprintf(stderr, "%d menu/screen checks failed\n", failures);
         return 1;

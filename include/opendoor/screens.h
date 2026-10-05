@@ -77,11 +77,14 @@ void od_render_conflicts(OdCanvas *canvas,
 size_t od_history_page_size(size_t height);
 size_t od_history_visible_scroll(size_t count, size_t selected,
                                  size_t scroll, size_t height);
+/* status is general outcome feedback. Backend refusal/refresh messages belong
+ * in error_detail, which is rendered only on the bottom detail line. */
 void od_render_history(OdCanvas *canvas,
                         const OdHistory *history,
                         size_t selected,
                         size_t scroll,
                         const char *status,
+                        const char *error_detail,
                         bool ascii);
 void od_render_history_confirmation(OdCanvas *canvas,
                                      const OdHistoryRecord *record,

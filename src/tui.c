@@ -429,6 +429,7 @@ typedef struct {
     bool confirming;
     uint64_t pending_id;
     char status[OD_ERROR_MESSAGE_CAP * 2U];
+    char error_detail[OD_ERROR_MESSAGE_CAP * 2U + 32U];
 } HistoryState;
 
 static size_t history_index_for_id(const OdHistory *history, uint64_t id) {
@@ -455,11 +456,13 @@ static OdStatus reload_history(HistoryState *state, const char *project_root,
     state->history = loaded;
     state->selected = history_index_for_id(&loaded, selected_id);
     if (state->selected == loaded.count) state->selected = 0U;
+    state->error_detail[0] = '\0';
     if (result == OD_OK) {
         set_status(state->status, sizeof(state->status),
                    "Loaded %zu change(s), newest first", loaded.count);
     } else {
-        set_status(state->status, sizeof(state->status), "%s", error->message);
+        set_status(state->status, sizeof(state->status), "Unable to refresh history");
+        set_status(state->error_detail, sizeof(state->error_detail), "%s", error->message);
     }
     return result;
 }
@@ -490,19 +493,23 @@ static void confirm_history_revert(HistoryState *state, const char *project_root
     size_t updated = 0U;
     OdStatus result = od_history_revert(project_root, id, &updated, &error);
     char outcome[OD_ERROR_MESSAGE_CAP];
+    char refusal[OD_ERROR_MESSAGE_CAP] = "";
     if (result == OD_OK) {
         set_status(outcome, sizeof(outcome), "Reverted history #%" PRIu64 "; updated %zu port(s)",
                    id, updated);
     } else {
-        set_status(outcome, sizeof(outcome), "%s", error.message);
+        set_status(outcome, sizeof(outcome), "Revert failed for history #%" PRIu64, id);
+        set_status(refusal, sizeof(refusal), "%s", error.message);
     }
     state->confirming = false;
     state->pending_id = 0U;
     if (reload_history(state, project_root, &error) == OD_OK) {
         set_status(state->status, sizeof(state->status), "%s", outcome);
+        set_status(state->error_detail, sizeof(state->error_detail), "%s", refusal);
     } else {
-        set_status(state->status, sizeof(state->status), "%s; refresh failed: %s",
-                   outcome, error.message);
+        set_status(state->status, sizeof(state->status), "%s; refresh failed", outcome);
+        set_status(state->error_detail, sizeof(state->error_detail), "%s%srefresh failed: %s",
+                   refusal, refusal[0] == '\0' ? "" : "; ", error.message);
     }
 }
 
@@ -522,7 +529,7 @@ static void render_history_screen(OdCanvas *canvas, void *opaque) {
         state->scroll = od_history_visible_scroll(state->history.count, state->selected,
                                                    state->scroll, canvas->height);
         od_render_history(canvas, &state->history, state->selected, state->scroll,
-                            state->status, context->ascii);
+                            state->status, state->error_detail, context->ascii);
     }
 }
 

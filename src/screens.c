@@ -967,7 +967,7 @@ static void history_detail_part(OdCanvas *canvas, int *x, const char *text) {
     *x += (int)(columns > available ? available : columns);
 }
 
-static void history_detail(OdCanvas *canvas, const OdHistoryRecord *record) {
+static int history_detail(OdCanvas *canvas, const OdHistoryRecord *record) {
     char change[40];
     (void)snprintf(change, sizeof(change), " | %u -> %u",
                    (unsigned)record->old_port, (unsigned)record->new_port);
@@ -982,6 +982,7 @@ static void history_detail(OdCanvas *canvas, const OdHistoryRecord *record) {
         history_detail_part(canvas, &x, record->reason == NULL ?
                              "Availability has not been checked" : record->reason);
     }
+    return x;
 }
 
 void od_render_history(OdCanvas *canvas,
@@ -989,6 +990,7 @@ void od_render_history(OdCanvas *canvas,
                         size_t selected,
                         size_t scroll,
                         const char *status,
+                        const char *error_detail,
                         bool ascii) {
     od_canvas_clear(canvas, OD_ROLE_DEFAULT);
     if (canvas->width < 60U || canvas->height < 18U) {
@@ -997,16 +999,6 @@ void od_render_history(OdCanvas *canvas,
     }
     size_t count = history == NULL ? 0U : history->count;
     if (count > 0U && selected >= count) selected = count - 1U;
-    /* A refusal message may outlive its selection. Keep record reasons in
-     * the selected detail line even after navigating to another entry. */
-    for (size_t index = 0U; status != NULL && index < count; ++index) {
-        const OdHistoryRecord *record = &history->items[index];
-        if (record->availability != OD_HISTORY_READY && record->reason != NULL &&
-            strcmp(status, record->reason) == 0) {
-            status = "Revert unavailable; select the change for details";
-            break;
-        }
-    }
     od_canvas_write(canvas, 2, 1, "OPEN DOOR / History",
                     available_width(canvas, 2), OD_ROLE_PRIMARY, 1U);
     od_canvas_write(canvas, 2, 2, status == NULL ?
@@ -1057,11 +1049,16 @@ void od_render_history(OdCanvas *canvas,
         draw_grid_rule(canvas, 1, y + 1, widths, 4U, ascii,
                        offset + 1U == visible ? OD_GRID_BOTTOM : OD_GRID_MIDDLE);
     }
+    int detail_x = 1;
     if (count == 0U) {
         draw_grid_rule(canvas, 1, 7, widths, 4U, ascii, OD_GRID_BOTTOM);
         od_canvas_write_centered(canvas, 9, "No history yet", OD_ROLE_MUTED, 0U);
     } else {
-        history_detail(canvas, &history->items[selected]);
+        detail_x = history_detail(canvas, &history->items[selected]);
+    }
+    if (error_detail != NULL && error_detail[0] != '\0') {
+        if (count > 0U) history_detail_part(canvas, &detail_x, " | ");
+        history_detail_part(canvas, &detail_x, error_detail);
     }
     char page[96];
     (void)snprintf(page, sizeof(page), "Showing %zu%s%zu of %zu change(s)",
