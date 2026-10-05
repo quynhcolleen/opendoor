@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -723,7 +725,301 @@ static void test_history_lock_precedes_source_mutation(void) {
     cleanup_transaction(&fixture);
 }
 
+static OdHistoryRecord *record_for_key(OdHistory *history, const char *key) {
+    for (size_t index = 0U; index < history->count; ++index) {
+        OdHistoryRecord *record = &history->items[index];
+        if (record->environment_key != NULL && strcmp(record->environment_key, key) == 0) {
+            return record;
+        }
+    }
+    CHECK(false);
+    return NULL;
+}
+
+static void applied_history(TransactionFixture *fixture, OdHistory *history) {
+    init_transaction(fixture);
+    size_t updated = 0U;
+    OdError error;
+    CHECK(od_history_apply_resolution(&fixture->resolution, OD_HISTORY_APPLY, NULL,
+                                       &updated, &error) == OD_OK);
+    CHECK(updated == 3U);
+    CHECK(od_history_load(fixture->root, history, &error) == OD_OK);
+}
+
+static void test_snapshot_classification_requires_one_exact_identity(void) {
+    /* Every mutation must deny a different identity or loss of write safety;
+     * line/column/hash differences alone must never deny the recorded span. */
+    OdPortDeclaration original = {
+        .source_kind = OD_SOURCE_ENV, .write_kind = OD_WRITE_ENV_LITERAL,
+        .declaration_kind = OD_DECLARATION_LITERAL, .port = 3001U,
+        .relative_path = "./services/api/.env", .environment_key = "PORT",
+        .byte_offset = 27U, .byte_length = 4U,
+        .line = 99U, .column = 21U, .file_hash = 1U
+    };
+    static const char *reasons[] = {
+        NULL, "Current port is 3002; expected 3001", "moved", "length",
+        "key", "kind", "automatically writable", "automatically writable",
+        "Ambiguous", "missing", "kind"
+    };
+    for (size_t mode = 0U; mode < sizeof(reasons) / sizeof(reasons[0]); ++mode) {
+        OdHistoryRecord record = {0};
+        OdError error;
+        CHECK(od_history_record_parse(apply_json, strlen(apply_json), &record, &error) == OD_OK);
+        OdPortDeclaration declarations[2] = {original, original};
+        OdProjectDiscovery discovery = {.items = declarations, .count = 1U};
+        if (mode == 1U) declarations[0].port = 3002U;
+        if (mode == 2U) ++declarations[0].byte_offset;
+        if (mode == 3U) ++declarations[0].byte_length;
+        if (mode == 4U) declarations[0].environment_key = "ADMIN_PORT";
+        if (mode == 5U) declarations[0].source_kind = OD_SOURCE_COMPOSE;
+        if (mode == 6U) declarations[0].write_kind = OD_WRITE_MANUAL_ONLY;
+        if (mode == 7U) declarations[0].declaration_kind = OD_DECLARATION_ENV_REFERENCE;
+        if (mode == 8U) discovery.count = 2U;
+        if (mode == 9U) declarations[0].relative_path = "./different/.env";
+        if (mode == 10U) declarations[0].write_kind = OD_WRITE_COMPOSE_LITERAL;
+        CHECK(od_history_classify_record(&record, &discovery, &error) == OD_OK);
+        CHECK(record.availability == (mode == 0U ? OD_HISTORY_READY : OD_HISTORY_UNAVAILABLE));
+        if (reasons[mode] != NULL) CHECK(record.reason != NULL && strstr(record.reason, reasons[mode]) != NULL);
+        CHECK(record.id == 42U && record.line == 3U && record.column == 6U);
+        CHECK(record.byte_offset == 27U && record.byte_length == 4U);
+        CHECK(record.old_port == 3000U && record.new_port == 3001U);
+        CHECK(discovery.count == (mode == 8U ? 2U : 1U));
+        od_history_record_free(&record);
+    }
+}
+
+static void test_snapshot_keys_normalize_absent_and_recheck_owned_reasons(void) {
+    OdHistoryRecord record = {0};
+    OdError error;
+    CHECK(od_history_record_parse(apply_json, strlen(apply_json), &record, &error) == OD_OK);
+    free(record.environment_key);
+    record.environment_key = NULL;
+    OdPortDeclaration declaration = {
+        .source_kind = OD_SOURCE_ENV, .write_kind = OD_WRITE_ENV_LITERAL,
+        .declaration_kind = OD_DECLARATION_LITERAL, .port = 3001U,
+        .relative_path = "./services/api/.env", .environment_key = "",
+        .byte_offset = 27U, .byte_length = 4U
+    };
+    OdProjectDiscovery discovery = {.items = &declaration, .count = 1U};
+    CHECK(od_history_classify_record(&record, &discovery, &error) == OD_OK);
+    CHECK(record.availability == OD_HISTORY_READY);
+    record.environment_key = strdup("");
+    declaration.environment_key = NULL;
+    CHECK(od_history_classify_record(&record, &discovery, &error) == OD_OK);
+    CHECK(record.availability == OD_HISTORY_READY);
+    declaration.port = 3010U;
+    CHECK(od_history_classify_record(&record, &discovery, &error) == OD_OK);
+    CHECK(record.availability == OD_HISTORY_UNAVAILABLE);
+    char *retained_reason = record.reason == NULL ? NULL : strdup(record.reason);
+    declaration.port = 3001U;
+    CHECK(retained_reason != NULL && strstr(retained_reason, "3010") != NULL);
+    CHECK(od_history_classify_record(&record, &discovery, &error) == OD_OK);
+    CHECK(record.availability == OD_HISTORY_READY);
+    CHECK(record.reason == NULL || record.reason[0] == '\0');
+    free(retained_reason);
+    od_history_record_free(&record);
+}
+
+static void test_refresh_rediscovery_allows_unrelated_edits_and_exact_state_return(void) {
+    TransactionFixture fixture;
+    OdHistory history = {0};
+    applied_history(&fixture, &history);
+    OdError error;
+    CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+    for (size_t index = 0U; index < history.count; ++index) CHECK(history.items[index].availability == OD_HISTORY_READY);
+    OdHistoryRecord *record = record_for_key(&history, "PORT");
+    if (record != NULL) {
+        write_source(fixture.env, "PORT=10000\nSECOND_PORT=80\n# unrelated edit\n");
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_READY);
+        write_source(fixture.env, "PORT=10001\nSECOND_PORT=80\n# unrelated edit\n");
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "Current port is 10001; expected 10000") != NULL);
+        write_source(fixture.env, "# shifted\nPORT=10000\nSECOND_PORT=80\n");
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "moved") != NULL);
+        write_source(fixture.env, "PORT=10000\nSECOND_PORT=80\n");
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_READY);
+    }
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_refresh_distinguishes_missing_unsafe_and_missing_declaration(void) {
+    TransactionFixture fixture;
+    OdHistory history = {0};
+    applied_history(&fixture, &history);
+    OdHistoryRecord *record = record_for_key(&history, "PORT");
+    OdError error;
+    if (record != NULL) {
+        CHECK(unlink(fixture.env) == 0);
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "file is missing") != NULL);
+        CHECK(symlink(fixture.compose, fixture.env) == 0);
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "unsafe") != NULL);
+        CHECK(unlink(fixture.env) == 0);
+        CHECK(mkfifo(fixture.env, 0600) == 0);
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "unsafe") != NULL);
+        CHECK(unlink(fixture.env) == 0);
+        CHECK(mkdir(fixture.env, 0700) == 0);
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "unsafe") != NULL);
+        CHECK(rmdir(fixture.env) == 0);
+        write_source(fixture.env, "# declaration removed\n");
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "Declaration") != NULL && strstr(record->reason, "missing") != NULL);
+        char linked[512];
+        (void)snprintf(linked, sizeof(linked), "%s/linked", fixture.root);
+        CHECK(symlink(fixture.root, linked) == 0);
+        free(record->relative_path);
+        record->relative_path = strdup("./linked/.env");
+        CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+        CHECK(record->availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(record->reason != NULL && strstr(record->reason, "unsafe") != NULL);
+        CHECK(unlink(linked) == 0);
+    }
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_revert_swaps_ports_records_inverse_and_redoes_different_widths(void) {
+    TransactionFixture fixture;
+    OdHistory history = {0};
+    applied_history(&fixture, &history);
+    OdHistoryRecord *record = record_for_key(&history, "SECOND_PORT");
+    if (record == NULL) { od_history_free(&history); cleanup_transaction(&fixture); return; }
+    uint64_t selected = record->id;
+    od_history_free(&history);
+    write_source(fixture.env, "PORT=10000\nSECOND_PORT=80\n# retained\n");
+    OdError error;
+    size_t updated = 99U;
+    CHECK(od_history_revert(fixture.root, selected, &updated, &error) == OD_OK);
+    CHECK(updated == 1U);
+    check_file(fixture.env, "PORT=10000\nSECOND_PORT=10000\n# retained\n");
+    char backup[544];
+    (void)snprintf(backup, sizeof(backup), "%s.opendoor.bak", fixture.env);
+    check_file(backup, "PORT=10000\nSECOND_PORT=80\n# retained\n");
+    CHECK(od_history_load(fixture.root, &history, &error) == OD_OK);
+    CHECK(history.count == 4U);
+    CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+    if (history.count == 4U) {
+        OdHistoryRecord *inverse = &history.items[0];
+        CHECK(inverse->id == 4U && inverse->kind == OD_HISTORY_REVERT);
+        CHECK(inverse->has_reverts && inverse->reverts == selected);
+        CHECK(inverse->old_port == 80U && inverse->new_port == 10000U);
+        CHECK(inverse->byte_offset == 23U && inverse->byte_length == 5U);
+        CHECK(inverse->availability == OD_HISTORY_READY);
+        CHECK(history.items[2].id == selected && history.items[2].availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(od_history_revert(fixture.root, inverse->id, &updated, &error) == OD_OK);
+        CHECK(updated == 1U);
+    }
+    od_history_free(&history);
+    check_file(fixture.env, "PORT=10000\nSECOND_PORT=80\n# retained\n");
+    CHECK(od_history_load(fixture.root, &history, &error) == OD_OK);
+    CHECK(history.count == 5U);
+    CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+    if (history.count == 5U) {
+        CHECK(history.items[0].kind == OD_HISTORY_REVERT && history.items[0].reverts == 4U);
+        CHECK(history.items[0].old_port == 10000U && history.items[0].new_port == 80U);
+        CHECK(history.items[0].byte_length == 2U && history.items[0].availability == OD_HISTORY_READY);
+        CHECK(history.items[1].availability == OD_HISTORY_UNAVAILABLE);
+        CHECK(history.items[3].id == selected && history.items[3].availability == OD_HISTORY_READY);
+    }
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_revert_reloads_stable_id_and_refuses_stale_without_writes(void) {
+    TransactionFixture fixture;
+    OdHistory history = {0};
+    applied_history(&fixture, &history);
+    OdHistoryRecord *record = record_for_key(&history, "PORT");
+    if (record == NULL) { od_history_free(&history); cleanup_transaction(&fixture); return; }
+    uint64_t selected = record->id;
+    OdError error;
+    CHECK(od_history_refresh(fixture.root, &history, &error) == OD_OK);
+    CHECK(record->availability == OD_HISTORY_READY);
+    write_source(fixture.env, "PORT=10001\nSECOND_PORT=80\n");
+    struct stat before, after;
+    CHECK(stat(fixture.log, &before) == 0);
+    size_t updated = 99U;
+    CHECK(od_history_revert(fixture.root, selected, &updated, &error) == OD_ERROR_CHANGED);
+    CHECK(updated == 0U);
+    CHECK(strstr(error.message, "Current port is 10001; expected 10000") != NULL);
+    check_file(fixture.env, "PORT=10001\nSECOND_PORT=80\n");
+    CHECK(stat(fixture.log, &after) == 0 && before.st_size == after.st_size);
+    char backup[544];
+    (void)snprintf(backup, sizeof(backup), "%s.opendoor.bak", fixture.env);
+    check_file(backup, env_before);
+    CHECK(od_history_revert(fixture.root, UINT64_MAX, &updated, &error) == OD_ERROR_CHANGED);
+    CHECK(updated == 0U && strstr(error.message, "not found") != NULL);
+    /* A saved selection must be loaded again, not authorized by its old row. */
+    write_source(fixture.log, "");
+    write_source(fixture.env, "PORT=10000\nSECOND_PORT=80\n");
+    CHECK(od_history_revert(fixture.root, selected, &updated, &error) == OD_ERROR_CHANGED);
+    CHECK(updated == 0U && strstr(error.message, "not found") != NULL);
+    check_file(fixture.log, "");
+    check_file(fixture.env, "PORT=10000\nSECOND_PORT=80\n");
+    check_file(backup, env_before);
+    od_history_free(&history);
+    cleanup_transaction(&fixture);
+}
+
+static void test_revert_does_not_gate_on_live_socket_or_allocate_a_port(void) {
+    TransactionFixture fixture;
+    init_transaction(&fixture);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    CHECK(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    CHECK(listen(listener, 1) == 0);
+    socklen_t address_length = sizeof(address);
+    CHECK(getsockname(listener, (struct sockaddr *)&address, &address_length) == 0);
+    OdHistoryRecord record = {0};
+    OdError error;
+    CHECK(od_history_record_parse(apply_json, strlen(apply_json), &record, &error) == OD_OK);
+    free(record.relative_path);
+    record.relative_path = strdup("./.env");
+    record.byte_offset = 5U;
+    record.byte_length = 4U;
+    record.new_port = 9999U;
+    record.old_port = ntohs(address.sin_port);
+    char *json = NULL;
+    size_t length = 0U;
+    CHECK(od_history_record_render(&record, &json, &length, &error) == OD_OK);
+    int log = create_log(fixture.root, fixture.directory, fixture.log);
+    if (json != NULL) write_line(log, json);
+    CHECK(close(log) == 0);
+    size_t updated = 99U;
+    CHECK(od_history_revert(fixture.root, 42U, &updated, &error) == OD_OK);
+    CHECK(updated == 1U);
+    char expected[128];
+    (void)snprintf(expected, sizeof(expected), "PORT=%u\nSECOND_PORT=10000\n", (unsigned int)record.old_port);
+    check_file(fixture.env, expected);
+    CHECK(close(listener) == 0);
+    free(json);
+    od_history_record_free(&record);
+    cleanup_transaction(&fixture);
+}
+
 int main(void) {
+    test_snapshot_classification_requires_one_exact_identity();
+    test_snapshot_keys_normalize_absent_and_recheck_owned_reasons();
+    test_refresh_rediscovery_allows_unrelated_edits_and_exact_state_return();
+    test_refresh_distinguishes_missing_unsafe_and_missing_declaration();
+    test_revert_swaps_ports_records_inverse_and_redoes_different_widths();
+    test_revert_reloads_stable_id_and_refuses_stale_without_writes();
+    test_revert_does_not_gate_on_live_socket_or_allocate_a_port();
     test_recorded_apply_has_one_flat_record_per_automatic_edit();
     test_recorded_append_uses_maximum_id_and_accepts_revert_metadata();
     test_short_history_append_restores_sources_and_original_log_bytes();

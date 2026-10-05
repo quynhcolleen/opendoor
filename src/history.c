@@ -1001,3 +1001,249 @@ OdStatus od_history_apply_resolution(const OdResolution *resolution,
     if (transaction.log >= 0) (void)close(transaction.log);
     return status;
 }
+
+static OdStatus set_availability(OdHistoryRecord *record, const char *reason,
+                                  OdError *error) {
+    char *owned_reason = reason == NULL ? NULL : strdup(reason);
+    if (reason != NULL && owned_reason == NULL) {
+        record->availability = OD_HISTORY_UNCHECKED;
+        od_error_set(error, OD_ERROR_MEMORY, "unable to store history availability reason");
+        return OD_ERROR_MEMORY;
+    }
+    free(record->reason);
+    record->reason = owned_reason;
+    record->availability = reason == NULL ? OD_HISTORY_READY : OD_HISTORY_UNAVAILABLE;
+    od_error_clear(error);
+    return OD_OK;
+}
+
+static bool same_key(const char *left, const char *right) {
+    return strcmp(left == NULL ? "" : left, right == NULL ? "" : right) == 0;
+}
+
+static bool auto_writable(const OdPortDeclaration *declaration) {
+    return declaration->declaration_kind == OD_DECLARATION_LITERAL &&
+           ((declaration->source_kind == OD_SOURCE_ENV &&
+             declaration->write_kind == OD_WRITE_ENV_LITERAL) ||
+            (declaration->source_kind == OD_SOURCE_COMPOSE &&
+             declaration->write_kind == OD_WRITE_COMPOSE_LITERAL));
+}
+
+static OdStatus classify_record(OdHistoryRecord *record,
+                                 const OdProjectDiscovery *discovery,
+                                 const OdPortDeclaration **match,
+                                 OdError *error) {
+    if (match != NULL) *match = NULL;
+    if (record == NULL || record->relative_path == NULL || discovery == NULL ||
+        (discovery->count > 0U && discovery->items == NULL)) {
+        od_error_set(error, OD_ERROR_INVALID, "history record and discovery are required");
+        return OD_ERROR_INVALID;
+    }
+    const OdPortDeclaration *exact = NULL;
+    size_t exact_count = 0U;
+    bool moved = false, changed_length = false, changed_key = false;
+    bool changed_kind = false, manual = false;
+    for (size_t index = 0U; index < discovery->count; ++index) {
+        const OdPortDeclaration *declaration = &discovery->items[index];
+        if (declaration->relative_path == NULL ||
+            strcmp(declaration->relative_path, record->relative_path) != 0) continue;
+        bool key_matches = same_key(declaration->environment_key, record->environment_key);
+        bool kinds_match = declaration->source_kind == record->source_kind &&
+                           declaration->write_kind == record->write_kind;
+        if (declaration->byte_offset != record->byte_offset) {
+            if (key_matches && kinds_match) moved = true;
+            continue;
+        }
+        if (declaration->byte_length != record->byte_length) {
+            changed_length = true;
+            continue;
+        }
+        if (declaration->declaration_kind != OD_DECLARATION_LITERAL ||
+            declaration->write_kind == OD_WRITE_MANUAL_ONLY) manual = true;
+        if (!key_matches) changed_key = true;
+        if (!kinds_match) changed_kind = true;
+        if (key_matches && kinds_match) {
+            exact = declaration;
+            ++exact_count;
+        }
+    }
+    if (exact_count > 1U) {
+        return set_availability(record, "Ambiguous declaration: multiple matches at the recorded span", error);
+    }
+    if (exact != NULL) {
+        if (!auto_writable(exact)) {
+            return set_availability(record, "Declaration is no longer automatically writable", error);
+        }
+        if (exact->port != record->new_port) {
+            char reason[80];
+            (void)snprintf(reason, sizeof(reason), "Current port is %u; expected %u",
+                           (unsigned int)exact->port, (unsigned int)record->new_port);
+            return set_availability(record, reason, error);
+        }
+        OdStatus status = set_availability(record, NULL, error);
+        if (status == OD_OK && match != NULL) *match = exact;
+        return status;
+    }
+    const char *reason = "Declaration is missing or moved from the recorded span";
+    if (manual) reason = "Declaration is no longer automatically writable";
+    else if (changed_kind) reason = "Declaration source or write kind changed at the recorded span";
+    else if (changed_key) reason = "Declaration key changed at the recorded span";
+    else if (changed_length) reason = "Declaration byte length changed at the recorded offset";
+    else if (moved) reason = "Declaration moved from the recorded byte offset";
+    return set_availability(record, reason, error);
+}
+
+OdStatus od_history_classify_record(OdHistoryRecord *record,
+                                     const OdProjectDiscovery *discovery,
+                                     OdError *error) {
+    return classify_record(record, discovery, NULL, error);
+}
+
+/* Check every path component under the opened root, without following links.
+ * A nonblocking final open also makes FIFOs and devices safe to reject. */
+static OdStatus source_safety(int root, OdHistoryRecord *record, bool *safe,
+                               OdError *error) {
+    *safe = false;
+    const char *path = record->relative_path;
+    if (!valid_relative_path(path) || strncmp(path, "./", 2U) != 0 ||
+        path[2] == '\0' || strstr(path, "//") != NULL) {
+        return set_availability(record, "Source file path is unsafe", error);
+    }
+    char *copy = strdup(path + 2U);
+    if (copy == NULL) {
+        od_error_set(error, OD_ERROR_MEMORY, "unable to inspect history source path");
+        return OD_ERROR_MEMORY;
+    }
+    int current = dup(root);
+    if (current < 0) {
+        free(copy);
+        return history_io_error(error, "unable to inspect history source directory");
+    }
+    const char *reason = NULL;
+    char *part = copy;
+    for (;;) {
+        char *slash = strchr(part, '/');
+        if (slash != NULL) *slash = '\0';
+        if (strcmp(part, ".") == 0 || part[0] == '\0') {
+            reason = "Source file path is unsafe";
+            break;
+        }
+        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+        if (slash != NULL) flags |= O_DIRECTORY;
+        int next = openat(current, part, flags);
+        if (next < 0) {
+            reason = errno == ENOENT ? "Source file is missing" :
+                                      "Source file is unsafe or unreadable";
+            break;
+        }
+        (void)close(current);
+        current = next;
+        if (slash == NULL) {
+            struct stat information;
+            if (fstat(current, &information) != 0 || !S_ISREG(information.st_mode)) {
+                reason = "Source file is unsafe or is not a regular file";
+            }
+            break;
+        }
+        part = slash + 1U;
+    }
+    (void)close(current);
+    free(copy);
+    if (reason != NULL) return set_availability(record, reason, error);
+    *safe = true;
+    return OD_OK;
+}
+
+static OdStatus classify_current_record(int root, OdHistoryRecord *record,
+                                         const OdProjectDiscovery *discovery,
+                                         const OdPortDeclaration **match,
+                                         OdError *error) {
+    if (match != NULL) *match = NULL;
+    bool safe = false;
+    OdStatus status = source_safety(root, record, &safe, error);
+    if (status == OD_OK && safe) status = classify_record(record, discovery, match, error);
+    return status;
+}
+
+OdStatus od_history_refresh(const char *project_root, OdHistory *history,
+                             OdError *error) {
+    if (project_root == NULL || history == NULL ||
+        (history->count > 0U && history->items == NULL)) {
+        od_error_set(error, OD_ERROR_INVALID, "history project root and records are required");
+        return OD_ERROR_INVALID;
+    }
+    /* A failed refresh must not leave previously ready rows actionable. */
+    for (size_t index = 0U; index < history->count; ++index) {
+        history->items[index].availability = OD_HISTORY_UNCHECKED;
+    }
+    int root = -1;
+    OdProjectDiscovery discovery = {0};
+    OdStatus status = open_root(project_root, &root, error);
+    if (status == OD_OK) status = od_discover_project_ports(project_root, &discovery, error);
+    for (size_t index = 0U; status == OD_OK && index < history->count; ++index) {
+        status = classify_current_record(root, &history->items[index], &discovery, NULL, error);
+    }
+    od_project_discovery_free(&discovery);
+    if (root >= 0) (void)close(root);
+    if (status == OD_OK) od_error_clear(error);
+    return status;
+}
+
+OdStatus od_history_revert(const char *project_root, uint64_t record_id,
+                            size_t *updated, OdError *error) {
+    if (updated != NULL) *updated = 0U;
+    if (project_root == NULL || record_id == 0U || updated == NULL) {
+        od_error_set(error, OD_ERROR_INVALID, "history project root, record ID and update count are required");
+        return OD_ERROR_INVALID;
+    }
+    char *canonical = realpath(project_root, NULL);
+    if (canonical == NULL) return history_io_error(error, "unable to resolve history project root");
+    OdHistory history = {0};
+    OdProjectDiscovery discovery = {0};
+    int root = -1;
+    OdStatus status = od_history_load(canonical, &history, error);
+    OdHistoryRecord *record = NULL;
+    for (size_t index = 0U; status == OD_OK && index < history.count; ++index) {
+        if (history.items[index].id == record_id) {
+            record = &history.items[index];
+            break;
+        }
+    }
+    if (status == OD_OK && record == NULL) {
+        od_error_set(error, OD_ERROR_CHANGED, "History record %" PRIu64 " was not found", record_id);
+        status = OD_ERROR_CHANGED;
+    }
+    if (status == OD_OK) status = open_root(canonical, &root, error);
+    if (status == OD_OK) status = od_discover_project_ports(canonical, &discovery, error);
+    const OdPortDeclaration *declaration = NULL;
+    if (status == OD_OK) {
+        status = classify_current_record(root, record, &discovery, &declaration, error);
+    }
+    if (status == OD_OK && record->availability != OD_HISTORY_READY) {
+        od_error_set(error, OD_ERROR_CHANGED, "%s", record->reason);
+        status = OD_ERROR_CHANGED;
+    }
+    if (status == OD_OK) {
+        /* Borrow only fresh discovery metadata. Persistence performs the final
+         * file hash/span preflight, source mutation and rollback. */
+        OdResolutionItem item = {
+            .variable = declaration->environment_key,
+            .old_port = declaration->port, .new_port = record->old_port,
+            .automatic = true, .source_kind = declaration->source_kind,
+            .write_kind = declaration->write_kind,
+            .line = declaration->line, .column = declaration->column,
+            .byte_offset = declaration->byte_offset, .byte_length = declaration->byte_length,
+            .file_size = declaration->file_size, .file_hash = declaration->file_hash,
+            .absolute_path = declaration->absolute_path, .relative_path = declaration->relative_path
+        };
+        OdResolution resolution = {.items = &item, .count = 1U, .automatic_count = 1U,
+                                     .project_root = canonical};
+        status = od_history_apply_resolution(&resolution, OD_HISTORY_REVERT, &record_id,
+                                              updated, error);
+    }
+    if (root >= 0) (void)close(root);
+    od_project_discovery_free(&discovery);
+    od_history_free(&history);
+    free(canonical);
+    return status;
+}

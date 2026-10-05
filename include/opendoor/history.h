@@ -60,6 +60,20 @@ OdStatus od_history_record_render(const OdHistoryRecord *record,
                                    char **text, size_t *length, OdError *error);
 OdStatus od_history_load(const char *project_root, OdHistory *history,
                           OdError *error);
+/* Pure snapshot classification: borrows discovery, and replaces only the
+ * record's availability and owned reason. NULL and empty keys are equivalent.
+ * This does not verify file safety or authorize mutation. */
+OdStatus od_history_classify_record(OdHistoryRecord *record,
+                                     const OdProjectDiscovery *discovery,
+                                     OdError *error);
+/* Rediscover the project and refresh availability/reasons in already loaded
+ * records, including source path safety. Never creates history storage. */
+OdStatus od_history_refresh(const char *project_root, OdHistory *history,
+                             OdError *error);
+/* Reload by stable ID, rediscover and revalidate, then perform one recorded
+ * reverse transaction. Refusal leaves updated at zero. */
+OdStatus od_history_revert(const char *project_root, uint64_t record_id,
+                            size_t *updated, OdError *error);
 /* Records each automatic edit under an exclusive history lock. Normal apply
  * uses OD_HISTORY_APPLY and NULL; revert uses OD_HISTORY_REVERT and a target ID.
  * Eligibility for a revert must be checked by the caller. Logging errors roll
