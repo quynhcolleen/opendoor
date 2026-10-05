@@ -55,11 +55,12 @@ static const OdCell *canvas_cell(const OdCanvas *canvas, size_t x, size_t y) {
     return &canvas->cells[y * canvas->width + x];
 }
 
-static void test_menu_dispatch_is_fixed_to_three_items(void) {
-    CHECK(OD_MENU_COUNT == 3);
+static void test_menu_dispatch_is_fixed_to_four_items(void) {
+    CHECK(OD_MENU_COUNT == 4);
     CHECK(od_menu_dispatch(0U) == OD_MENU_DASHBOARD);
     CHECK(od_menu_dispatch(1U) == OD_MENU_RESOLVE_CONFLICTS);
-    CHECK(od_menu_dispatch(2U) == OD_MENU_QUIT);
+    CHECK(od_menu_dispatch(2U) == OD_MENU_HISTORY);
+    CHECK(od_menu_dispatch(3U) == OD_MENU_QUIT);
     CHECK(od_menu_dispatch(99U) == OD_MENU_QUIT);
 
     OdCanvas canvas;
@@ -69,9 +70,11 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     char *text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "Dashboard") != NULL);
     CHECK(text != NULL && strstr(text, "Resolve conflicts") != NULL);
+    CHECK(text != NULL && strstr(text, "History") != NULL);
     CHECK(text != NULL && strstr(text, "Quit") != NULL);
     CHECK(text != NULL && strstr(text, "Ports in this project") != NULL);
     CHECK(text != NULL && strstr(text, "Find and fix port clashes") != NULL);
+    CHECK(text != NULL && strstr(text, "View and revert past changes") != NULL);
     CHECK(text != NULL && strstr(text, "Pre-start port check - example/opendoor") != NULL);
     CHECK(text != NULL && strstr(text, "/tmp/example/opendoor") == NULL);
     CHECK(text != NULL &&
@@ -81,11 +84,11 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     CHECK(text != NULL && strstr(text, "Discover this project") == NULL);
     CHECK(text != NULL && strstr(text, "Settings") == NULL);
     CHECK(strcmp(canvas_cell(&canvas, 11U, 8U)->glyph, "+") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 68U, 14U)->glyph, "+") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 68U, 15U)->glyph, "+") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 35U, 8U)->glyph, "|") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 44U, 8U)->glyph, "|") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 15U, 9U)->glyph, " ") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 15U, 13U)->glyph, " ") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 15U, 14U)->glyph, " ") == 0);
     for (size_t x = 12U; x <= 67U; ++x) {
         CHECK(canvas_cell(&canvas, x, 11U)->role == OD_ROLE_SELECTED);
     }
@@ -97,7 +100,8 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     CHECK(strcmp(canvas_cell(&canvas, 13U, 12U)->glyph, " ") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 15U, 10U)->glyph, "D") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 15U, 11U)->glyph, "R") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 15U, 12U)->glyph, "Q") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 15U, 12U)->glyph, "H") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 15U, 13U)->glyph, "Q") == 0);
     CHECK(canvas_cell(&canvas, 15U, 10U)->role == OD_ROLE_DEFAULT);
     CHECK(canvas_cell(&canvas, 15U, 10U)->attributes == 1U);
     CHECK(canvas_cell(&canvas, 36U, 10U)->role == OD_ROLE_MUTED);
@@ -110,14 +114,16 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     CHECK(strcmp(canvas_cell(&canvas, 33U, 11U)->glyph, " ") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 34U, 11U)->glyph, " ") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 35U, 11U)->glyph, " ") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 36U, 12U)->glyph, " ") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 36U, 12U)->glyph, "V") == 0);
+    CHECK(canvas_cell(&canvas, 36U, 12U)->role == OD_ROLE_MUTED);
+    CHECK(strcmp(canvas_cell(&canvas, 36U, 13U)->glyph, " ") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 67U, 10U)->glyph, " ") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 20U, 15U)->glyph, " ") == 0);
-    CHECK(canvas_cell(&canvas, 20U, 16U)->role == OD_ROLE_PRIMARY);
-    CHECK(canvas_cell(&canvas, 20U, 16U)->attributes == 1U);
-    CHECK(canvas_cell(&canvas, 28U, 16U)->role == OD_ROLE_MUTED);
-    CHECK(strcmp(canvas_cell(&canvas, 25U, 17U)->glyph, " ") == 0);
-    CHECK(canvas_cell(&canvas, 37U, 18U)->role == OD_ROLE_MUTED);
+    CHECK(strcmp(canvas_cell(&canvas, 20U, 16U)->glyph, " ") == 0);
+    CHECK(canvas_cell(&canvas, 20U, 17U)->role == OD_ROLE_PRIMARY);
+    CHECK(canvas_cell(&canvas, 20U, 17U)->attributes == 1U);
+    CHECK(canvas_cell(&canvas, 28U, 17U)->role == OD_ROLE_MUTED);
+    CHECK(strcmp(canvas_cell(&canvas, 25U, 18U)->glyph, " ") == 0);
+    CHECK(canvas_cell(&canvas, 37U, 19U)->role == OD_ROLE_MUTED);
 
     od_render_main_menu(&canvas, 2U, "/tmp/example/opendoor", "Ready", true);
     for (size_t x = 12U; x <= 67U; ++x) {
@@ -125,6 +131,15 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
         CHECK(canvas_cell(&canvas, x, 11U)->role != OD_ROLE_SELECTED);
     }
     CHECK(canvas_cell(&canvas, 15U, 12U)->attributes == 1U);
+    CHECK(canvas_cell(&canvas, 36U, 12U)->role == OD_ROLE_SELECTED);
+    CHECK(canvas_cell(&canvas, 36U, 12U)->attributes == 0U);
+    CHECK(strcmp(canvas_cell(&canvas, 13U, 12U)->glyph, ">") == 0);
+    od_render_main_menu(&canvas, 3U, "/tmp/example/opendoor", "Ready", true);
+    for (size_t x = 12U; x <= 67U; ++x) {
+        CHECK(canvas_cell(&canvas, x, 13U)->role == OD_ROLE_SELECTED);
+        CHECK(canvas_cell(&canvas, x, 12U)->role != OD_ROLE_SELECTED);
+    }
+    CHECK(strcmp(canvas_cell(&canvas, 13U, 13U)->glyph, ">") == 0);
     free(text);
     od_canvas_free(&canvas);
 
@@ -157,9 +172,9 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     CHECK(text != NULL && strstr(text, "Pre-start port check · .") == NULL);
     CHECK(text != NULL && strstr(text, fake_project) == NULL);
     CHECK(strcmp(canvas_cell(&canvas, 21U, 15U)->glyph, "╭") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 78U, 21U)->glyph, "╯") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 78U, 22U)->glyph, "╯") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 25U, 16U)->glyph, " ") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 25U, 20U)->glyph, " ") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 25U, 21U)->glyph, " ") == 0);
     for (size_t x = 22U; x <= 77U; ++x) {
         CHECK(canvas_cell(&canvas, x, 17U)->role == OD_ROLE_SELECTED);
     }
@@ -167,15 +182,17 @@ static void test_menu_dispatch_is_fixed_to_three_items(void) {
     CHECK(strcmp(canvas_cell(&canvas, 23U, 17U)->glyph, "▶") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 23U, 18U)->glyph, " ") == 0);
     CHECK(strcmp(canvas_cell(&canvas, 23U, 19U)->glyph, " ") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 25U, 19U)->glyph, "H") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 25U, 20U)->glyph, "Q") == 0);
     CHECK(canvas_cell(&canvas, 25U, 17U)->attributes == 1U);
     CHECK(canvas_cell(&canvas, 46U, 17U)->role == OD_ROLE_SELECTED);
     CHECK(canvas_cell(&canvas, 46U, 17U)->attributes == 0U);
     CHECK(strcmp(canvas_cell(&canvas, 45U, 17U)->glyph, " ") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 28U, 22U)->glyph, " ") == 0);
-    CHECK(canvas_cell(&canvas, 32U, 23U)->role == OD_ROLE_PRIMARY);
-    CHECK(canvas_cell(&canvas, 35U, 23U)->role == OD_ROLE_MUTED);
-    CHECK(strcmp(canvas_cell(&canvas, 35U, 24U)->glyph, " ") == 0);
-    CHECK(canvas_cell(&canvas, 47U, 25U)->role == OD_ROLE_MUTED);
+    CHECK(strcmp(canvas_cell(&canvas, 28U, 23U)->glyph, " ") == 0);
+    CHECK(canvas_cell(&canvas, 32U, 24U)->role == OD_ROLE_PRIMARY);
+    CHECK(canvas_cell(&canvas, 35U, 24U)->role == OD_ROLE_MUTED);
+    CHECK(strcmp(canvas_cell(&canvas, 35U, 25U)->glyph, " ") == 0);
+    CHECK(canvas_cell(&canvas, 47U, 26U)->role == OD_ROLE_MUTED);
     free(text);
     od_canvas_free(&canvas);
     CHECK(chdir(original_directory) == 0);
@@ -193,20 +210,23 @@ static void test_menu_degrades_at_minimum_size(void) {
     OdCanvas canvas;
     OdError error;
     CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
-    od_render_main_menu(&canvas, 2U,
+    od_render_main_menu(&canvas, 3U,
                         "/tmp/a-project-with-a-very-long-directory-name-for-menu-testing",
                         "Run before starting project services", true);
     char *text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "Dashboard") != NULL);
     CHECK(text != NULL && strstr(text, "Resolve conflicts") != NULL);
+    CHECK(text != NULL && strstr(text, "History") != NULL);
     CHECK(text != NULL && strstr(text, "Quit") != NULL);
     CHECK(text != NULL && strstr(text, "Ports in this project") == NULL);
     CHECK(text != NULL && strstr(text, "Find and fix port clashes") == NULL);
+    CHECK(text != NULL && strstr(text, "View and revert past changes") == NULL);
     CHECK(text != NULL && strstr(text, "Run before starting project services") == NULL);
     CHECK(text != NULL && strstr(text, "...") != NULL);
     CHECK(strcmp(canvas_cell(&canvas, 2U, 6U)->glyph, "+") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 57U, 12U)->glyph, "+") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 4U, 10U)->glyph, ">") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 57U, 13U)->glyph, "+") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 6U, 10U)->glyph, "H") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 4U, 11U)->glyph, ">") == 0);
     free(text);
     od_canvas_free(&canvas);
 
@@ -252,9 +272,12 @@ static void test_mouse_targets_match_visible_controls(void) {
     target = od_menu_mouse_target(100U, 32U, false, 40, 19);
     CHECK(target.action == OD_MOUSE_MENU_ITEM);
     CHECK(target.item == 2U);
+    target = od_menu_mouse_target(100U, 32U, false, 40, 20);
+    CHECK(target.action == OD_MOUSE_MENU_ITEM);
+    CHECK(target.item == 3U);
     target = od_menu_mouse_target(100U, 32U, false, 40, 16);
     CHECK(target.action == OD_MOUSE_NONE);
-    target = od_menu_mouse_target(100U, 32U, false, 40, 20);
+    target = od_menu_mouse_target(100U, 32U, false, 40, 21);
     CHECK(target.action == OD_MOUSE_NONE);
     target = od_menu_mouse_target(100U, 32U, false, 21, 17);
     CHECK(target.action == OD_MOUSE_NONE);
@@ -270,9 +293,16 @@ static void test_mouse_targets_match_visible_controls(void) {
     target = od_menu_mouse_target(60U, 18U, true, 20, 10);
     CHECK(target.action == OD_MOUSE_MENU_ITEM);
     CHECK(target.item == 2U);
+    target = od_menu_mouse_target(60U, 18U, true, 20, 11);
+    CHECK(target.action == OD_MOUSE_MENU_ITEM);
+    CHECK(target.item == 3U);
     target = od_menu_mouse_target(60U, 18U, true, 20, 7);
     CHECK(target.action == OD_MOUSE_NONE);
-    target = od_menu_mouse_target(60U, 18U, true, 20, 11);
+    target = od_menu_mouse_target(60U, 18U, true, 20, 12);
+    CHECK(target.action == OD_MOUSE_NONE);
+    target = od_menu_mouse_target(59U, 18U, true, 20, 10);
+    CHECK(target.action == OD_MOUSE_NONE);
+    target = od_menu_mouse_target(60U, 17U, true, 20, 10);
     CHECK(target.action == OD_MOUSE_NONE);
 
     target = od_dashboard_mouse_target(80U, 24U, 18, 23);
@@ -564,7 +594,7 @@ static void test_conflicts_have_one_whole_plan_action(void) {
 }
 
 int main(void) {
-    test_menu_dispatch_is_fixed_to_three_items();
+    test_menu_dispatch_is_fixed_to_four_items();
     test_menu_degrades_at_minimum_size();
     test_update_is_cli_only_and_must_be_used_alone();
     test_mouse_targets_match_visible_controls();

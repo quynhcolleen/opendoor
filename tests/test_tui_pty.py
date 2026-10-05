@@ -146,6 +146,16 @@ def main() -> int:
                 assert b"\x1b[38;5;245m" in bytes(session.output), \
                     "256-color menu did not render muted text with color 245"
 
+                resolve_selection = session.mark()
+                session.send(b"\x1bOB")
+                session.wait_for("> Resolve conflicts", resolve_selection)
+                history_selection = session.mark()
+                session.send(b"\x1bOB")
+                session.wait_for("> History", history_selection)
+                quit_selection = session.mark()
+                session.send(b"\x1bOB")
+                session.wait_for("> Quit", quit_selection)
+
                 dashboard_mark = session.mark()
                 session.click(50, 14)
                 session.wait_for("RELATIVE FOLDER", dashboard_mark)
@@ -190,7 +200,14 @@ def main() -> int:
                 assert not Path(f"{env_path}.opendoor.bak").exists(), \
                     "Resolve cancel created a backup"
 
+                history_mark = session.mark()
                 session.click(50, 16)
+                session.wait_for("Returned from History", history_mark)
+                assert env_path.read_bytes() == refreshed, "History modified the fixture"
+                assert not (project / ".opendoor").exists(), \
+                    "History created project state"
+
+                session.click(50, 17)
                 session.finish()
             except BaseException:
                 session.abort()
@@ -226,7 +243,7 @@ def main() -> int:
             back_mark = session.mark()
             session.send(b"q")
             session.wait_for("Pre-start port check", back_mark)
-            session.click(50, 16)
+            session.click(50, 17)
             session.finish()
         except BaseException:
             session.abort()

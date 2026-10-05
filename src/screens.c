@@ -17,12 +17,14 @@ static const char *const banner[] = {
 static const char *const menu_labels[OD_MENU_COUNT] = {
     "Dashboard",
     "Resolve conflicts",
+    "History",
     "Quit"
 };
 
 static const char *const menu_descriptions[OD_MENU_COUNT] = {
     "Ports in this project",
     "Find and fix port clashes",
+    "View and revert past changes",
     NULL
 };
 
@@ -239,7 +241,7 @@ static OdMenuLayout menu_layout(size_t width, size_t height, bool ascii) {
         sizeof(banner) / sizeof(banner[0]) : 1U;
     bool show_descriptions = height >= 22U;
     bool show_reminder = height >= 20U;
-    int panel_height = 7;
+    int panel_height = (int)OD_MENU_COUNT + 4;
     int composition_height = (int)logo_height + panel_height + 5 +
         (show_reminder ? 2 : 0);
     int top = (int)height > composition_height ?

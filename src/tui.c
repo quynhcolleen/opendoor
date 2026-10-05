@@ -419,6 +419,11 @@ static void run_conflicts(const char *project_root, bool ascii) {
     conflict_state_free(&state);
 }
 
+static void run_history(char *menu_status, size_t capacity) {
+    /* The History screen will replace this non-writing entry point. */
+    set_status(menu_status, capacity, "Returned from History");
+}
+
 int od_tui_run(const OpendoorOptions *options) {
     const char *project = options->project_path == NULL ? "." : options->project_path;
     (void)setlocale(LC_ALL, "");
@@ -457,6 +462,9 @@ int od_tui_run(const OpendoorOptions *options) {
                 run_conflicts(project, options->force_ascii);
                 set_status(menu_status, sizeof(menu_status),
                            "Returned from Resolve conflicts");
+                break;
+            case OD_MENU_HISTORY:
+                run_history(menu_status, sizeof(menu_status));
                 break;
             case OD_MENU_QUIT:
             case OD_MENU_COUNT:

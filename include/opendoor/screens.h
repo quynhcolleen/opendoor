@@ -11,6 +11,7 @@
 typedef enum {
     OD_MENU_DASHBOARD = 0,
     OD_MENU_RESOLVE_CONFLICTS,
+    OD_MENU_HISTORY,
     OD_MENU_QUIT,
     OD_MENU_COUNT
 } OdMenuItem;
