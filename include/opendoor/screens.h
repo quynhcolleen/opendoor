@@ -22,7 +22,9 @@ typedef enum {
     OD_MOUSE_MENU_ITEM,
     OD_MOUSE_REFRESH,
     OD_MOUSE_BACK,
-    OD_MOUSE_APPLY_ALL,
+    OD_MOUSE_WARNINGS,
+    OD_MOUSE_CONFLICT_ROW,
+    OD_MOUSE_CONFLICT_APPLY,
     OD_MOUSE_HISTORY_ROW,
     OD_MOUSE_HISTORY_REVERT,
     OD_MOUSE_HISTORY_CONFIRM
@@ -45,7 +47,9 @@ OdMouseTarget od_dashboard_mouse_target(size_t width,
                                         int y);
 OdMouseTarget od_conflicts_mouse_target(size_t width,
                                         size_t height,
-                                        bool apply_available,
+                                        const OdResolution *resolution,
+                                        size_t selected,
+                                        size_t scroll,
                                         int x,
                                         int y);
 OdMouseTarget od_history_mouse_target(size_t width,
@@ -66,14 +70,40 @@ void od_render_dashboard(OdCanvas *canvas,
                          const OdDashboard *dashboard,
                          const char *status,
                          bool ascii);
-size_t od_resolution_visual_line_count(const OdResolution *resolution);
+void od_render_dashboard_loading(OdCanvas *canvas, bool ascii);
+void od_render_conflicts_loading(OdCanvas *canvas, bool ascii);
+void od_render_conflicts_apply_loading(OdCanvas *canvas, bool ascii);
+void od_render_history_loading(OdCanvas *canvas, bool ascii);
 void od_render_conflicts(OdCanvas *canvas,
                          const OdResolution *resolution,
+                         size_t selected,
                          size_t scroll,
-                         bool apply_available,
                          bool prepared,
                          const char *status,
                          bool ascii);
+/* Report-aware views preserve the clean-screen entry points above. Resolve's
+ * cursor traverses warning entries followed by conflict groups; scroll is in
+ * document lines. Dashboard warning rows are read-only. */
+void od_render_dashboard_report(OdCanvas *canvas, const OdDashboard *dashboard,
+                                const char *status, bool ascii,
+                                const OdScanReport *report, bool warnings_view,
+                                size_t warning_scroll);
+OdMouseTarget od_dashboard_report_mouse_target(size_t width, size_t height,
+                                               const OdScanReport *report,
+                                               bool warnings_view, int x, int y);
+size_t od_scan_warning_rows(const OdScanReport *report);
+size_t od_conflicts_report_scroll(const OdResolution *resolution,
+                                  const OdScanReport *report, size_t selected,
+                                  size_t scroll, size_t height);
+void od_render_conflicts_report(OdCanvas *canvas, const OdResolution *resolution,
+                                size_t selected, size_t scroll, bool prepared,
+                                const char *status, bool ascii,
+                                const OdScanReport *report);
+OdMouseTarget od_conflicts_report_mouse_target(size_t width, size_t height,
+                                               const OdResolution *resolution,
+                                               size_t selected, size_t scroll,
+                                               const OdScanReport *report,
+                                               int x, int y);
 size_t od_history_page_size(size_t height);
 size_t od_history_visible_scroll(size_t count, size_t selected,
                                  size_t scroll, size_t height);

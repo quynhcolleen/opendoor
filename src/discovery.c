@@ -141,10 +141,7 @@ void od_project_discovery_free(OdProjectDiscovery *result) {
         free(result->environment_assignments[index].environment_key);
     }
     free(result->environment_assignments);
-    for (size_t index = 0U; index < result->warning_count; ++index) {
-        free(result->warnings[index]);
-    }
-    free(result->warnings);
+    od_scan_report_free(&result->report);
     *result = (OdProjectDiscovery){0};
 }
 
@@ -152,23 +149,12 @@ static OdStatus add_warning(OdProjectDiscovery *result,
                             const char *path,
                             const char *detail,
                             OdError *error) {
-    size_t length = strlen(path) + strlen(detail) + 3U;
-    char *warning = malloc(length);
-    if (warning == NULL) {
-        od_error_set(error, OD_ERROR_MEMORY, "unable to store discovery warning");
-        return OD_ERROR_MEMORY;
-    }
-    (void)snprintf(warning, length, "%s: %s", path, detail);
-    char **warnings = realloc(result->warnings,
-                              (result->warning_count + 1U) * sizeof(*warnings));
-    if (warnings == NULL) {
-        free(warning);
-        od_error_set(error, OD_ERROR_MEMORY, "unable to grow discovery warnings");
-        return OD_ERROR_MEMORY;
-    }
-    result->warnings = warnings;
-    result->warnings[result->warning_count++] = warning;
-    return OD_OK;
+    /* Producers only pass project-relative paths. Normalize the root/prefix. */
+    char subject[OD_PATH_CAP + 3U];
+    (void)snprintf(subject, sizeof(subject), strncmp(path, "./", 2U) == 0 ?
+                   "%s" : "./%s", strcmp(path, ".") == 0 ? "" : path);
+    return od_scan_report_add(&result->report, OD_WARNING_DISCOVERY,
+                               subject, detail, error);
 }
 
 static OdStatus append_env_declaration(OdProjectDiscovery *result,
@@ -808,6 +794,7 @@ static OdStatus parse_compose_text(OdProjectDiscovery *result,
             size_t scalar_start = 0U;
             size_t scalar_end = 0U;
             bool malformed_quote = false;
+            bool recognized = false;
             if (compose_list_scalar(text, cursor, content_end, &scalar_start,
                                     &scalar_end, &malformed_quote)) {
                 ComposeMapping mapping;
@@ -818,7 +805,15 @@ static OdStatus parse_compose_text(OdProjectDiscovery *result,
                         content_end - line_start, text + scalar_start, scalar_start,
                         &mapping, line_number, line_start, length, file_hash, error);
                     if (status != OD_OK) return status;
+                    recognized = true;
                 }
+            }
+            if (!recognized && text[cursor] == '-') {
+                char reason[96];
+                (void)snprintf(reason, sizeof(reason),
+                               "unsupported Compose port syntax at line %zu", line_number);
+                OdStatus status = add_warning(result, relative_path, reason, error);
+                if (status != OD_OK) return status;
             }
         }
         line_start = line_end < length ? line_end + 1U : length;

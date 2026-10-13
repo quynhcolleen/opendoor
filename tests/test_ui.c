@@ -1,6 +1,7 @@
 #include "opendoor/app.h"
 #include "opendoor/history.h"
 #include "opendoor/screens.h"
+#include "opendoor/tui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,30 @@
 #include <unistd.h>
 
 static int failures = 0;
+
+int __real_doupdate(void);
+
+typedef struct {
+    char events[16];
+    size_t count;
+    bool intercept_flush;
+} FlushTrace;
+
+static FlushTrace *active_flush_trace = NULL;
+
+static void trace_event(FlushTrace *trace, char event) {
+    if (trace == NULL || trace->count + 1U >= sizeof(trace->events)) return;
+    trace->events[trace->count++] = event;
+    trace->events[trace->count] = '\0';
+}
+
+int __wrap_doupdate(void) {
+    if (active_flush_trace != NULL && active_flush_trace->intercept_flush) {
+        trace_event(active_flush_trace, 'F');
+        return 0;
+    }
+    return __real_doupdate();
+}
 
 #define CHECK(condition)                                                         \
     do {                                                                         \
@@ -54,6 +79,89 @@ static const OdCell *canvas_cell(const OdCanvas *canvas, size_t x, size_t y) {
     CHECK(x < canvas->width);
     CHECK(y < canvas->height);
     return &canvas->cells[y * canvas->width + x];
+}
+
+static void trace_loading_render(void *opaque) {
+    trace_event(opaque, 'R');
+}
+
+static void trace_blocking_scan(void *opaque) {
+    trace_event(opaque, 'B');
+}
+
+/* Catches a queued loading draw that is never flushed before work blocks. */
+static void test_interstitial_is_flushed_before_blocking_work(void) {
+    FlushTrace trace = {.intercept_flush = true};
+    active_flush_trace = &trace;
+    od_tui_run_flushed_interstitial(trace_loading_render,
+                                    trace_blocking_scan,
+                                    &trace);
+    active_flush_trace = NULL;
+
+    const char *render = strchr(trace.events, 'R');
+    const char *flush = strchr(trace.events, 'F');
+    const char *block = strchr(trace.events, 'B');
+    CHECK(render != NULL);
+    CHECK(flush != NULL);
+    CHECK(block != NULL);
+    CHECK(render != NULL && flush != NULL && render < flush);
+    CHECK(flush != NULL && block != NULL && flush < block);
+}
+
+static void test_dashboard_loading_screen_explains_the_blocking_work(void) {
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 80U, 24U, &error) == OD_OK);
+    od_render_dashboard_loading(&canvas, true);
+    char *text = rendered_text(&canvas);
+    CHECK(text != NULL && strstr(text, "OPENDOOR / Dashboard") != NULL);
+    CHECK(text != NULL && strstr(text, "Scanning project ports...") != NULL);
+    CHECK(text != NULL &&
+          strstr(text, "Discovering declarations and checking live endpoints") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
+}
+
+static void test_resolve_open_loading_screen_explains_the_blocking_work(void) {
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 80U, 24U, &error) == OD_OK);
+    od_render_conflicts_loading(&canvas, true);
+    char *text = rendered_text(&canvas);
+    CHECK(text != NULL && strstr(text, "OPENDOOR / Resolve conflicts") != NULL);
+    CHECK(text != NULL && strstr(text, "Scanning for port conflicts...") != NULL);
+    CHECK(text != NULL &&
+          strstr(text, "Discovering declarations and checking live endpoints") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
+}
+
+static void test_resolve_apply_loading_screen_explains_the_blocking_work(void) {
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 80U, 24U, &error) == OD_OK);
+    od_render_conflicts_apply_loading(&canvas, true);
+    char *text = rendered_text(&canvas);
+    CHECK(text != NULL && strstr(text, "OPENDOOR / Resolve conflicts") != NULL);
+    CHECK(text != NULL && strstr(text, "Revalidating before apply...") != NULL);
+    CHECK(text != NULL &&
+          strstr(text, "Rescanning listeners before writing project files") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
+}
+
+static void test_history_loading_screen_explains_the_blocking_work(void) {
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 80U, 24U, &error) == OD_OK);
+    od_render_history_loading(&canvas, true);
+    char *text = rendered_text(&canvas);
+    CHECK(text != NULL && strstr(text, "OPENDOOR / History") != NULL);
+    CHECK(text != NULL && strstr(text, "Loading change history...") != NULL);
+    CHECK(text != NULL &&
+          strstr(text, "Reading the log and checking recorded declarations") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
 }
 
 static void test_menu_dispatch_is_fixed_to_four_items(void) {
@@ -313,12 +421,7 @@ static void test_mouse_targets_match_visible_controls(void) {
     target = od_dashboard_mouse_target(80U, 24U, 10, 10);
     CHECK(target.action == OD_MOUSE_NONE);
 
-    target = od_conflicts_mouse_target(80U, 24U, true, 18, 23);
-    CHECK(target.action == OD_MOUSE_APPLY_ALL);
-    target = od_conflicts_mouse_target(80U, 24U, true, 37, 23);
-    CHECK(target.action == OD_MOUSE_BACK);
-    target = od_conflicts_mouse_target(80U, 24U, false, 18, 23);
-    CHECK(target.action == OD_MOUSE_BACK);
+
 }
 
 static void test_dashboard_is_read_only(void) {
@@ -328,21 +431,24 @@ static void test_dashboard_is_read_only(void) {
             .status = OD_PORT_RUNNING,
             .declared = true,
             .relative_folder = "./services/api",
-            .source = "./services/api/.env"
+            .process = "api-server",
+            .source = "env (PORT) — ./services/api/.env"
         },
         {
             .port = 4000U,
             .status = OD_PORT_NOT_RUNNING,
             .declared = true,
             .relative_folder = "./services/web",
-            .source = "./services/web/compose.yaml"
+            .process = "-",
+            .source = "compose — ./services/web/compose.yaml"
         },
         {
             .port = 5000U,
             .status = OD_PORT_IN_USE_OTHER,
             .declared = true,
             .relative_folder = "./services/外部",
-            .source = "./services/外部/.env"
+            .process = "other-server",
+            .source = "env (PORT) — ./services/外部/.env"
         }
     };
     OdDashboard dashboard = {
@@ -352,7 +458,7 @@ static void test_dashboard_is_read_only(void) {
     };
     OdCanvas canvas;
     OdError error;
-    CHECK(od_canvas_init(&canvas, 120U, 30U, &error) == OD_OK);
+    CHECK(od_canvas_init(&canvas, 180U, 30U, &error) == OD_OK);
     od_render_dashboard(&canvas, &dashboard, "Scan complete", false);
     char *text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "PORT") != NULL);
@@ -364,6 +470,7 @@ static void test_dashboard_is_read_only(void) {
     CHECK(text != NULL && strstr(text, "DIRECTORY") == NULL);
     CHECK(text != NULL && strstr(text, "/work/") == NULL);
     CHECK(text != NULL && strstr(text, "./services/api") != NULL);
+    CHECK(text != NULL && strstr(text, "env (PORT)") != NULL);
     CHECK(text != NULL && strstr(text, "./services/api/.env") != NULL);
     CHECK(text != NULL && strstr(text, "?") == NULL);
     CHECK(text != NULL && strstr(text, "┌") != NULL);
@@ -406,6 +513,41 @@ static void test_dashboard_is_read_only(void) {
     CHECK(text != NULL && strstr(text, "| PORT") != NULL);
     CHECK(text != NULL && line_has_at_least(text, '+', 5U));
     free(text);
+    od_canvas_free(&canvas);
+}
+
+/* A conflict is a STATUS condition, not a property of its path/process/source. */
+static void test_dashboard_conflict_color_is_limited_to_status(void) {
+    OdPortRow row = {
+        .port = 5500U,
+        .status = OD_PORT_IN_USE_OTHER,
+        .declared = true,
+        .relative_folder = "./",
+        .process = "code",
+        .source = "env (PORT) — ./.env"
+    };
+    OdDashboard dashboard = {
+        .rows = &row,
+        .count = 1U,
+        .page_size = 10U
+    };
+    OdCanvas canvas;
+    OdError error;
+    CHECK(od_canvas_init(&canvas, 100U, 24U, &error) == OD_OK);
+
+    od_render_dashboard(&canvas, &dashboard, "Scan complete", true);
+
+    /* At 100 columns, the five cell texts begin at x=5,13,39,56,81. */
+    CHECK(canvas_cell(&canvas, 5U, 10U)->role == OD_ROLE_DEFAULT);
+    CHECK(canvas_cell(&canvas, 13U, 10U)->role == OD_ROLE_DEFAULT);
+    CHECK(canvas_cell(&canvas, 56U, 10U)->role == OD_ROLE_DEFAULT);
+    CHECK(canvas_cell(&canvas, 81U, 10U)->role == OD_ROLE_DEFAULT);
+    for (size_t offset = 0U; offset < strlen("in use (other)"); ++offset) {
+        const OdCell *cell = canvas_cell(&canvas, 39U + offset, 10U);
+        CHECK(cell->role == OD_ROLE_DANGER);
+        CHECK(cell->attributes == 1U);
+    }
+
     od_canvas_free(&canvas);
 }
 
@@ -475,123 +617,293 @@ static void test_empty_dashboard_explains_supported_project_sources(void) {
     od_canvas_free(&canvas);
 }
 
-static void test_conflicts_have_one_whole_plan_action(void) {
-    OdResolutionItem items[] = {
-        {
-            .declaration_index = 0U,
-            .old_port = 3000U,
-            .new_port = 3001U,
-            .automatic = true,
-            .source_kind = OD_SOURCE_ENV,
-            .write_kind = OD_WRITE_ENV_LITERAL,
-            .line = 2U,
-            .relative_path = "./.env",
-            .line_before = "- API_PORT=3000",
-            .line_after = "+ API_PORT=3001",
-            .manual_reason = ""
-        },
-        {
-            .declaration_index = 1U,
-            .old_port = 8080U,
-            .new_port = 8081U,
-            .automatic = true,
-            .source_kind = OD_SOURCE_COMPOSE,
-            .write_kind = OD_WRITE_COMPOSE_LITERAL,
-            .line = 5U,
-            .relative_path = "./compose.yaml",
-            .line_before = "-       - \"8080:80\"",
-            .line_after = "+       - \"8081:80\"",
-            .manual_reason = ""
-        },
-        {
-            .declaration_index = 2U,
-            .old_port = 5173U,
-            .new_port = 5174U,
-            .automatic = false,
-            .source_kind = OD_SOURCE_PACKAGE_JSON,
-            .write_kind = OD_WRITE_MANUAL_ONLY,
-            .line = 3U,
-            .relative_path = "./package.json",
-            .line_before = "-     \"dev\": \"vite --port 5173\"",
-            .line_after = "+     \"dev\": \"vite --port 5174\"",
-            .manual_reason = "package.json scripts are manual-only"
-        }
-    };
-    OdResolution resolution = {
-        .items = items,
-        .count = 3U,
-        .automatic_count = 2U,
-        .manual_count = 1U
-    };
-    CHECK(od_resolution_visual_line_count(&resolution) >= 10U);
-    OdCanvas canvas;
+static void test_scan_warning_views_and_apply_severity(void) {
     OdError error;
+    OdScanReport discovery = {0}, sockets = {0}, report = {0};
+    CHECK(od_scan_report_add(&discovery, OD_WARNING_DISCOVERY,
+                             "./package.json", "invalid JSON", &error) == OD_OK);
+    CHECK(od_scan_report_add(&sockets, OD_WARNING_OWNER_ATTRIBUTION,
+                             "Process ownership", "owners unreadable", &error) == OD_OK);
+    CHECK(od_scan_report_combine(&report, &discovery, &sockets, &error) == OD_OK);
+    od_scan_report_free(&discovery);
+    od_scan_report_free(&sockets);
+    OdCanvas canvas;
     CHECK(od_canvas_init(&canvas, 100U, 32U, &error) == OD_OK);
-    od_render_conflicts(&canvas, &resolution, 0U, true, true,
-                        "Ready to apply", false);
+    OdResolution empty = {0};
+    od_render_conflicts_report(&canvas, &empty, 0U, 0U, true, NULL, true, &report);
     char *text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "Automatic changes") != NULL);
-    CHECK(text != NULL && strstr(text, "./.env") != NULL);
-    CHECK(text != NULL && strstr(text, "- API_PORT=3000") != NULL);
-    CHECK(text != NULL && strstr(text, "+ API_PORT=3001") != NULL);
-    CHECK(text != NULL && strstr(text, "./compose.yaml") != NULL);
-    CHECK(text != NULL && strstr(text, "Manual suggestions") != NULL);
-    CHECK(text != NULL && strstr(text, "not applied automatically") != NULL);
-    CHECK(text != NULL && strstr(text, "change line 3 in ./package.json to 5174") != NULL);
-    CHECK(text != NULL && strstr(text, "package.json scripts are manual-only") != NULL);
-    CHECK(text != NULL && strstr(text, "┌") != NULL);
-    CHECK(text != NULL && strstr(text, "└") != NULL);
-    CHECK(text != NULL && strstr(text, "Enter Apply all") != NULL);
-    CHECK(text != NULL && strstr(text, "q/Esc Cancel") != NULL);
-    CHECK(text != NULL && strstr(text, "┌") != NULL);
-    CHECK(text != NULL && strstr(text, "Edit") == NULL);
-    CHECK(text != NULL && strstr(text, "Override") == NULL);
+    CHECK(strstr(text, "Scan incomplete (2 warnings)") != NULL);
+    CHECK(strstr(text, "No conflicts found") == NULL);
+    CHECK(strstr(text, "./package.json: invalid JSON") != NULL);
+    CHECK(strstr(text, "[info]") != NULL);
+    CHECK(strstr(text, "Process ownership: owners unreadable") != NULL);
+    CHECK(canvas_cell(&canvas, 2U, 2U)->role == OD_ROLE_WARNING);
     free(text);
-
-    od_render_conflicts(&canvas, &resolution, 0U, false, true,
-                        "Updated 2 port(s); 1 manual suggestion(s)", true);
+    OdResolutionItem item = {.automatic = true, .old_port = 5500U, .new_port = 5501U,
+        .relative_path = "./.env", .variable = "PORT", .source_kind = OD_SOURCE_ENV};
+    OdResolution resolution = {.items = &item, .count = 1U, .automatic_count = 1U};
+    od_render_conflicts_report(&canvas, &resolution, 2U, 0U, true, NULL, true, &report);
     text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "Updated 2 port(s)") != NULL);
-    CHECK(text != NULL && strstr(text, "Enter Apply all") == NULL);
+    CHECK(strstr(text, "[Apply]") != NULL);
+    CHECK(strstr(text, "Scan was incomplete (2 warnings); undiscovered declarations or unknown owners are possible.") != NULL);
     free(text);
+    CHECK(od_scan_report_add(&report, OD_WARNING_SOCKET_PARTIAL,
+                             "Socket table (IPv4 TCP)", "partial read", &error) == OD_OK);
+    od_render_conflicts_report(&canvas, &resolution, 3U, 0U, true, NULL, true, &report);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "[Apply]") == NULL && strstr(text, "Blocked") != NULL);
+    CHECK(strstr(text, "[blocks apply]") != NULL);
+    CHECK(strstr(text, OD_SCAN_APPLY_BLOCKED) != NULL);
+    free(text);
+    od_render_dashboard_report(&canvas, NULL, NULL, true, &report, false, 0U);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "w Warnings") != NULL);
+    CHECK(strstr(text, "Scan incomplete (3 warnings)") != NULL);
+    free(text);
+    bool mouse_warning = false;
+    for (int x = 0; x < 100; ++x) {
+        if (od_dashboard_report_mouse_target(100U, 32U, &report, false, x, 31).action == OD_MOUSE_WARNINGS) mouse_warning = true;
+    }
+    CHECK(mouse_warning);
+    od_render_dashboard_report(&canvas, NULL, NULL, true, &report, true, 0U);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "./package.json: invalid JSON") != NULL);
+    CHECK(strstr(text, "[blocks apply]") != NULL);
+    free(text);
+    od_render_dashboard_report(&canvas, NULL, "no proc socket tables were readable",
+                                true, &report, false, 0U);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "no proc socket tables were readable") != NULL);
+    CHECK(strstr(text, "Scan incomplete (3 warnings)") != NULL);
+    free(text);
+    for (size_t i = 0U; i < 202U; ++i) {
+        CHECK(od_scan_report_add(&report, OD_WARNING_DISCOVERY, "./bad.json", "invalid JSON", &error) == OD_OK);
+    }
+    od_render_dashboard_report(&canvas, NULL, NULL, true, &report, true, 199U);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "and 5 more") != NULL);
+    CHECK(strstr(text, "Scan incomplete (205 warnings)") != NULL);
+    free(text);
+    od_canvas_free(&canvas);
+    od_scan_report_free(&report);
+}
 
-    OdResolution manual_only = {
-        .items = &items[2],
-        .count = 1U,
-        .manual_count = 1U
+static void test_resolve_summary_is_not_duplicated(void) {
+    OdError error;
+    OdScanReport report = {0};
+    CHECK(od_scan_report_add(&report, OD_WARNING_OWNER_ATTRIBUTION,
+        "Process ownership", "some owners could not be read (permissions)", &error) == OD_OK);
+    OdResolutionItem item = {.automatic = true, .old_port = 5500U, .new_port = 5501U,
+        .relative_path = "./.env", .variable = "PORT", .source_kind = OD_SOURCE_ENV};
+    OdResolution resolution = {.items = &item, .count = 1U, .automatic_count = 1U};
+    OdCanvas canvas;
+    CHECK(od_canvas_init(&canvas, 100U, 32U, &error) == OD_OK);
+    od_render_conflicts_report(&canvas, &resolution, 1U, 0U, true,
+        "Scan incomplete (1 warning)", false, &report);
+    char *text = rendered_text(&canvas);
+    CHECK(substring_count(text, "Scan incomplete (1 warning)") == 1U);
+    CHECK(strstr(text, "PROPOSED") != NULL && strstr(text, "[Apply]") != NULL);
+    CHECK(canvas_cell(&canvas, 2U, 2U)->role == OD_ROLE_WARNING);
+    free(text);
+    /* De-duplication must not hide operation outcomes or real errors. */
+    const char *statuses[] = {"Updated 1 port(s)", "Source file changed; refresh conflicts"};
+    for (size_t i = 0U; i < sizeof(statuses) / sizeof(statuses[0]); ++i) {
+        od_render_conflicts_report(&canvas, &resolution, 1U, 0U, true,
+            statuses[i], false, &report);
+        text = rendered_text(&canvas);
+        CHECK(substring_count(text, "Scan incomplete (1 warning)") == 1U);
+        CHECK(strstr(text, statuses[i]) != NULL);
+        free(text);
+    }
+    od_canvas_free(&canvas);
+    od_scan_report_free(&report);
+}
+
+static void test_resolve_empty_state_has_no_table(void) {
+    OdError error;
+    OdScanReport report = {0};
+    CHECK(od_scan_report_add(&report, OD_WARNING_OWNER_ATTRIBUTION,
+        "Process ownership", "some owners could not be read (permissions)", &error) == OD_OK);
+    OdResolution empty = {0};
+    const size_t widths[] = {60U, 78U, 79U, 90U, 91U, 160U};
+    for (size_t w = 0U; w < sizeof(widths) / sizeof(widths[0]); ++w) {
+        for (size_t mode = 0U; mode < 2U; ++mode) {
+            OdCanvas canvas;
+            CHECK(od_canvas_init(&canvas, widths[w], 18U, &error) == OD_OK);
+            for (size_t state = 0U; state < 3U; ++state) {
+                const OdScanReport *warnings = state == 0U ? &report : NULL;
+                od_render_conflicts_report(&canvas, &empty, 0U, 0U, state != 2U,
+                    state == 0U ? "Scan incomplete (1 warning)" : NULL, mode == 0U, warnings);
+                char *text = rendered_text(&canvas);
+                CHECK(strstr(text, "PROPOSED") == NULL && strstr(text, "SOURCE") == NULL);
+                CHECK(strstr(text, "[Apply]") == NULL);
+                const char *message = state == 0U ? "No conflicts detected in scanned data." :
+                    state == 1U ? "No conflicts found" : "Unable to prepare proposal";
+                CHECK(strstr(text, message) != NULL);
+                if (state == 0U) {
+                    CHECK(substring_count(text, "Scan incomplete (1 warning)") == 1U);
+                    CHECK(strstr(text, "No conflicts found") == NULL);
+                }
+                /* Check canvas cells too: an empty state must have no leftover
+                 * ASCII or Unicode table rules, including above/below it. */
+                bool has_table_border = false, has_apply_target = false;
+                for (size_t y = 4U; y < canvas.height - 5U; ++y) {
+                    for (size_t x = 0U; x < canvas.width; ++x) {
+                        const OdCell *cell = canvas_cell(&canvas, x, y);
+                        if (cell->role == OD_ROLE_FOCUSED_BORDER) has_table_border = true;
+                        if (od_conflicts_report_mouse_target(canvas.width, canvas.height,
+                            &empty, 0U, 0U, warnings, (int)x, (int)y).action == OD_MOUSE_CONFLICT_APPLY)
+                            has_apply_target = true;
+                    }
+                }
+                CHECK(!has_table_border && !has_apply_target);
+                free(text);
+            }
+            od_canvas_free(&canvas);
+        }
+    }
+    od_scan_report_free(&report);
+}
+
+static void test_warning_document_scroll_and_hit_targets(void) {
+    OdError error;
+    OdScanReport report = {0};
+    for (size_t i = 0U; i < OD_SCAN_WARNING_CAP + 5U; ++i)
+        CHECK(od_scan_report_add(&report, OD_WARNING_DISCOVERY,
+                                 "./package.json", "invalid JSON", &error) == OD_OK);
+    OdResolutionItem items[6] = {0};
+    for (size_t i = 0U; i < 6U; ++i) {
+        items[i] = (OdResolutionItem){.allocation_index = i, .automatic = true,
+            .old_port = 5500U, .new_port = 5501U, .relative_path = "./.env",
+            .variable = "PORT", .source_kind = OD_SOURCE_ENV};
+    }
+    OdResolution resolution = {.items = items, .count = 6U, .automatic_count = 6U};
+    const size_t widths[] = {60U, 78U, 79U, 90U, 91U, 160U};
+    for (size_t w = 0U; w < sizeof(widths) / sizeof(widths[0]); ++w) {
+        OdCanvas canvas;
+        CHECK(od_canvas_init(&canvas, widths[w], 18U, &error) == OD_OK);
+        size_t selected = od_scan_warning_rows(&report);
+        size_t scroll = od_conflicts_report_scroll(&resolution, &report, selected, 0U, 18U);
+        od_render_conflicts_report(&canvas, &resolution, selected, scroll, true, NULL, true, &report);
+        char *text = rendered_text(&canvas);
+        CHECK(strstr(text, "and 5 more") != NULL);
+        CHECK(strstr(text, "[Apply]") != NULL);
+        CHECK(strstr(text, "Scan incomplete (205 warnings)") != NULL);
+        free(text);
+        bool actionable = false;
+        for (int y = 4; y < 14; ++y) {
+            OdMouseTarget target = od_conflicts_report_mouse_target(widths[w], 18U,
+                &resolution, selected, scroll, &report, (int)widths[w] - 10, y);
+            if (target.action != OD_MOUSE_CONFLICT_APPLY) continue;
+            actionable = true;
+            CHECK(strcmp(canvas_cell(&canvas, widths[w] - 10U, (size_t)y)->glyph, "[") == 0);
+        }
+        CHECK(actionable);
+        /* Also exercise the next group just below the viewport. Blank space
+         * before the page count must never act as an invisible Apply button. */
+        selected = OD_SCAN_WARNING_CAP - 3U;
+        scroll = selected;
+        scroll = od_conflicts_report_scroll(&resolution, &report, selected, scroll, 18U);
+        od_render_conflicts_report(&canvas, &resolution, selected, scroll, true, NULL, true, &report);
+        CHECK(od_conflicts_report_mouse_target(widths[w], 18U, &resolution, selected,
+            scroll, &report, (int)widths[w] - 10, 13).action == OD_MOUSE_NONE);
+        OdResolution empty = {0};
+        selected = od_scan_warning_rows(&report) - 1U;
+        scroll = od_conflicts_report_scroll(&empty, &report, selected, 0U, 18U);
+        od_render_conflicts_report(&canvas, &empty, selected, scroll, true, NULL, true, &report);
+        text = rendered_text(&canvas);
+        CHECK(strstr(text, "No conflicts detected in scanned data.") != NULL);
+        CHECK(strstr(text, "and 5 more") != NULL);
+        free(text);
+        od_canvas_free(&canvas);
+    }
+    od_scan_report_free(&report);
+}
+
+static void test_conflict_table_has_row_actions(void) {
+    OdResolutionItem items[] = {
+        {.allocation_index = 0U, .old_port = 5500U, .new_port = 5501U,
+         .automatic = true, .source_kind = OD_SOURCE_ENV,
+         .variable = "PORT", .relative_path = "./.env",
+         .line_before = "- PORT=5500", .line_after = "+ PORT=5501"},
+        {.allocation_index = 0U, .old_port = 5500U, .new_port = 5501U,
+         .source_kind = OD_SOURCE_COMPOSE, .relative_path = "./compose.yaml"},
+        {.allocation_index = 1U, .old_port = 6000U, .new_port = 6001U,
+         .source_kind = OD_SOURCE_PACKAGE_JSON, .relative_path = "./package.json",
+         .manual_reason = "package scripts are manual-only"}
     };
-    od_render_conflicts(&canvas, &manual_only, 0U, true, true,
-                        "Manual suggestion only", false);
-    text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "Manual suggestions") != NULL);
-    CHECK(text != NULL && strstr(text, "Enter Apply all") == NULL);
-    free(text);
+    OdResolution resolution = {.items = items, .count = 3U,
+                               .automatic_count = 1U, .manual_count = 2U};
+    const size_t widths[] = {60U, 78U, 79U, 90U, 91U, 160U};
+    for (size_t w = 0U; w < sizeof(widths) / sizeof(widths[0]); ++w) {
+        OdCanvas canvas;
+        OdError error;
+        CHECK(od_canvas_init(&canvas, widths[w], 18U, &error) == OD_OK);
+        od_render_conflicts(&canvas, &resolution, 0U, 0U, true, "Ready", true);
+        char *text = rendered_text(&canvas);
+        CHECK(text != NULL && strstr(text, "PROPOSED") != NULL);
+        CHECK(text != NULL && strstr(text, "SOURCE") != NULL);
+        CHECK(text != NULL && strstr(text, "ACTION") != NULL);
+        CHECK(text != NULL && strstr(text, "[Apply]") != NULL);
+        CHECK(text != NULL && strstr(text, "Manual") != NULL);
+        CHECK(text != NULL && strstr(text, "Showing 1-2 of 2 conflict(s)") != NULL);
+        CHECK(text != NULL && strstr(text, "env (PORT)") != NULL);
+        CHECK(text != NULL && strstr(text, "Automatic changes") == NULL);
+        CHECK(text != NULL && strstr(text, "Apply all") == NULL);
+        CHECK(text != NULL && (strstr(text, "RELATIVE FOLDER") != NULL) == (widths[w] >= 91U));
+        CHECK(text != NULL && (strstr(text, "PROCESS") != NULL) == (widths[w] >= 79U));
+        OdCanvas header = {canvas.width, 1U, canvas.cells + 5U * canvas.width};
+        char *heading = rendered_text(&header);
+        if (heading != NULL) {
+            const char *port = strstr(heading, "PORT");
+            const char *proposed = strstr(heading, "PROPOSED");
+            const char *source = strstr(heading, "SOURCE");
+            const char *action = strstr(heading, "ACTION");
+            CHECK(port != NULL && proposed != NULL && source != NULL && action != NULL &&
+                  port < proposed && proposed < source && source < action);
+            free(heading);
+        }
+        if (widths[w] == 160U) {
+            CHECK(strstr(text, "env (PORT) — ./.env, ./compose.yaml") != NULL);
+        }
+        /* Every interior cell on the selected row, including separators and
+         * the Apply label, must share the selected background. */
+        for (size_t x = 2U; x < widths[w] - 2U; ++x) {
+            CHECK(canvas.cells[7U * canvas.width + x].role == OD_ROLE_SELECTED);
+        }
 
-    od_canvas_free(&canvas);
-    CHECK(od_canvas_init(&canvas, 60U, 18U, &error) == OD_OK);
-    size_t visual_lines = od_resolution_visual_line_count(&resolution);
-    size_t last_scroll = visual_lines > 3U ? visual_lines - 3U : 0U;
-    od_render_conflicts(&canvas, &resolution, last_scroll, true, true,
-                        "Ready", false);
-    text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "package.json scripts are manual-only") != NULL);
-    CHECK(text != NULL && strstr(text, "Showing") != NULL);
-    free(text);
-
-    resolution = (OdResolution){0};
-    od_render_conflicts(&canvas, &resolution, 0U, false, true, NULL, true);
-    text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "No conflicts found") != NULL);
-    CHECK(text != NULL && strstr(text, "OLD PORT") == NULL);
-    free(text);
-
-    od_render_conflicts(&canvas, &resolution, 0U, false, false,
-                        "Unable to scan sockets", true);
-    text = rendered_text(&canvas);
-    CHECK(text != NULL && strstr(text, "Unable to prepare proposal") != NULL);
-    CHECK(text != NULL && strstr(text, "No conflicts found") == NULL);
-    free(text);
-    od_canvas_free(&canvas);
+        OdMouseTarget target = od_conflicts_mouse_target(widths[w], 18U, &resolution,
+                                                          0U, 0U, (int)widths[w] - 10, 7);
+        CHECK(target.action == OD_MOUSE_CONFLICT_APPLY && target.item == 0U);
+        target = od_conflicts_mouse_target(widths[w], 18U, &resolution,
+                                           0U, 0U, (int)widths[w] - 3, 7);
+        CHECK(target.action == OD_MOUSE_CONFLICT_ROW);
+        target = od_conflicts_mouse_target(widths[w], 18U, &resolution, 0U, 0U, 5, 9);
+        CHECK(target.action == OD_MOUSE_CONFLICT_ROW && target.item == 1U);
+        target = od_conflicts_mouse_target(widths[w], 18U, &resolution,
+                                           0U, 0U, (int)widths[w] - 10, 9);
+        CHECK(target.action == OD_MOUSE_CONFLICT_ROW && target.item == 1U);
+        target = od_conflicts_mouse_target(widths[w], 18U, &resolution, 0U, 0U, 5, 8);
+        CHECK(target.action == OD_MOUSE_NONE);
+        CHECK(canvas.cells[7U * canvas.width + widths[w] - 10U].attributes == 1U);
+        free(text);
+        od_render_conflicts(&canvas, &resolution, 1U, 0U, true, "Ready", true);
+        text = rendered_text(&canvas);
+        CHECK(text != NULL && strstr(text, "package scripts are manual-only") != NULL);
+        CHECK(text != NULL && strstr(text, "Enter Apply") == NULL);
+        free(text);
+        OdResolution empty = {0};
+        od_render_conflicts(&canvas, &empty, 0U, 0U, true, NULL, true);
+        text = rendered_text(&canvas);
+        CHECK(text != NULL && strstr(text, "No conflicts found") != NULL);
+        free(text);
+        od_render_conflicts(&canvas, &empty, 0U, 0U, false, "Scan failed", true);
+        text = rendered_text(&canvas);
+        CHECK(text != NULL && strstr(text, "Unable to prepare proposal") != NULL);
+        CHECK(text != NULL && strstr(text, "No conflicts found") == NULL);
+        free(text);
+        od_canvas_free(&canvas);
+    }
 }
 
 static char *rendered_line(OdCanvas *canvas, size_t y) {
@@ -608,8 +920,9 @@ static void history_fixture(OdHistoryRecord records[12], OdHistory *history) {
     for (size_t index = 0U; index < 12U; ++index) {
         records[index] = (OdHistoryRecord){
             .id = 120U - index,
-            .timestamp = "2026-10-05T08:14:22.123Z",
+            .timestamp = "2026-10-06T09:30:18.715Z",
             .relative_path = paths[index],
+            .source_kind = index == 2U ? OD_SOURCE_COMPOSE : OD_SOURCE_ENV,
             .environment_key = "PORT",
             .old_port = (uint16_t)(2000U + index),
             .new_port = (uint16_t)(3000U + index),
@@ -618,12 +931,13 @@ static void history_fixture(OdHistoryRecord records[12], OdHistory *history) {
                 "The declaration moved; its exact byte span no longer matches. "
                 "Restore the recorded location before trying again."
         };
+        if (index == 2U) records[index].environment_key = NULL;
     }
     *history = (OdHistory){.items = records, .count = 12U};
 }
 
-/* Catches wrapped reasons, unequal row heights, incorrect action text, and
- * selection paint overwriting the explicit unavailable/ready action roles. */
+/* Catches raw timestamps, mismatched Dashboard vocabulary, wrapped reasons,
+ * unequal row heights, and selected-row seams or nested action backgrounds. */
 static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
     OdHistoryRecord records[12];
     OdHistory history;
@@ -635,12 +949,30 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
     char *text = rendered_text(&canvas);
     CHECK(strstr(text, "OPENDOOR / History") != NULL);
     CHECK(strstr(text, "WHEN") != NULL);
-    CHECK(strstr(text, "FILE / KEY") != NULL);
+    CHECK(strstr(text, "RELATIVE FOLDER") != NULL);
+    CHECK(strstr(text, "SOURCE") != NULL);
     CHECK(strstr(text, "CHANGE") != NULL);
     CHECK(strstr(text, "ACTION / STATUS") != NULL);
+    CHECK(strstr(text, "FILE / KEY") == NULL);
+    CHECK(strstr(text, "2026-10-06 09:30:18") != NULL);
+    CHECK(strstr(text, "2026-10-06T09:30:18.715Z") == NULL);
     CHECK(strstr(text, "Showing 1-10 of 12 change(s)") != NULL);
     CHECK(substring_count(text, records[1].reason) == 1U);
     free(text);
+    char *header = rendered_line(&canvas, 5U);
+    const char *when_header = strstr(header, "WHEN");
+    const char *folder_header = strstr(header, "RELATIVE FOLDER");
+    const char *source_header = strstr(header, "SOURCE");
+    const char *change_header = strstr(header, "CHANGE");
+    const char *action_header = strstr(header, "ACTION / STATUS");
+    CHECK(when_header != NULL && folder_header != NULL && source_header != NULL &&
+          change_header != NULL && action_header != NULL);
+    if (when_header != NULL && folder_header != NULL && source_header != NULL &&
+        change_header != NULL && action_header != NULL) {
+        CHECK(when_header < folder_header && folder_header < source_header &&
+              source_header < change_header && change_header < action_header);
+    }
+    free(header);
     for (size_t index = 0U; index < 10U; ++index) {
         size_t y = 7U + index * 2U;
         char *line = rendered_line(&canvas, y);
@@ -648,7 +980,13 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
         (void)snprintf(expected, sizeof(expected), "%u -> %u",
                        (unsigned)records[index].old_port,
                        (unsigned)records[index].new_port);
-        CHECK(strstr(line, records[index].relative_path) != NULL);
+        char folder[32];
+        (void)snprintf(folder, sizeof(folder), "./row-%02zu", index);
+        CHECK(strstr(line, folder) != NULL);
+        CHECK(strstr(line, records[index].relative_path) == NULL);
+        CHECK(strstr(line, index == 2U ? "compose" : "env (PORT)") != NULL);
+        CHECK(strstr(line, "2026-10-06 09:30:18") != NULL);
+        CHECK(strstr(line, "2026-10-06T09:30:18.715Z") == NULL);
         CHECK(strstr(line, expected) != NULL);
         const char *action = index % 2U == 0U ? "[Revert]" : "Unavailable";
         CHECK(strstr(line, action) != NULL);
@@ -659,7 +997,9 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
         CHECK(strcmp(canvas_cell(&canvas, 222U + strlen(action), y)->glyph, " ") == 0);
         for (size_t glyph = 0U; glyph < strlen(action); ++glyph) {
             const OdCell *cell = canvas_cell(&canvas, 222U + glyph, y);
-            CHECK(cell->role == (index % 2U == 0U ? OD_ROLE_PRIMARY : OD_ROLE_DANGER));
+            OdStyleRole expected_role = index == 1U ? OD_ROLE_SELECTED :
+                (index % 2U == 0U ? OD_ROLE_PRIMARY : OD_ROLE_DANGER);
+            CHECK(cell->role == expected_role);
             CHECK(cell->attributes == 1U);
         }
         CHECK(strcmp(canvas_cell(&canvas, 1U, y + 1U)->glyph, "+") == 0);
@@ -679,12 +1019,18 @@ static void test_history_rows_are_uniform_and_reasons_stay_in_status(void) {
     CHECK(strstr(detail, "./row-01/.env | PORT | 2001 -> 3001") != NULL);
     CHECK(strstr(detail, records[1].reason) != NULL);
     CHECK(canvas_cell(&canvas, 3U, 9U)->role == OD_ROLE_SELECTED);
+    for (size_t x = 2U; x <= 237U; ++x) {
+        CHECK(canvas_cell(&canvas, x, 9U)->role == OD_ROLE_SELECTED);
+    }
     free(detail);
 
     od_render_history(&canvas, &history, 0U, 0U, NULL, NULL, false);
     for (size_t glyph = 0U; glyph < 8U; ++glyph) {
-        CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->role == OD_ROLE_PRIMARY);
+        CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->role == OD_ROLE_SELECTED);
         CHECK(canvas_cell(&canvas, 222U + glyph, 7U)->attributes == 1U);
+    }
+    for (size_t x = 2U; x <= 237U; ++x) {
+        CHECK(canvas_cell(&canvas, x, 7U)->role == OD_ROLE_SELECTED);
     }
     text = rendered_text(&canvas);
     CHECK(strstr(text, "┼") != NULL);
@@ -716,17 +1062,18 @@ static void test_history_pagination_clipping_and_empty_state(void) {
     CHECK(strstr(text, "2010 -> 3010") != NULL);
     CHECK(strstr(text, "2011 -> 3011") != NULL);
     CHECK(strstr(text, "2008 -> 3008") == NULL);
-    CHECK(strstr(text, "ACTION / STATUS") != NULL);
-    CHECK(strstr(text, "FILE / KEY") != NULL);
+    CHECK(strstr(text, "STATUS") != NULL);
+    CHECK(strstr(text, "RELATIVE FOLDER") == NULL);
+    CHECK(strstr(text, "FILE / KEY") == NULL);
     CHECK(strcmp(canvas_cell(&canvas, 58U, 7U)->glyph, "|") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 42U, 7U)->glyph, "U") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 47U, 7U)->glyph, "U") == 0);
     free(text);
     records[10].relative_path = "./a-very-long-directory/another-directory/file.env";
     records[10].environment_key = "A_VERY_LONG_ENVIRONMENT_KEY";
     od_render_history(&canvas, &history, 10U, 9U, NULL, NULL, true);
-    CHECK(strcmp(canvas_cell(&canvas, 23U, 9U)->glyph, "|") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 25U, 9U)->glyph, "2") == 0);
-    CHECK(strcmp(canvas_cell(&canvas, 42U, 9U)->glyph, "[") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 20U, 9U)->glyph, "|") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 32U, 9U)->glyph, "2") == 0);
+    CHECK(strcmp(canvas_cell(&canvas, 47U, 9U)->glyph, "[") == 0);
     char *warnings[] = {"Skipped malformed history line"};
     OdHistory empty = {.warnings = warnings, .warning_count = 1U};
     od_render_history(&canvas, &empty, 0U, 0U, NULL, NULL, true);
@@ -737,6 +1084,21 @@ static void test_history_pagination_clipping_and_empty_state(void) {
     CHECK(strstr(text, "Enter Revert") == NULL);
     free(text);
     od_canvas_free(&canvas);
+
+    CHECK(od_canvas_init(&canvas, 79U, 18U, &error) == OD_OK);
+    od_render_history(&canvas, &history, 0U, 0U, NULL, NULL, true);
+    text = rendered_text(&canvas);
+    CHECK(strstr(text, "RELATIVE FOLDER") != NULL);
+    CHECK(strstr(text, "ACTION / STATUS") != NULL);
+    CHECK(strcmp(canvas_cell(&canvas, 63U, 7U)->glyph, "[") == 0);
+    free(text);
+    od_canvas_free(&canvas);
+
+    CHECK(od_canvas_init(&canvas, 91U, 18U, &error) == OD_OK);
+    od_render_history(&canvas, &history, 0U, 0U, NULL, NULL, true);
+    CHECK(strcmp(canvas_cell(&canvas, 73U, 7U)->glyph, "[") == 0);
+    od_canvas_free(&canvas);
+
     CHECK(od_canvas_init(&canvas, 59U, 17U, &error) == OD_OK);
     od_render_history(&canvas, &history, 0U, 0U, NULL, NULL, true);
     text = rendered_text(&canvas);
@@ -781,7 +1143,7 @@ static void test_history_targets_match_only_visible_actions(void) {
                           OD_MOUSE_NONE, 0U);
     check_history_target(100U, 32U, &history, 0U, 0U, false, 98, 7,
                           OD_MOUSE_NONE, 0U);
-    check_history_target(60U, 18U, &history, 10U, 9U, false, 42, 9,
+    check_history_target(60U, 18U, &history, 10U, 9U, false, 47, 9,
                           OD_MOUSE_HISTORY_REVERT, 10U);
     check_history_target(60U, 18U, &history, 10U, 9U, false, 42, 13,
                           OD_MOUSE_NONE, 0U);
@@ -891,14 +1253,24 @@ static void test_history_refusal_and_refresh_errors_never_reach_top_line(void) {
 }
 
 int main(void) {
+    test_interstitial_is_flushed_before_blocking_work();
+    test_dashboard_loading_screen_explains_the_blocking_work();
+    test_resolve_open_loading_screen_explains_the_blocking_work();
+    test_resolve_apply_loading_screen_explains_the_blocking_work();
+    test_history_loading_screen_explains_the_blocking_work();
     test_menu_dispatch_is_fixed_to_four_items();
     test_menu_degrades_at_minimum_size();
     test_update_is_cli_only_and_must_be_used_alone();
     test_mouse_targets_match_visible_controls();
     test_dashboard_is_read_only();
+    test_dashboard_conflict_color_is_limited_to_status();
     test_dashboard_renders_declaration_names_and_live_processes();
     test_empty_dashboard_explains_supported_project_sources();
-    test_conflicts_have_one_whole_plan_action();
+    test_scan_warning_views_and_apply_severity();
+    test_resolve_summary_is_not_duplicated();
+    test_resolve_empty_state_has_no_table();
+    test_warning_document_scroll_and_hit_targets();
+    test_conflict_table_has_row_actions();
     test_history_rows_are_uniform_and_reasons_stay_in_status();
     test_history_pagination_clipping_and_empty_state();
     test_history_targets_match_only_visible_actions();

@@ -60,8 +60,7 @@ typedef struct {
     size_t count;
     OdEnvironmentAssignment *environment_assignments;
     size_t environment_assignment_count;
-    char **warnings;
-    size_t warning_count;
+    OdScanReport report;
 } OdProjectDiscovery;
 
 OdStatus od_discover_project_ports(const char *project_root,

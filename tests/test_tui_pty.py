@@ -233,6 +233,17 @@ def history_records(path: Path) -> list[dict]:
     return records
 
 
+def assert_emitted_before(session: Session, mark: int,
+                          first: str, second: str) -> None:
+    output = session.plain_since(mark)
+    first_at = output.find(first.encode())
+    second_at = output.find(second.encode())
+    assert first_at >= 0, f"{first!r} was never flushed; output={output!r}"
+    assert second_at >= 0, f"{second!r} was never emitted; output={output!r}"
+    assert first_at < second_at, \
+        f"{first!r} was not flushed before {second!r}; output={output!r}"
+
+
 def exercise_recorded_changes(session: Session, project: Path,
                               refreshed: bytes, conflict_port: int) -> None:
     env_path = project / ".env"
@@ -240,11 +251,18 @@ def exercise_recorded_changes(session: Session, project: Path,
         "recorded-change fixture must contain only the reserved conflict declaration"
     backup = Path(f"{env_path}.opendoor.bak")
     log = project / ".opendoor" / "history.log"
-    apply_mark = session.mark()
+    open_mark = session.mark()
     session.click(50, 15)
-    session.wait_for("Automatic changes", apply_mark)
-    session.send(b"\r")
-    session.wait_for_line("Updated 1 port(s)", HEIGHT - 2)
+    session.wait_for("PROPOSED", open_mark)
+    assert_emitted_before(session, open_mark,
+                          "Scanning for port conflicts...", "PROPOSED")
+    apply_mark = session.mark()
+    rows = session.screen_lines()
+    apply_row = next(i for i, row in enumerate(rows) if "[Apply]" in row)
+    session.click(rows[apply_row].index("[Apply]"), apply_row)
+    session.wait_for_line("Updated 1 port(s)", 3)
+    assert_emitted_before(session, apply_mark,
+                          "Revalidating before apply...", "Updated 1 port(s)")
     applied = env_path.read_bytes()
     assert applied != refreshed, "Resolve apply did not change the source"
     assert backup.read_bytes() == refreshed, "apply backup is not the original source"
@@ -370,6 +388,60 @@ def exercise_single_conflict_workflow(binary: str, conflict_port: int) -> None:
             raise
 
 
+def exercise_individual_conflicts(binary: str, conflict_port: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="opendoor-tui-rows-") as temporary:
+        project = Path(temporary)
+        env = project / ".env"
+        original = f"API_PORT={conflict_port}\nWEB_PORT={conflict_port}\n"
+        env.write_text(original)
+        compose = project / "compose.yaml"
+        linked = 'services:\n  api:\n    ports:\n      - "${API_PORT}:80"\n'
+        compose.write_text(linked)
+        session = Session(binary, project)
+        try:
+            session.wait_for("Resolve conflicts", 0)
+            session.click(50, 15)
+            session.wait_for_line("Showing 1-2 of 2 conflict(s)", HEIGHT - 4)
+            rows = session.screen_lines()
+            apply_rows = [i for i, row in enumerate(rows) if "[Apply]" in row]
+            assert len(apply_rows) == 2
+            session.click(20, apply_rows[1])
+            session.drain(0.15)
+            assert env.read_text() == original, "selecting a row applied changes"
+            # The second action must not accidentally apply the first row or
+            # the complete plan. Both declarations share the same source file.
+            mark = session.mark()
+            session.send(b"\r\r")
+            session.wait_for_line("Updated 1 port(s)", 3)
+            assert_emitted_before(session, mark, "Revalidating before apply...", "Updated 1 port(s)")
+            first = env.read_text()
+            assert f"API_PORT={conflict_port}\n" in first
+            assert f"WEB_PORT={conflict_port}\n" not in first
+            records = history_records(project / ".opendoor/history.log")
+            assert len(records) == 1 and records[0]["key"] == "WEB_PORT"
+            assert compose.read_text() == linked, "Apply rewrote a linked reference"
+            session.wait_for_line("Showing 1-1 of 1 conflict(s)", HEIGHT - 4)
+            # Rebuilding the remaining row is necessary: its original file
+            # fingerprint is stale after applying WEB_PORT.
+            mark = session.mark()
+            session.send(b"\r")
+            # Real hosts may have informational owner-permission warnings.
+            incomplete = any("Scan incomplete (" in row for row in session.screen_lines())
+            session.wait_for("No conflicts detected in scanned data." if incomplete else
+                             "No conflicts found", mark)
+            assert f"API_PORT={conflict_port}\n" not in env.read_text()
+            assert compose.read_text() == linked
+            records = history_records(project / ".opendoor/history.log")
+            assert len(records) == 2 and records[1]["key"] == "API_PORT"
+            session.send(b"q")
+            session.wait_for("Pre-start port check", 0)
+            session.send(b"q")
+            session.finish()
+        except BaseException:
+            session.abort()
+            raise
+
+
 def exercise_history_pagination(binary: str) -> None:
     # Twelve valid independent records exceed the ten-entry page at 100x32.
     # Files are already in their recorded post-change state, with hand-checked
@@ -403,8 +475,16 @@ def exercise_history_pagination(binary: str) -> None:
             session.wait_for_line("Showing 1-10 of 12 change(s)", HEIGHT - 4)
             rows = session.screen_lines()
             for visible, identity in enumerate(range(12, 2, -1)):
-                assert f"./row-{identity:02d}/.env" in rows[7 + visible * 2], \
+                row = rows[7 + visible * 2]
+                assert f"2026-10-05 08:14:{identity:02d}" in row, \
                     "history is not paginated newest first"
+                assert f"./row-{identity:02d}" in row and \
+                    f"./row-{identity:02d}/.env" not in row, \
+                    "History did not render the containing relative folder"
+                assert "env (PORT)" in row, \
+                    "History did not reuse the Dashboard source vocabulary"
+                assert "T08:14" not in row and ".123Z" not in row, \
+                    "History exposed the stored RFC 3339 timestamp"
             session.wait_for_line("./row-12/.env | PORT | 2000 -> 3000", HEIGHT - 2)
 
             session.send(b"\x1bOB")
@@ -417,8 +497,8 @@ def exercise_history_pagination(binary: str) -> None:
                 session.wheel_down(50, 18)
             session.wait_for_line("./row-01/.env | PORT | 2000 -> 3000", HEIGHT - 2)
             session.wait_for_line("Showing 3-12 of 12 change(s)", HEIGHT - 4)
-            assert "./row-10/.env" in session.screen_lines()[7], session.screen_lines()
-            assert "./row-01/.env" in session.screen_lines()[25], session.screen_lines()
+            assert "./row-10" in session.screen_lines()[7], session.screen_lines()
+            assert "./row-01" in session.screen_lines()[25], session.screen_lines()
             session.wheel_up(50, 18)
             session.wait_for_line("./row-04/.env | PORT | 2000 -> 3000", HEIGHT - 2)
             session.click(40, 7)
@@ -504,14 +584,17 @@ def main() -> int:
                 conflicts_mark = session.mark()
                 session.click(50, 15)
                 session.wait_for("Resolve conflicts", conflicts_mark)
-                session.wait_for("Automatic changes", conflicts_mark)
+                session.wait_for("PROPOSED", conflicts_mark)
+                assert_emitted_before(session, conflicts_mark,
+                                      "Scanning for port conflicts...",
+                                      "PROPOSED")
                 session.click(20, 10)
                 session.wheel_down(50, 18)
                 session.drain(0.3)
                 assert env_path.read_bytes() == refreshed, "Resolve row click modified the fixture"
 
                 return_mark = session.mark()
-                session.click(40, HEIGHT - 1)
+                session.click(session.screen_lines()[HEIGHT - 1].index("q/Esc"), HEIGHT - 1)
                 session.wait_for("Pre-start port check", return_mark)
                 assert env_path.read_bytes() == refreshed, "Resolve cancel modified the fixture"
                 assert not Path(f"{env_path}.opendoor.bak").exists(), \
@@ -521,6 +604,8 @@ def main() -> int:
                 session.click(50, 16)
                 session.wait_for("OPENDOOR / History", history_mark)
                 session.wait_for("No history yet", history_mark)
+                assert_emitted_before(session, history_mark,
+                                      "Loading change history...", "No history yet")
                 assert env_path.read_bytes() == refreshed, "History modified the fixture"
                 assert not (project / ".opendoor").exists(), \
                     "History created project state"
@@ -535,6 +620,7 @@ def main() -> int:
             except BaseException:
                 session.abort()
                 raise
+        exercise_individual_conflicts(binary, conflict_port)
         exercise_single_conflict_workflow(binary, conflict_port)
     finally:
         listener.close()

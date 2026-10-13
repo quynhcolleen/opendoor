@@ -35,6 +35,7 @@ add_library(opendoor_core
   src/dotenv.c
   src/allocation.c
   src/scan.c
+  src/scan_report.c
   src/discovery.c
   src/display.c
   src/history.c
@@ -58,6 +59,16 @@ endif()
 target_compile_options(opendoor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 if(BUILD_TESTING)
+  add_executable(test_scan_report tests/test_scan_report.c)
+  target_link_libraries(test_scan_report PRIVATE opendoor_core)
+  target_compile_options(test_scan_report PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  add_test(NAME scan_reporting_contracts COMMAND test_scan_report)
+  add_executable(test_scan_source_warnings tests/test_scan_source_warnings.c)
+  target_link_libraries(test_scan_source_warnings PRIVATE opendoor_core)
+  target_compile_options(test_scan_source_warnings PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  target_link_options(test_scan_source_warnings PRIVATE "-Wl,--wrap=socket" "-Wl,--wrap=fopen"
+    "-Wl,--wrap=send" "-Wl,--wrap=recv")
+  add_test(NAME scan_source_warning_contracts COMMAND test_scan_source_warnings)
   add_executable(test_core tests/test_core.c)
   target_link_libraries(test_core PRIVATE opendoor_core)
   target_compile_options(test_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -84,15 +95,31 @@ if(BUILD_TESTING)
     target_link_libraries(test_ui PRIVATE ${TINFO_LIBRARY})
   endif()
   target_compile_options(test_ui PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  target_link_options(test_ui PRIVATE "-Wl,--wrap=doupdate")
   add_test(NAME menu_contracts COMMAND test_ui)
 
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
+    add_executable(opendoor_scan_test src/main.c tests/scan_faults.c)
+    target_link_libraries(opendoor_scan_test PRIVATE opendoor_core ${NCURSESW_LIBRARY})
+    target_compile_options(opendoor_scan_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    if(TINFO_LIBRARY)
+      target_link_libraries(opendoor_scan_test PRIVATE ${TINFO_LIBRARY})
+    endif()
+    target_link_options(opendoor_scan_test PRIVATE "-Wl,--wrap=od_scan_host")
+    add_test(NAME scan_reporting_pty
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scan_reporting_pty.py
+              $<TARGET_FILE:opendoor> $<TARGET_FILE:opendoor_scan_test>)
+    set_tests_properties(scan_reporting_pty PROPERTIES TIMEOUT 45)
     add_test(NAME tui_mouse_contracts
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tui_pty.py
               $<TARGET_FILE:opendoor>)
     set_tests_properties(tui_mouse_contracts PROPERTIES TIMEOUT 30)
+    # Both workflows hold real listeners and allocate replacement ports from
+    # the same host namespace; do not interleave their fixtures under ctest -j.
+    set_tests_properties(scan_reporting_pty tui_mouse_contracts
+      PROPERTIES RESOURCE_LOCK opendoor_live_port_fixtures)
   endif()
 endif()
 

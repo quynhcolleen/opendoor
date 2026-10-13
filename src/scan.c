@@ -68,37 +68,14 @@ void od_scan_snapshot_free(OdScanSnapshot *snapshot) {
         free(snapshot->endpoints[index].command);
     }
     free(snapshot->endpoints);
-    for (size_t index = 0U; index < snapshot->warning_count; ++index) {
-        free(snapshot->warnings[index]);
-    }
-    free(snapshot->warnings);
+    od_scan_report_free(&snapshot->report);
     *snapshot = (OdScanSnapshot){0};
 }
 
 OdStatus od_scan_snapshot_add_warning(OdScanSnapshot *snapshot, const char *warning, OdError *error) {
-    if (snapshot == NULL || warning == NULL) {
-        od_error_set(error, OD_ERROR_INVALID, "snapshot and warning are required");
-        return OD_ERROR_INVALID;
-    }
-    for (size_t index = 0U; index < snapshot->warning_count; ++index) {
-        if (strcmp(snapshot->warnings[index], warning) == 0) {
-            return OD_OK;
-        }
-    }
-    char **warnings = realloc(snapshot->warnings,
-                              (snapshot->warning_count + 1U) * sizeof(*warnings));
-    if (warnings == NULL) {
-        od_error_set(error, OD_ERROR_MEMORY, "unable to store scan warning");
-        return OD_ERROR_MEMORY;
-    }
-    snapshot->warnings = warnings;
-    warnings[snapshot->warning_count] = strdup(warning);
-    if (warnings[snapshot->warning_count] == NULL) {
-        od_error_set(error, OD_ERROR_MEMORY, "unable to copy scan warning");
-        return OD_ERROR_MEMORY;
-    }
-    ++snapshot->warning_count;
-    return OD_OK;
+    if (snapshot == NULL) return OD_ERROR_INVALID;
+    return od_scan_report_add(&snapshot->report, OD_WARNING_UNCLASSIFIED,
+                               "Socket scan", warning, error);
 }
 
 static bool same_endpoint(const OdEndpoint *left, const OdEndpoint *right) {
@@ -358,17 +335,40 @@ static OdStatus scan_netlink_query(int socket_fd,
     unsigned char buffer[65536];
     bool done = false;
     while (!done) {
-        ssize_t received = recv(socket_fd, buffer, sizeof(buffer), 0);
+        ssize_t received = recv(socket_fd, buffer, sizeof(buffer), MSG_TRUNC);
         if (received < 0) {
             if (errno == EINTR) continue;
             od_error_set(error, OD_ERROR_IO, "unable to receive kernel socket diagnostics");
             return OD_ERROR_IO;
         }
+        if ((size_t)received > sizeof(buffer)) {
+            OdStatus status = od_scan_report_add(&snapshot->report,
+                OD_WARNING_SOCKET_PARTIAL, "Socket table (kernel diagnostics)",
+                "truncated response; occupied ports may be missing", error);
+            if (status != OD_OK) return status;
+            received = (ssize_t)sizeof(buffer);
+        }
         for (struct nlmsghdr *header = (struct nlmsghdr *)buffer;
              NLMSG_OK(header, (unsigned)received);
              header = NLMSG_NEXT(header, received)) {
             if (header->nlmsg_seq != sequence) continue;
+            if ((header->nlmsg_flags & NLM_F_DUMP_INTR) != 0U) {
+                OdStatus status = od_scan_report_add(&snapshot->report,
+                    OD_WARNING_SOCKET_PARTIAL, "Socket table (kernel diagnostics)",
+                    "interrupted response; occupied ports may be missing", error);
+                if (status != OD_OK) return status;
+            }
             if (header->nlmsg_type == NLMSG_DONE) {
+                size_t payload_size = header->nlmsg_len - NLMSG_HDRLEN;
+                int dump_error = 0;
+                if (payload_size >= sizeof(dump_error))
+                    memcpy(&dump_error, NLMSG_DATA(header), sizeof(dump_error));
+                if (dump_error != 0 || payload_size < sizeof(dump_error)) {
+                    OdStatus status = od_scan_report_add(&snapshot->report,
+                        OD_WARNING_SOCKET_PARTIAL, "Socket table (kernel diagnostics)",
+                        "dump ended with an error or incomplete result", error);
+                    if (status != OD_OK) return status;
+                }
                 done = true;
                 break;
             }
@@ -376,10 +376,16 @@ static OdStatus scan_netlink_query(int socket_fd,
                 od_error_set(error, OD_ERROR_IO, "kernel rejected socket diagnostics request");
                 return OD_ERROR_IO;
             }
-            if (header->nlmsg_type != SOCK_DIAG_BY_FAMILY ||
-                header->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg))) {
+            if (header->nlmsg_type == NLMSG_OVERRUN ||
+                (header->nlmsg_type == SOCK_DIAG_BY_FAMILY &&
+                 header->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg)))) {
+                OdStatus status = od_scan_report_add(&snapshot->report,
+                    OD_WARNING_SOCKET_PARTIAL, "Socket table (kernel diagnostics)",
+                    "missing or malformed socket records", error);
+                if (status != OD_OK) return status;
                 continue;
             }
+            if (header->nlmsg_type != SOCK_DIAG_BY_FAMILY) continue;
             const struct inet_diag_msg *diagnostic = NLMSG_DATA(header);
             OdEndpoint endpoint = {0};
             endpoint.family = family;
@@ -399,6 +405,12 @@ static OdStatus scan_netlink_query(int socket_fd,
                          sizeof(endpoint.remote_address));
             assign_stable_id(&endpoint);
             OdStatus status = add_endpoint(snapshot, &endpoint, error);
+            if (status != OD_OK) return status;
+        }
+        if (!done && received > 0) {
+            OdStatus status = od_scan_report_add(&snapshot->report,
+                OD_WARNING_SOCKET_PARTIAL, "Socket table (kernel diagnostics)",
+                "malformed response framing; occupied ports may be missing", error);
             if (status != OD_OK) return status;
         }
     }
@@ -481,13 +493,14 @@ static OdStatus read_whole_file(const char *path, char **text, OdError *error) {
 static OdStatus scan_proc(OdScanSnapshot *snapshot, OdError *error) {
     struct {
         const char *path;
+        const char *stage;
         int family;
         unsigned protocol;
     } files[] = {
-        {"/proc/net/tcp", AF_INET, OD_PROTOCOL_TCP},
-        {"/proc/net/tcp6", AF_INET6, OD_PROTOCOL_TCP},
-        {"/proc/net/udp", AF_INET, OD_PROTOCOL_UDP},
-        {"/proc/net/udp6", AF_INET6, OD_PROTOCOL_UDP}
+        {"/proc/net/tcp", "Socket table (IPv4 TCP)", AF_INET, OD_PROTOCOL_TCP},
+        {"/proc/net/tcp6", "Socket table (IPv6 TCP)", AF_INET6, OD_PROTOCOL_TCP},
+        {"/proc/net/udp", "Socket table (IPv4 UDP)", AF_INET, OD_PROTOCOL_UDP},
+        {"/proc/net/udp6", "Socket table (IPv6 UDP)", AF_INET6, OD_PROTOCOL_UDP}
     };
     OdStatus status = OD_OK;
     size_t successful = 0U;
@@ -495,12 +508,31 @@ static OdStatus scan_proc(OdScanSnapshot *snapshot, OdError *error) {
         char *text = NULL;
         OdStatus read_status = read_whole_file(files[index].path, &text, error);
         if (read_status != OD_OK) {
+            status = od_scan_report_add(&snapshot->report, OD_WARNING_SOCKET_UNREADABLE,
+                                        files[index].stage, "could not be fully read", error);
+            if (status != OD_OK) return status;
             continue;
+        }
+        /* An empty/truncated table is not evidence that no ports are occupied.
+         * Keep parsing behavior unchanged, but make verification fail closed. */
+        const char *header_end = strchr(text, '\n');
+        const char *address_header = strstr(text, "local_address");
+        if (header_end == NULL || address_header == NULL || address_header > header_end) {
+            status = od_scan_report_add(&snapshot->report, OD_WARNING_SOCKET_PARTIAL,
+                files[index].stage, "missing or incomplete socket-table header", error);
+            if (status != OD_OK) { free(text); return status; }
         }
         status = od_parse_proc_net(text, files[index].family, files[index].protocol,
                                    snapshot, error);
         free(text);
-        if (status != OD_OK) return status;
+        if (status != OD_OK) {
+            OdError original = *error;
+            OdStatus reported = od_scan_report_add(&snapshot->report, OD_WARNING_SOCKET_PARTIAL,
+                files[index].stage, "invalid or partial socket data", error);
+            if (reported != OD_OK) return reported;
+            *error = original;
+            return status;
+        }
         ++successful;
     }
     if (successful == 0U) {
@@ -516,11 +548,23 @@ OdStatus od_scan_sockets(OdScanSnapshot *snapshot, OdError *error) {
         return OD_ERROR_INVALID;
     }
     size_t original_count = snapshot->endpoint_count;
+    size_t warning_count = snapshot->report.count;
+    size_t warning_total = snapshot->report.total_count;
+    size_t blocking_total = snapshot->report.blocking_count;
     OdStatus status = scan_netlink(snapshot, error);
     if (status != OD_OK) {
         snapshot->endpoint_count = original_count;
-        OdStatus warning_status = od_scan_snapshot_add_warning(
-            snapshot, "NETLINK_INET_DIAG unavailable; using /proc socket tables", error);
+        /* The fallback replaces the rejected kernel result. Report coverage
+         * of that replacement, not partial data which is no longer used. */
+        for (size_t i = warning_count; i < snapshot->report.count; ++i)
+            free(snapshot->report.items[i].text);
+        snapshot->report.count = warning_count;
+        snapshot->report.total_count = warning_total;
+        snapshot->report.blocking_count = blocking_total;
+        snapshot->report.completeness = warning_total == 0U ? OD_SCAN_COMPLETE : OD_SCAN_INCOMPLETE;
+        OdStatus warning_status = od_scan_report_add(
+            &snapshot->report, OD_WARNING_SOCKET_FALLBACK, "Socket scan",
+            "kernel diagnostics unavailable; using fallback socket tables", error);
         if (warning_status != OD_OK) return warning_status;
         status = scan_proc(snapshot, error);
     }
@@ -742,8 +786,9 @@ OdStatus od_resolve_process_owners(const char *proc_root,
                 snapshot->endpoints[index].permission_limited = true;
             }
         }
-        OdStatus status = od_scan_snapshot_add_warning(
-            snapshot, "Some process owners are hidden by /proc permissions", error);
+        OdStatus status = od_scan_report_add(
+            &snapshot->report, OD_WARNING_OWNER_ATTRIBUTION, "Process ownership",
+            "some owners could not be read (permissions)", error);
         if (status != OD_OK) return status;
     }
     od_error_clear(error);

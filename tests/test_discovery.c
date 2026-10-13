@@ -472,6 +472,26 @@ static void test_env_template_and_unrelated_files_are_ignored(void) {
     CHECK(rmdir(outside) == 0);
 }
 
+static void test_unsupported_compose_is_reported_without_new_declarations(void) {
+    char root[] = "/tmp/opendoor-unsupported-warning-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char path[512];
+    (void)snprintf(path, sizeof(path), "%s/compose.yaml", root);
+    write_text_file(path, "services:\n  api:\n    ports:\n      - \"127.0.0.1:3000:80\"\n");
+    OdProjectDiscovery result = {0};
+    OdError error;
+    CHECK(od_discover_project_ports(root, &result, &error) == OD_OK);
+    CHECK(result.count == 0U);
+    CHECK(result.report.total_count == 1U);
+    CHECK(!od_scan_report_blocks_apply(&result.report));
+    if (result.report.count == 1U) {
+        CHECK(strstr(result.report.items[0].text, "./compose.yaml: unsupported") != NULL);
+    }
+    od_project_discovery_free(&result);
+    CHECK(unlink(path) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
 static void test_compose_block_scalars_are_not_port_sections(void) {
     char root[] = "/tmp/opendoor-discovery-compose-scalar-XXXXXX";
     CHECK(mkdtemp(root) != NULL);
@@ -822,9 +842,9 @@ static void test_package_scripts_are_manual_only(void) {
     CHECK(find_declaration(&result, "./package.json", 7000U) == NULL);
     CHECK(find_declaration(&result, "./package.json", 7100U) == NULL);
     CHECK(find_declaration(&result, "./invalid/package.json", 6200U) == NULL);
-    CHECK(result.warning_count == 1U);
-    if (result.warning_count == 1U) {
-        CHECK(strstr(result.warnings[0], "invalid/package.json") != NULL);
+    CHECK(result.report.total_count == 1U);
+    if (result.report.count == 1U) {
+        CHECK(strstr(result.report.items[0].text, "invalid/package.json") != NULL);
     }
 
     od_project_discovery_free(&result);
@@ -1259,6 +1279,7 @@ int main(void) {
     test_env_address_keys_extract_auto_write_port_spans();
     test_env_template_and_unrelated_files_are_ignored();
     test_compose_block_scalars_are_not_port_sections();
+    test_unsupported_compose_is_reported_without_new_declarations();
     test_env_reference_requires_one_direct_assignment();
     test_compose_literals_and_direct_env_references();
     test_compose_rejects_unsupported_or_ambiguous_mappings();

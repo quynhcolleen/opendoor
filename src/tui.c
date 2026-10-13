@@ -95,7 +95,7 @@ static bool initialize_colors(void) {
     return true;
 }
 
-static void present_canvas(const OdCanvas *canvas) {
+static void queue_canvas(const OdCanvas *canvas) {
     (void)werase(terminal_window);
     for (size_t y = 0U; y < canvas->height; ++y) {
         for (size_t x = 0U; x < canvas->width; ++x) {
@@ -108,10 +108,9 @@ static void present_canvas(const OdCanvas *canvas) {
     }
     (void)wattrset(terminal_window, 0);
     (void)wnoutrefresh(terminal_window);
-    (void)doupdate();
 }
 
-static bool draw(void (*renderer)(OdCanvas *, void *), void *context) {
+static bool queue_draw(void (*renderer)(OdCanvas *, void *), void *context) {
     int width = getmaxx(terminal_window);
     int height = getmaxy(terminal_window);
     if (width <= 0 || height <= 0) return false;
@@ -121,9 +120,23 @@ static bool draw(void (*renderer)(OdCanvas *, void *), void *context) {
         return false;
     }
     renderer(&canvas, context);
-    present_canvas(&canvas);
+    queue_canvas(&canvas);
     od_canvas_free(&canvas);
     return true;
+}
+
+static bool draw(void (*renderer)(OdCanvas *, void *), void *context) {
+    bool rendered = queue_draw(renderer, context);
+    if (rendered) (void)doupdate();
+    return rendered;
+}
+
+void od_tui_run_flushed_interstitial(OdTuiBlockingStep render,
+                                     OdTuiBlockingStep operation,
+                                     void *context) {
+    if (render != NULL) render(context);
+    (void)doupdate();
+    if (operation != NULL) operation(context);
 }
 
 typedef struct {
@@ -179,10 +192,14 @@ static OdMenuItem run_menu(const char *project, bool ascii, const char *status) 
 typedef struct {
     OdProjectDiscovery discovery;
     OdDashboard dashboard;
+    OdScanReport report;
+    bool warnings_view;
+    size_t warning_scroll;
     char status[OD_ERROR_MESSAGE_CAP];
 } DashboardState;
 
 static void dashboard_state_free(DashboardState *state) {
+    od_scan_report_free(&state->report);
     od_dashboard_free(&state->dashboard);
     od_project_discovery_free(&state->discovery);
     *state = (DashboardState){0};
@@ -203,12 +220,16 @@ static OdStatus refresh_dashboard(DashboardState *state,
         status = od_dashboard_init(&state->dashboard, project_root,
                                    &state->discovery, &snapshot, error);
     }
+    OdError scan_error = *error;
+    OdStatus report_status = od_scan_report_combine(&state->report,
+        &state->discovery.report, &snapshot.report, error);
     od_scan_snapshot_free(&snapshot);
-    if (status != OD_OK) return status;
-    if (state->discovery.warning_count > 0U) {
+    if (report_status != OD_OK) return report_status;
+    if (status != OD_OK) { *error = scan_error; return status; }
+    if (state->report.completeness == OD_SCAN_INCOMPLETE) {
         set_status(state->status, sizeof(state->status),
-                   "Scan complete with %zu warning(s)",
-                   state->discovery.warning_count);
+                   "Scan incomplete (%zu warning%s)", state->report.total_count,
+                   state->report.total_count == 1U ? "" : "s");
     } else {
         set_status(state->status, sizeof(state->status), "Scan complete");
     }
@@ -225,15 +246,62 @@ static void render_dashboard(OdCanvas *canvas, void *opaque) {
     size_t page_size = canvas->height > 16U ? (canvas->height - 16U) / 2U : 1U;
     if (page_size == 0U) page_size = 1U;
     od_dashboard_set_page_size(&context->state->dashboard, page_size);
-    od_render_dashboard(canvas, &context->state->dashboard,
-                        context->state->status, context->ascii);
+    od_render_dashboard_report(canvas, &context->state->dashboard,
+        context->state->status, context->ascii, &context->state->report,
+        context->state->warnings_view, context->state->warning_scroll);
+}
+
+typedef struct {
+    DashboardState *state;
+    const char *project_root;
+    uint64_t generation;
+    OdError *error;
+    OdStatus result;
+    bool ascii;
+} DashboardRefreshContext;
+
+static void render_dashboard_loading(OdCanvas *canvas, void *opaque) {
+    const DashboardRefreshContext *context = opaque;
+    od_render_dashboard_loading(canvas, context->ascii);
+}
+
+static void queue_dashboard_loading(void *opaque) {
+    (void)queue_draw(render_dashboard_loading, opaque);
+}
+
+static void run_dashboard_refresh(void *opaque) {
+    DashboardRefreshContext *context = opaque;
+    context->result = refresh_dashboard(context->state,
+                                        context->project_root,
+                                        context->generation,
+                                        context->error);
+}
+
+static OdStatus refresh_dashboard_with_loading(DashboardState *state,
+                                               const char *project_root,
+                                               uint64_t generation,
+                                               bool ascii,
+                                               OdError *error) {
+    DashboardRefreshContext context = {
+        .state = state,
+        .project_root = project_root,
+        .generation = generation,
+        .error = error,
+        .result = OD_OK,
+        .ascii = ascii
+    };
+    od_tui_run_flushed_interstitial(queue_dashboard_loading,
+                                    run_dashboard_refresh,
+                                    &context);
+    return context.result;
 }
 
 static void run_dashboard(const char *project_root, bool ascii) {
     DashboardState state = {0};
     OdError error;
     uint64_t generation = 1U;
-    if (refresh_dashboard(&state, project_root, generation, &error) != OD_OK) {
+    if (refresh_dashboard_with_loading(&state, project_root, generation,
+                                       ascii, &error) != OD_OK) {
         set_status(state.status, sizeof(state.status), "%s", error.message);
     }
     while (!interrupted) {
@@ -244,33 +312,44 @@ static void run_dashboard(const char *project_root, bool ascii) {
             MEVENT event;
             if (getmouse(&event) == OK) {
                 if ((event.bstate & BUTTON4_PRESSED) != 0U) {
-                    od_dashboard_scroll(&state.dashboard, -3);
+                    if (state.warnings_view) state.warning_scroll = od_page_target(state.warning_scroll, od_scan_warning_rows(&state.report), 3U, -1);
+                    else od_dashboard_scroll(&state.dashboard, -3);
                     continue;
                 }
                 if ((event.bstate & BUTTON5_PRESSED) != 0U) {
-                    od_dashboard_scroll(&state.dashboard, 3);
+                    if (state.warnings_view) state.warning_scroll = od_page_target(state.warning_scroll, od_scan_warning_rows(&state.report), 3U, 1);
+                    else od_dashboard_scroll(&state.dashboard, 3);
                     continue;
                 }
                 if ((event.bstate & BUTTON1_CLICKED) != 0U) {
-                    OdMouseTarget target = od_dashboard_mouse_target(
+                    OdMouseTarget target = od_dashboard_report_mouse_target(
                         (size_t)getmaxx(terminal_window),
-                        (size_t)getmaxy(terminal_window), event.x, event.y);
+                        (size_t)getmaxy(terminal_window), &state.report, state.warnings_view, event.x, event.y);
                     if (target.action == OD_MOUSE_REFRESH) key = 'r';
+                    if (target.action == OD_MOUSE_WARNINGS) key = 'w';
                     if (target.action == OD_MOUSE_BACK) key = 'q';
                 }
             }
         }
         if (key == KEY_UP) {
-            od_dashboard_scroll(&state.dashboard, -1);
+            if (state.warnings_view) state.warning_scroll = od_page_target(state.warning_scroll, od_scan_warning_rows(&state.report), 1U, -1);
+            else od_dashboard_scroll(&state.dashboard, -1);
         } else if (key == KEY_DOWN) {
-            od_dashboard_scroll(&state.dashboard, 1);
+            if (state.warnings_view) state.warning_scroll = od_page_target(state.warning_scroll, od_scan_warning_rows(&state.report), 1U, 1);
+            else od_dashboard_scroll(&state.dashboard, 1);
+        } else if (key == 'w' && state.report.total_count > 0U) {
+            state.warnings_view = !state.warnings_view;
         } else if (key == 'r') {
+            bool warnings_view = state.warnings_view;
             ++generation;
-            if (refresh_dashboard(&state, project_root, generation, &error) != OD_OK) {
+            if (refresh_dashboard_with_loading(&state, project_root, generation,
+                                               ascii, &error) != OD_OK) {
                 set_status(state.status, sizeof(state.status), "%s", error.message);
             }
+            state.warnings_view = warnings_view && state.report.total_count > 0U;
         } else if (key == 'q' || key == 27) {
-            break;
+            if (state.warnings_view) state.warnings_view = false;
+            else break;
         }
     }
     dashboard_state_free(&state);
@@ -279,13 +358,15 @@ static void run_dashboard(const char *project_root, bool ascii) {
 typedef struct {
     OdProjectDiscovery discovery;
     OdResolution resolution;
+    OdScanReport report;
+    size_t selected;
     size_t scroll;
-    bool apply_available;
     bool prepared;
     char status[OD_ERROR_MESSAGE_CAP];
 } ConflictState;
 
 static void conflict_state_free(ConflictState *state) {
+    od_scan_report_free(&state->report);
     od_resolution_free(&state->resolution);
     od_project_discovery_free(&state->discovery);
     *state = (ConflictState){0};
@@ -302,22 +383,30 @@ static OdStatus prepare_conflicts(ConflictState *state,
     if (status == OD_OK) status = od_scan_host(&snapshot, error);
     if (status == OD_OK) status = od_resolution_build(
         project_root, &state->discovery, &snapshot, &state->resolution, error);
+    OdError scan_error = *error;
+    OdStatus report_status = od_scan_report_combine(&state->report,
+        &state->discovery.report, &snapshot.report, error);
     od_scan_snapshot_free(&snapshot);
+    if (report_status != OD_OK) status = report_status;
+    else if (status != OD_OK) *error = scan_error;
     if (status != OD_OK) {
         set_status(state->status, sizeof(state->status), "%s", error->message);
         return status;
     }
     state->prepared = true;
-    state->apply_available = state->resolution.automatic_count > 0U;
-    if (state->resolution.count == 0U) {
+    if (state->report.completeness == OD_SCAN_INCOMPLETE) {
+        set_status(state->status, sizeof(state->status),
+                   "Scan incomplete (%zu warning%s)", state->report.total_count,
+                   state->report.total_count == 1U ? "" : "s");
+    } else if (state->resolution.count == 0U) {
         set_status(state->status, sizeof(state->status), "No conflicts found");
-    } else if (!state->apply_available) {
+    } else if (state->resolution.automatic_count == 0U) {
         set_status(state->status, sizeof(state->status),
                    "%zu manual suggestion(s); nothing will be written",
                    state->resolution.manual_count);
     } else {
         set_status(state->status, sizeof(state->status),
-                   "Press Enter once to apply the complete proposal");
+                   "Select a conflict; Enter applies only that row");
     }
     return OD_OK;
 }
@@ -329,92 +418,213 @@ typedef struct {
 
 static void render_conflict_screen(OdCanvas *canvas, void *opaque) {
     ConflictRenderContext *context = opaque;
-    od_render_conflicts(canvas, &context->state->resolution,
+    od_render_conflicts_report(canvas, &context->state->resolution,
+                        context->state->selected,
                         context->state->scroll,
-                        context->state->apply_available,
                         context->state->prepared,
                         context->state->status,
-                        context->ascii);
+                        context->ascii, &context->state->report);
+}
+
+typedef struct {
+    ConflictState *state;
+    const char *project_root;
+    OdError *error;
+    OdStatus result;
+    bool ascii;
+} ConflictPrepareContext;
+
+static void render_conflicts_loading(OdCanvas *canvas, void *opaque) {
+    const ConflictPrepareContext *context = opaque;
+    od_render_conflicts_loading(canvas, context->ascii);
+}
+
+static void queue_conflicts_loading(void *opaque) {
+    (void)queue_draw(render_conflicts_loading, opaque);
+}
+
+static void run_conflicts_prepare(void *opaque) {
+    ConflictPrepareContext *context = opaque;
+    context->result = prepare_conflicts(context->state,
+                                        context->project_root,
+                                        context->error);
+}
+
+static OdStatus prepare_conflicts_with_loading(ConflictState *state,
+                                               const char *project_root,
+                                               bool ascii,
+                                               OdError *error) {
+    ConflictPrepareContext context = {
+        .state = state,
+        .project_root = project_root,
+        .error = error,
+        .result = OD_OK,
+        .ascii = ascii
+    };
+    od_tui_run_flushed_interstitial(queue_conflicts_loading,
+                                    run_conflicts_prepare,
+                                    &context);
+    return context.result;
 }
 
 static void apply_proposal(ConflictState *state,
                            const char *project_root,
+                           bool ascii,
                            OdError *error) {
-    if (!state->apply_available) return;
+    if (od_scan_report_blocks_apply(&state->report)) {
+        set_status(state->status, sizeof(state->status), "%s", OD_SCAN_APPLY_BLOCKED);
+        return;
+    }
+    size_t warning_rows = od_scan_warning_rows(&state->report);
+    if (state->selected < warning_rows) return;
+    size_t group = state->selected - warning_rows;
+    const OdResolutionItem *item = od_resolution_group_item(&state->resolution,
+                                                           group);
+    if (item == NULL || !item->automatic) return;
+    OdResolution selected = {0};
+    OdStatus status = od_resolution_select_group(&state->resolution,
+                                                 group, &selected, error);
     OdScanSnapshot snapshot;
     od_scan_snapshot_init(&snapshot, 2U);
-    OdStatus status = od_scan_host(&snapshot, error);
+    if (status == OD_OK) status = od_scan_host(&snapshot, error);
     if (status == OD_OK) {
-        status = od_resolution_validate_snapshot(project_root, &state->resolution,
+        status = od_resolution_validate_snapshot(project_root, &selected,
                                                  &snapshot, error);
     }
+    OdError scan_error = *error;
+    OdStatus report_status = od_scan_report_combine(&state->report,
+        &state->discovery.report, &snapshot.report, error);
     od_scan_snapshot_free(&snapshot);
+    state->selected = od_scan_warning_rows(&state->report) + group;
+    if (report_status != OD_OK) status = report_status;
+    else if (status != OD_OK) *error = scan_error;
+    if (status == OD_OK && od_scan_report_blocks_apply(&state->report)) {
+        od_error_set(error, OD_ERROR_UNSUPPORTED, "%s", OD_SCAN_APPLY_BLOCKED);
+        status = OD_ERROR_UNSUPPORTED;
+    }
     size_t updated = 0U;
     if (status == OD_OK) {
-        status = od_history_apply_resolution(&state->resolution, OD_HISTORY_APPLY,
+        /* Fresh attribution warnings may not have existed on the proposal
+         * screen. Flush that report before entering the write transaction. */
+        if (state->report.total_count > 0U) {
+            ConflictRenderContext context = {state, ascii};
+            (void)draw(render_conflict_screen, &context);
+        }
+        status = od_history_apply_resolution(&selected, OD_HISTORY_APPLY,
                                               NULL, &updated, error);
     }
+    od_resolution_free(&selected);
     if (status != OD_OK) {
         set_status(state->status, sizeof(state->status), "%s", error->message);
         return;
     }
-    state->apply_available = false;
-    if (state->resolution.manual_count > 0U) {
-        set_status(state->status, sizeof(state->status),
-                   "Updated %zu port(s); %zu manual suggestion(s)",
-                   updated, state->resolution.manual_count);
-    } else {
-        set_status(state->status, sizeof(state->status), "Updated %zu port(s)",
-                   updated);
+    /* Other rows may share the edited file. Refresh their hashes and spans
+     * before accepting another action, under the already flushed interstitial. */
+    size_t previous_selection = group;
+    status = prepare_conflicts(state, project_root, error);
+    size_t count = od_resolution_group_count(&state->resolution);
+    state->selected = count == 0U ? 0U : od_scan_warning_rows(&state->report) +
+        (previous_selection < count ? previous_selection : count - 1U);
+    set_status(state->status, sizeof(state->status),
+               status == OD_OK ? "Updated %zu port(s)" :
+               "Updated %zu port(s); refresh failed: %s", updated, error->message);
+}
+
+typedef struct {
+    ConflictState *state;
+    const char *project_root;
+    OdError *error;
+    bool ascii;
+} ConflictApplyContext;
+
+static void render_conflicts_apply_loading(OdCanvas *canvas, void *opaque) {
+    const ConflictApplyContext *context = opaque;
+    od_render_conflicts_apply_loading(canvas, context->ascii);
+}
+
+static void queue_conflicts_apply_loading(void *opaque) {
+    (void)queue_draw(render_conflicts_apply_loading, opaque);
+}
+
+static void run_conflicts_apply(void *opaque) {
+    ConflictApplyContext *context = opaque;
+    apply_proposal(context->state, context->project_root, context->ascii, context->error);
+}
+
+static void apply_proposal_with_loading(ConflictState *state,
+                                        const char *project_root,
+                                        bool ascii,
+                                        OdError *error) {
+    if (od_scan_report_blocks_apply(&state->report)) {
+        set_status(state->status, sizeof(state->status), "%s", OD_SCAN_APPLY_BLOCKED);
+        return;
     }
+    size_t warnings = od_scan_warning_rows(&state->report);
+    if (state->selected < warnings) return;
+    const OdResolutionItem *item = od_resolution_group_item(&state->resolution,
+                                                           state->selected - warnings);
+    if (item == NULL || !item->automatic) return;
+    ConflictApplyContext context = {
+        .state = state,
+        .project_root = project_root,
+        .error = error,
+        .ascii = ascii
+    };
+    od_tui_run_flushed_interstitial(queue_conflicts_apply_loading,
+                                    run_conflicts_apply,
+                                    &context);
+    /* A completed row disappears. Keys queued while work blocked must not
+     * become confirmation for the next row occupying the same position. */
+    (void)flushinp();
 }
 
 static void run_conflicts(const char *project_root, bool ascii) {
     ConflictState state = {0};
     OdError error;
-    (void)prepare_conflicts(&state, project_root, &error);
+    (void)prepare_conflicts_with_loading(&state, project_root, ascii, &error);
     while (!interrupted) {
+        size_t count = od_resolution_group_count(&state.resolution) + od_scan_warning_rows(&state.report);
+        state.scroll = od_conflicts_report_scroll(&state.resolution, &state.report, state.selected, state.scroll,
+                                                  (size_t)getmaxy(terminal_window));
         ConflictRenderContext context = {&state, ascii};
         (void)draw(render_conflict_screen, &context);
         int key = wgetch(terminal_window);
-        int terminal_height = getmaxy(terminal_window);
-        size_t page_size = terminal_height > 12 ?
-            (size_t)(terminal_height - 12) / 2U : 1U;
-        if (page_size == 0U) page_size = 1U;
-        size_t visual_count = od_resolution_visual_line_count(&state.resolution);
-        size_t maximum = visual_count > page_size ?
-            visual_count - page_size : 0U;
-        if (state.scroll > maximum) state.scroll = maximum;
+        size_t maximum = count == 0U ? 0U : count - 1U;
         if (key == KEY_MOUSE) {
             MEVENT event;
             if (getmouse(&event) == OK) {
                 if ((event.bstate & BUTTON4_PRESSED) != 0U) {
-                    state.scroll = state.scroll > 3U ? state.scroll - 3U : 0U;
+                    state.selected = state.selected > 3U ? state.selected - 3U : 0U;
                     continue;
                 }
                 if ((event.bstate & BUTTON5_PRESSED) != 0U) {
-                    size_t remaining = maximum - state.scroll;
-                    state.scroll += remaining > 3U ? 3U : remaining;
+                    size_t remaining = maximum - state.selected;
+                    state.selected += remaining > 3U ? 3U : remaining;
                     continue;
                 }
                 if ((event.bstate & BUTTON1_CLICKED) != 0U) {
-                    OdMouseTarget target = od_conflicts_mouse_target(
+                    OdMouseTarget target = od_conflicts_report_mouse_target(
                         (size_t)getmaxx(terminal_window),
                         (size_t)getmaxy(terminal_window),
-                        state.apply_available, event.x, event.y);
-                    if (target.action == OD_MOUSE_APPLY_ALL) key = '\n';
+                        &state.resolution, state.selected, state.scroll, &state.report, event.x, event.y);
+                    if (target.action == OD_MOUSE_CONFLICT_ROW ||
+                        target.action == OD_MOUSE_CONFLICT_APPLY) state.selected = target.item;
+                    if (target.action == OD_MOUSE_CONFLICT_APPLY) key = '\n';
+                    if (target.action == OD_MOUSE_REFRESH) key = 'r';
                     if (target.action == OD_MOUSE_BACK) key = 'q';
                 }
             }
         }
         if (key == KEY_UP) {
-            if (state.scroll > 0U) --state.scroll;
+            if (state.selected > 0U) --state.selected;
         } else if (key == KEY_DOWN) {
-            if (state.scroll < maximum) ++state.scroll;
+            if (state.selected < maximum) ++state.selected;
+        } else if (key == 'r') {
+            (void)prepare_conflicts_with_loading(&state, project_root, ascii, &error);
         } else if ((key == '\n' || key == '\r' || key == KEY_ENTER) &&
                    getmaxx(terminal_window) >= 60 &&
                    getmaxy(terminal_window) >= 18) {
-            apply_proposal(&state, project_root, &error);
+            apply_proposal_with_loading(&state, project_root, ascii, &error);
         } else if (key == 'q' || key == 27) {
             break;
         }
@@ -533,10 +743,51 @@ static void render_history_screen(OdCanvas *canvas, void *opaque) {
     }
 }
 
+typedef struct {
+    HistoryState *state;
+    const char *project_root;
+    OdError *error;
+    OdStatus result;
+    bool ascii;
+} HistoryReloadContext;
+
+static void render_history_loading(OdCanvas *canvas, void *opaque) {
+    const HistoryReloadContext *context = opaque;
+    od_render_history_loading(canvas, context->ascii);
+}
+
+static void queue_history_loading(void *opaque) {
+    (void)queue_draw(render_history_loading, opaque);
+}
+
+static void run_history_reload(void *opaque) {
+    HistoryReloadContext *context = opaque;
+    context->result = reload_history(context->state,
+                                     context->project_root,
+                                     context->error);
+}
+
+static OdStatus reload_history_with_loading(HistoryState *state,
+                                            const char *project_root,
+                                            bool ascii,
+                                            OdError *error) {
+    HistoryReloadContext context = {
+        .state = state,
+        .project_root = project_root,
+        .error = error,
+        .result = OD_OK,
+        .ascii = ascii
+    };
+    od_tui_run_flushed_interstitial(queue_history_loading,
+                                    run_history_reload,
+                                    &context);
+    return context.result;
+}
+
 static void run_history(const char *project_root, bool ascii) {
     HistoryState state = {0};
     OdError error;
-    (void)reload_history(&state, project_root, &error);
+    (void)reload_history_with_loading(&state, project_root, ascii, &error);
     while (!interrupted) {
         HistoryRenderContext context = {&state, ascii};
         (void)draw(render_history_screen, &context);

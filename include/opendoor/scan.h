@@ -3,6 +3,7 @@
 
 #include "opendoor/common.h"
 #include "opendoor/model.h"
+#include "opendoor/scan_report.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -39,8 +40,7 @@ typedef struct {
     OdEndpoint *endpoints;
     size_t endpoint_count;
     size_t endpoint_capacity;
-    char **warnings;
-    size_t warning_count;
+    OdScanReport report;
     bool process_permissions_limited;
 } OdScanSnapshot;
 
