@@ -342,6 +342,21 @@ OdStatus od_resolution_build(const char *project_root,
                                       &discovery->items[index],
                                       plan.items[group_index].new_port, error);
         if (status == OD_OK) {
+            OdResolutionItem *item = &resolution->items[output];
+            for (size_t e = 0U; e < snapshot->endpoint_count; ++e) {
+                const OdEndpoint *endpoint = &snapshot->endpoints[e];
+                if (endpoint->local_port != item->old_port ||
+                    endpoint_is_project_owned(canonical_root, endpoint)) continue;
+                const char *name = endpoint->process;
+                if (name[0] == '\0') {
+                    const char *slash = strrchr(endpoint->executable, '/');
+                    name = slash == NULL ? endpoint->executable : slash + 1;
+                }
+                (void)snprintf(item->process, sizeof(item->process), "%.*s",
+                               (int)sizeof(item->process) - 1,
+                               name[0] == '\0' ? "-" : name);
+                break;
+            }
             if (resolution->items[output].automatic) {
                 ++resolution->automatic_count;
             } else {
@@ -364,6 +379,80 @@ OdStatus od_resolution_build(const char *project_root,
     }
     od_error_clear(error);
     return OD_OK;
+}
+
+static bool first_in_group(const OdResolution *resolution, size_t index) {
+    for (size_t previous = 0U; previous < index; ++previous) {
+        if (resolution->items[previous].allocation_index ==
+            resolution->items[index].allocation_index) return false;
+    }
+    return true;
+}
+
+size_t od_resolution_group_count(const OdResolution *resolution) {
+    size_t count = 0U;
+    if (resolution != NULL) {
+        for (size_t i = 0U; i < resolution->count; ++i) {
+            if (first_in_group(resolution, i)) ++count;
+        }
+    }
+    return count;
+}
+
+const OdResolutionItem *od_resolution_group_item(const OdResolution *resolution,
+                                                size_t row) {
+    if (resolution == NULL) return NULL;
+    for (size_t i = 0U; i < resolution->count; ++i) {
+        if (!first_in_group(resolution, i)) continue;
+        if (row-- != 0U) continue;
+        const OdResolutionItem *first = &resolution->items[i];
+        for (size_t j = i; j < resolution->count; ++j) {
+            if (resolution->items[j].allocation_index == first->allocation_index &&
+                resolution->items[j].automatic) return &resolution->items[j];
+        }
+        return first;
+    }
+    return NULL;
+}
+
+OdStatus od_resolution_select_group(const OdResolution *resolution, size_t row,
+                                    OdResolution *selected, OdError *error) {
+    if (selected == NULL || selected == resolution) {
+        od_error_set(error, OD_ERROR_INVALID, "separate output resolution is required");
+        return OD_ERROR_INVALID;
+    }
+    *selected = (OdResolution){0};
+    const OdResolutionItem *representative = od_resolution_group_item(resolution, row);
+    if (representative == NULL) {
+        od_error_set(error, OD_ERROR_INVALID, "select a conflict to apply");
+        return OD_ERROR_INVALID;
+    }
+    selected->items = calloc(resolution->count, sizeof(*selected->items));
+    selected->project_root = copy_string(resolution->project_root);
+    if (selected->items == NULL || selected->project_root == NULL) goto no_memory;
+    for (size_t i = 0U; i < resolution->count; ++i) {
+        const OdResolutionItem *source = &resolution->items[i];
+        if (source->allocation_index != representative->allocation_index) continue;
+        OdResolutionItem *item = &selected->items[selected->count++];
+        *item = *source;
+        item->variable = copy_string(source->variable);
+        item->absolute_path = copy_string(source->absolute_path);
+        item->relative_path = copy_string(source->relative_path);
+        item->line_before = copy_string(source->line_before);
+        item->line_after = copy_string(source->line_after);
+        item->manual_reason = copy_string(source->manual_reason);
+        if (item->variable == NULL || item->absolute_path == NULL ||
+            item->relative_path == NULL || item->line_before == NULL ||
+            item->line_after == NULL || item->manual_reason == NULL) goto no_memory;
+        if (item->automatic) ++selected->automatic_count;
+        else ++selected->manual_count;
+    }
+    od_error_clear(error);
+    return OD_OK;
+no_memory:
+    od_resolution_free(selected);
+    od_error_set(error, OD_ERROR_MEMORY, "unable to copy selected conflict");
+    return OD_ERROR_MEMORY;
 }
 
 OdStatus od_resolution_validate_snapshot(const char *project_root,

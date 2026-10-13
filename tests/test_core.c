@@ -354,6 +354,7 @@ static void test_source_aware_conflict_proposals_and_snapshot_validation(void) {
     endpoints[5].directory[0] = '\0';
     endpoints[5].executable[0] = '\0';
     OdScanSnapshot snapshot = {.endpoints = endpoints, .endpoint_count = 8U};
+    (void)snprintf(endpoints[0].process, sizeof(endpoints[0].process), "code");
     OdResolution resolution;
     OdError error;
     CHECK(od_resolution_build(root, &discovery, &snapshot,
@@ -361,6 +362,24 @@ static void test_source_aware_conflict_proposals_and_snapshot_validation(void) {
     CHECK(resolution.count == 7U);
     CHECK(resolution.automatic_count == 4U);
     CHECK(resolution.manual_count == 3U);
+    CHECK(od_resolution_group_count(&resolution) == 6U);
+    OdResolution selected = {0};
+    CHECK(od_resolution_select_group(&resolution, 0U, &selected, &error) == OD_OK);
+    CHECK(selected.count == 2U && selected.automatic_count == 1U && selected.manual_count == 1U);
+    CHECK(selected.items != resolution.items);
+    CHECK(selected.project_root != resolution.project_root);
+    if (selected.count == 2U) {
+        CHECK(selected.items[0].allocation_index == selected.items[1].allocation_index);
+        CHECK(selected.items[0].variable != resolution.items[0].variable);
+        CHECK(strcmp(selected.items[0].variable, "API_PORT") == 0);
+        CHECK(selected.items[1].source_kind == OD_SOURCE_COMPOSE);
+        CHECK(strcmp(selected.items[0].process, "code") == 0);
+        OdScanSnapshot only_selected = {.endpoints = endpoints, .endpoint_count = 1U};
+        CHECK(od_resolution_validate_snapshot(root, &selected, &only_selected, &error) == OD_OK);
+    }
+    od_resolution_free(&selected);
+    CHECK(od_resolution_select_group(&resolution, 6U, &selected, &error) == OD_ERROR_INVALID);
+    CHECK(selected.items == NULL && selected.count == 0U);
     const OdResolutionItem *definition = find_resolution_item(&resolution, 0U);
     const OdResolutionItem *reference = find_resolution_item(&resolution, 1U);
     const OdResolutionItem *compose = find_resolution_item(&resolution, 2U);

@@ -15,6 +15,7 @@ typedef struct {
     uint16_t old_port;
     uint16_t new_port;
     bool automatic;
+    char process[OD_PROCESS_CAP];
     OdPortSourceKind source_kind;
     OdPortWriteKind write_kind;
     size_t line;
@@ -51,5 +52,13 @@ OdStatus od_resolution_validate_snapshot(const char *project_root,
                                          const OdScanSnapshot *snapshot,
                                          OdError *error);
 void od_resolution_free(OdResolution *resolution);
+/* One visible conflict per allocation, including every linked declaration.
+ * group_item prefers the writable definition as the row's representative. */
+size_t od_resolution_group_count(const OdResolution *resolution);
+const OdResolutionItem *od_resolution_group_item(const OdResolution *resolution,
+                                                size_t row);
+/* Creates an owned copy suitable for independent validation and transaction. */
+OdStatus od_resolution_select_group(const OdResolution *resolution, size_t row,
+                                    OdResolution *selected, OdError *error);
 
 #endif
