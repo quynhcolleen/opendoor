@@ -23,8 +23,7 @@ The columns are:
 
 `PORT | RELATIVE FOLDER | STATUS | PROCESS | SOURCE`
 
-Every displayed path is relative to the selected project and begins with `./`.
-Statuses are:
+Every displayed path is relative to the selected project and begins with `./`. `SOURCE` names the declaration format and key, then lists every contributing file, for example `env (API_PORT) — ./.env, ./docker-compose.yml` or `compose — ./compose.yaml`. The complete contributing-file list is retained when a linked Compose reference is merged into its `.env` definition. Statuses are:
 
 - `running`: at least one project-owned live endpoint uses the declared port;
 - `not running`: the declared port is free;
@@ -32,26 +31,51 @@ Statuses are:
 
 Every declaration sharing a project-owned live port is marked `running`. A project-owned live port that has no declaration is also shown with source `live`. `PROCESS` shows the compact kernel process name, falls back to the executable basename, and shows `-` when no owner name is available. Dashboard never asks for confirmation and never writes a file.
 
+When discovery or socket scanning emits a warning, the status says `Scan incomplete (N warnings)`. Press `w` or click the `w Warnings` footer target to read the warnings; this target appears only when warnings exist. `w`, `q`, or Escape returns from warnings to the ports table. The warning view is read-only and uses the same Up/Down and mouse-wheel scrolling as the table.
+
 ## Resolve conflicts
 
 Resolve Conflicts treats a declaration as conflicting when another project—or an endpoint with unavailable ownership metadata—already occupies its port. It reserves every live machine port and every declared port, then proposes a replacement from the fixed range **1024–65535**.
 
-The screen shows a per-file diff preview for automatic edits and a separate manual-suggestion section. Automatic edits are limited to:
+The screen shows one row per logical conflict:
+
+`PORT | PROPOSED | RELATIVE FOLDER | PROCESS | SOURCE | ACTION`
+
+When there are no conflicts, Resolve shows a plain result message instead of an empty table. The incomplete-scan summary appears once; warning details and distinct operation/error messages remain visible.
+
+Each writable row has an `[Apply]` button. Linked declarations (for example a Compose reference and its `.env` definition) share one row; `SOURCE` uses the Dashboard format and includes every contributing filename. The selected row's filenames and exact before/after line appear below the table. Manual-only rows show `Manual` and their reason in the detail area. Automatic edits are limited to:
 
 - the integer token in a plain `.env` assignment;
 - the host token in an unambiguous Compose short mapping.
 
 Package scripts, Makefiles, all variable references, and ambiguous or unresolvable declarations are suggestions only and are never written.
 
-Enter is the single confirmation: it applies every automatic proposal exactly as shown. There is no row selection, partial apply, manual port override, or second confirmation. `q` or Escape cancels without writing anything.
+Enter or a click on the exact `[Apply]` button applies only that row. An ordinary row click selects without writing. Linked references remain unchanged; their writable definition is updated in the same transaction as any other writable declaration in that group. After success, OpenDoor refreshes the remaining rows and discards input queued during Apply, so applying another row requires a fresh action. There is no manual port override or second confirmation. `q` or Escape returns to the menu without applying any remaining rows.
 
-Before writing, OpenDoor verifies that the source files and exact token spans have not changed and rescans sockets to ensure the proposal is still valid. For every touched source it creates `<file>.opendoor.bak`, patches only the recorded byte spans, writes through a same-directory temporary file, calls `fsync`, renames atomically, and validates the result. A failure restores every file touched by that confirmation byte-for-byte; partial apply is not allowed.
+At 91+ terminal columns all six columns are visible. At 79–90 columns the table omits `RELATIVE FOLDER`; at 60–78 it also omits `PROCESS`. All cells are left-aligned with one space of padding on each side. Content widths are respectively `5 | 8 | 15 | 10 | width-66 | 7`, `5 | 8 | 10 | width-48 | 7`, and `5 | 8 | width-35 | 7`, plus single-column separators and one-column outer margins. Long cell values and bottom details are clipped to the available terminal width; enlarge the terminal to inspect longer paths.
+
+Before writing, OpenDoor verifies that the selected row's writable source files and exact token spans have not changed and rescans sockets to ensure the proposal is still valid. For every touched source it creates `<file>.opendoor.bak`, patches only the recorded byte spans, writes through a same-directory temporary file, calls `fsync`, renames atomically, and validates the result. A failure restores every file touched by that row's transaction byte-for-byte. Other rows are independent transactions.
+
+### Scan completeness and Apply safety
+
+Both screens retain warnings from project discovery and socket scanning. Any warning makes the scan **incomplete**, even if no conflicts were detected. `No conflicts found` is reserved for a complete scan. An incomplete empty result instead says `No conflicts detected in scanned data.` with warning styling and the incomplete-scan summary. Resolve places a `Scan warnings` section before the proposal table; the section scrolls with the proposals. Each warning names a project-relative file (such as `./package.json`) or a scan stage and its reason. Paths/reasons follow the existing terminal-width clipping rules.
+
+Warning severity is also shown as text, not just color:
+
+- `[info]`: discovery failures (invalid/unreadable files, oversized files, unsupported syntax), unavailable owner metadata, or use of a working socket fallback. Apply remains available: unknown owners are already treated as external occupants. The proposal/confirmation view adds `Scan was incomplete (N warnings); undiscovered declarations or unknown owners are possible.`
+- `[blocks apply]`: unreadable or partial socket tables, failed/malformed or interrupted/truncated kernel responses, or an unclassified warning. Occupied ports cannot be reliably verified, so writable rows show `Blocked` instead of `[Apply]`. The message is `Apply blocked: socket table could not be fully read. Refresh and retry.`
+
+The same gate runs on the initial scan and the fresh pre-write scan. If a blocking warning first appears during the latter, Apply stops before creating backups, changing sources, or writing History. Informational warnings first seen in that scan are displayed and flushed before the write. There is no new confirmation keystroke. Refresh after correcting a blocking condition.
+
+The severity policy is centralized in `src/scan_report.c`; unknown warning kinds default to blocking. Each warning list retains at most **200** details and then shows `and N more`. Completeness, total warning counts, and blocking status still include every omitted warning. This reporting does not change declarations, proposals, or the existing persistence transaction.
 
 ## History
 
 Every successful automatic declaration change appends one flat JSON object to the project's `.opendoor/history.log`. The file is UTF-8 JSON Lines (JSONL), with one record per changed declaration, including the time, relative file, key, exact token span, and old and new ports. History is local, append-only, and retained without a size or age limit; OpenDoor never rotates, prunes, or clears successful records. Opening an empty History screen does not create the directory or log.
 
-The screen paginates all valid records newest-first in `WHEN | FILE / KEY | CHANGE | ACTION / STATUS`. Each entry occupies one content line. An entry shows `[Revert]` only when exactly one currently writable declaration matches its recorded file, key, format, byte offset, and token length, and its current port equals the recorded new port. Missing, moved, changed, or unsafe declarations show the explicit danger-colored label `Unavailable`. Unavailable rows remain selectable; the selected row's full relative path, key, change, and reason appear in the bottom status line, with the reason kept out of the table.
+The screen paginates all valid records newest-first in `WHEN | RELATIVE FOLDER | SOURCE | CHANGE | ACTION / STATUS`. `WHEN` remains UTC but is displayed at whole-second precision as `YYYY-MM-DD HH:MM:SS`; the stored RFC 3339 timestamp retains its `T`, `Z`, and milliseconds. `RELATIVE FOLDER` uses the same project-relative folder format as Dashboard, while `SOURCE` uses the same format-and-key label without repeating the filename. At 79–90 terminal columns the five columns use a compact unpadded layout. At 60–78 columns the table omits `RELATIVE FOLDER` and abbreviates `ACTION / STATUS` to `STATUS`; the selected entry's exact path remains in the bottom status line.
+
+Each entry occupies one content line. An entry shows `[Revert]` only when exactly one currently writable declaration matches its recorded file, key, format, byte offset, and token length, and its current port equals the recorded new port. Missing, moved, changed, or unsafe declarations show the explicit danger-colored label `Unavailable`. Unavailable rows remain selectable; the selected row is one continuous highlight, and its full relative path, key, change, and reason appear in the bottom status line, with the reason kept out of the table.
 
 Revert changes only that exact declaration from its recorded new port back to its old port. OpenDoor checks availability before opening confirmation and again immediately before writing. Only lowercase `y` or a click on the explicit `Confirm revert` target confirms; Enter does not write. There is no force option, guessed location, declaration relocation, merge, or whole-file snapshot restoration. External edits can make an entry stale and unavailable, while restoring its exact recorded state can make it available again.
 
@@ -82,13 +106,17 @@ Dashboard:
 
 - Up/Down or mouse wheel: scroll;
 - `r` or the footer refresh target: rescan;
+- `w` or the footer Warnings target (only when warnings exist): show warnings;
+- in warnings, `w`, `q`, Escape, or the footer Ports targets: return to ports;
 - `q`, Escape, or the footer back target: return to the menu.
 
 Resolve Conflicts:
 
-- Up/Down or mouse wheel: scroll the preview;
-- Enter or the footer apply-all target: apply all automatic changes once;
-- `q`, Escape, or the footer cancel target: return without writing.
+- Up/Down or mouse wheel: navigate warnings and conflicts, keeping selection visible;
+- ordinary row click: select only;
+- Enter, the footer Apply target, or the exact `[Apply]` button: apply that row, unless a blocking scan warning exists;
+- `r` or the footer refresh target: rebuild proposals from the current files and sockets;
+- `q`, Escape, or the footer back target: return without applying remaining rows.
 
 History:
 
@@ -105,7 +133,7 @@ History confirmation:
 - `n`, `q`, Escape, or the footer cancel target: cancel without writing;
 - Enter, arrows, mouse wheel, row clicks, and refresh: do nothing.
 
-Clicks inside Dashboard rows or Resolve preview rows have no action.
+Clicks inside Dashboard rows have no action.
 
 ## Build and run
 
@@ -117,6 +145,8 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Terminal integration tests use real loopback listeners. CTest serializes those fixtures within a test run; run native and sanitizer suites sequentially when they share a host, so one suite cannot occupy another's proposed replacement port.
 
 Run from a project directory or select another root:
 
