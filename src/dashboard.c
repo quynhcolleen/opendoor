@@ -1,6 +1,6 @@
 #include "opendoor/dashboard.h"
+#include "opendoor/display.h"
 
-#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,65 +134,6 @@ static bool append_unique_source(char *destination,
     return true;
 }
 
-static const char *source_kind_name(OdPortSourceKind kind) {
-    switch (kind) {
-        case OD_SOURCE_ENV: return "env";
-        case OD_SOURCE_COMPOSE: return "compose";
-        case OD_SOURCE_PACKAGE_JSON: return "package.json";
-        case OD_SOURCE_MAKEFILE: return "makefile";
-    }
-    return "source";
-}
-
-static bool case_insensitive_port_at(const char *text) {
-    return toupper((unsigned char)text[0]) == 'P' &&
-           toupper((unsigned char)text[1]) == 'O' &&
-           toupper((unsigned char)text[2]) == 'R' &&
-           toupper((unsigned char)text[3]) == 'T';
-}
-
-static bool store_declaration_name(char *destination,
-                                   size_t capacity,
-                                   const OdPortDeclaration *declaration) {
-    const char *key = declaration->environment_key;
-    if (key == NULL || key[0] == '\0') {
-        return checked_copy(destination, capacity,
-                            source_kind_name(declaration->source_kind));
-    }
-    char stripped[OD_PROCESS_CAP];
-    size_t key_length = strlen(key);
-    size_t write_index = 0U;
-    size_t segment_start = 0U;
-    for (size_t cursor = 0U; cursor <= key_length; ++cursor) {
-        if (cursor < key_length && key[cursor] != '_') continue;
-        size_t segment_length = cursor - segment_start;
-        bool port_segment = segment_length == 4U &&
-                            case_insensitive_port_at(key + segment_start);
-        if (segment_length > 0U && !port_segment) {
-            size_t separator_length = write_index == 0U ? 0U : 1U;
-            if (segment_length > sizeof(stripped) - write_index -
-                                     separator_length - 1U) {
-                return checked_copy(destination, capacity,
-                                    source_kind_name(declaration->source_kind));
-            }
-            if (separator_length != 0U) stripped[write_index++] = '_';
-            memcpy(stripped + write_index, key + segment_start, segment_length);
-            write_index += segment_length;
-        }
-        segment_start = cursor + 1U;
-    }
-    if (write_index >= sizeof(stripped)) {
-            return checked_copy(destination, capacity,
-                                source_kind_name(declaration->source_kind));
-    }
-    stripped[write_index] = '\0';
-    if (stripped[0] == '\0') {
-        return checked_copy(destination, capacity,
-                            source_kind_name(declaration->source_kind));
-    }
-    return checked_copy(destination, capacity, stripped);
-}
-
 static bool reference_belongs_to_env_row(
     const OdProjectDiscovery *discovery,
     size_t reference_index,
@@ -277,14 +218,30 @@ static int compare_rows(const void *left, const void *right) {
     return strcmp(first->source, second->source);
 }
 
-static OdStatus store_row_strings(OdPortRow *row,
-                                  const char *folder,
-                                  const char *source,
-                                  OdError *error) {
-    if (folder == NULL || source == NULL || folder[0] != '.' || folder[1] != '/' ||
-        (strcmp(source, "live") != 0 && (source[0] != '.' || source[1] != '/')) ||
+static OdStatus store_declared_row_strings(OdPortRow *row,
+                                           const OdPortDeclaration *declaration,
+                                           const char *paths,
+                                           OdError *error) {
+    if (declaration == NULL || paths == NULL ||
+        !od_display_relative_folder(declaration->relative_path,
+                                    row->relative_folder,
+                                    sizeof(row->relative_folder)) ||
+        !od_display_source(declaration->source_kind,
+                           declaration->environment_key,
+                           paths, row->source, sizeof(row->source))) {
+        od_error_set(error, OD_ERROR_INVALID,
+                     "dashboard display values exceed their bounds");
+        return OD_ERROR_INVALID;
+    }
+    return OD_OK;
+}
+
+static OdStatus store_live_row_strings(OdPortRow *row,
+                                       const char *folder,
+                                       OdError *error) {
+    if (folder == NULL || folder[0] != '.' || folder[1] != '/' ||
         !checked_copy(row->relative_folder, sizeof(row->relative_folder), folder) ||
-        !checked_copy(row->source, sizeof(row->source), source)) {
+        !checked_copy(row->source, sizeof(row->source), "live")) {
         od_error_set(error, OD_ERROR_INVALID,
                      "dashboard paths must be bounded project-relative paths");
         return OD_ERROR_INVALID;
@@ -385,8 +342,8 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
         }
         OdPortRow *row = &dashboard->rows[dashboard->count];
         *row = (OdPortRow){.port = declaration->port, .declared = true};
-        status = store_row_strings(row, declaration->relative_folder,
-                                   combined_source, error);
+        status = store_declared_row_strings(row, declaration,
+                                            combined_source, error);
         if (status != OD_OK) break;
         const LiveRecord *owner = representative_project_record(
             records, record_count, declaration->port, declaration->relative_folder);
@@ -397,10 +354,10 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
                                                 declaration->port);
             row->status = owner == NULL ? OD_PORT_NOT_RUNNING : OD_PORT_IN_USE_OTHER;
         }
-        if (!store_declaration_name(row->process, sizeof(row->process),
-                                    declaration)) {
+        if (!checked_copy(row->process, sizeof(row->process),
+                          owner == NULL ? "-" : owner->process)) {
             od_error_set(error, OD_ERROR_INVALID,
-                         "dashboard declaration name exceeds its bound");
+                         "dashboard process name exceeds its bound");
             status = OD_ERROR_INVALID;
             break;
         }
@@ -418,7 +375,7 @@ OdStatus od_dashboard_init(OdDashboard *dashboard,
             .port = record->port,
             .status = OD_PORT_RUNNING
         };
-        status = store_row_strings(row, record->relative_folder, "live", error);
+        status = store_live_row_strings(row, record->relative_folder, error);
         if (status != OD_OK) break;
         if (!checked_copy(row->process, sizeof(row->process), record->process)) {
             od_error_set(error, OD_ERROR_INVALID,

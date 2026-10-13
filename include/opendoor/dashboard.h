@@ -14,13 +14,15 @@ typedef enum {
     OD_PORT_IN_USE_OTHER
 } OdPortStatus;
 
+#define OD_DASHBOARD_SOURCE_CAP (OD_PATH_CAP + OD_PROCESS_CAP + 32U)
+
 typedef struct {
     uint16_t port;
     OdPortStatus status;
     bool declared;
     char relative_folder[OD_PATH_CAP];
     char process[OD_PROCESS_CAP];
-    char source[OD_PATH_CAP];
+    char source[OD_DASHBOARD_SOURCE_CAP];
 } OdPortRow;
 
 typedef struct {

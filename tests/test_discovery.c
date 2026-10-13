@@ -924,10 +924,10 @@ static void test_makefile_ports_are_manual_only(void) {
 
 static const OdPortRow *find_dashboard_row(const OdDashboard *dashboard,
                                            uint16_t port,
-                                           const char *source) {
+                                           const char *source_fragment) {
     for (size_t index = 0U; index < dashboard->count; ++index) {
         if (dashboard->rows[index].port == port &&
-            strcmp(dashboard->rows[index].source, source) == 0) {
+            strstr(dashboard->rows[index].source, source_fragment) != NULL) {
             return &dashboard->rows[index];
         }
     }
@@ -958,8 +958,8 @@ static void test_dashboard_merges_env_definition_with_compose_reference(void) {
     if (dashboard.count == 1U) {
         CHECK(dashboard.rows[0].port == 27027U);
         CHECK(strcmp(dashboard.rows[0].source,
-                     "./.env, ./docker-compose.yml") == 0);
-        CHECK(strcmp(dashboard.rows[0].process, "SOME") == 0);
+                     "env (SOME_PORT) — ./.env, ./docker-compose.yml") == 0);
+        CHECK(strcmp(dashboard.rows[0].process, "-") == 0);
     }
 
     od_dashboard_free(&dashboard);
@@ -993,7 +993,8 @@ static void test_dashboard_keeps_linked_source_when_same_file_port_is_deduplicat
     CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
     CHECK(dashboard.count == 1U);
     if (dashboard.count == 1U) {
-        CHECK(strcmp(dashboard.rows[0].source, "./.env, ./compose.yaml") == 0);
+        CHECK(strcmp(dashboard.rows[0].source,
+                     "env (API_PORT) — ./.env, ./compose.yaml") == 0);
     }
 
     od_dashboard_free(&dashboard);
@@ -1040,12 +1041,22 @@ static void test_dashboard_declared_rows_show_variable_or_source_kind(void) {
     const OdPortRow *compose =
         find_dashboard_row(&dashboard, 4000U, "./compose.yaml");
     const OdPortRow *live = find_dashboard_row(&dashboard, 5000U, "live");
-    CHECK(env != NULL && strcmp(env->process, "API") == 0);
-    CHECK(bare != NULL && strcmp(bare->process, "env") == 0);
-    CHECK(support != NULL && strcmp(support->process, "SUPPORT") == 0);
-    CHECK(middle != NULL && strcmp(middle->process, "API_SERVER") == 0);
-    CHECK(repeated != NULL && strcmp(repeated->process, "API_SERVER") == 0);
-    CHECK(compose != NULL && strcmp(compose->process, "compose") == 0);
+    CHECK(env != NULL && strcmp(env->source, "env (API_PORT) — ./.env") == 0);
+    CHECK(bare != NULL && strcmp(bare->source, "env (PORT) — ./.env") == 0);
+    CHECK(support != NULL &&
+          strcmp(support->source, "env (SUPPORT_PORT) — ./.env") == 0);
+    CHECK(middle != NULL &&
+          strcmp(middle->source, "env (API_PORT_SERVER) — ./.env") == 0);
+    CHECK(repeated != NULL &&
+          strcmp(repeated->source, "env (API_PORT_PORT_SERVER) — ./.env") == 0);
+    CHECK(compose != NULL &&
+          strcmp(compose->source, "compose — ./compose.yaml") == 0);
+    CHECK(env != NULL && strcmp(env->process, "-") == 0);
+    CHECK(bare != NULL && strcmp(bare->process, "-") == 0);
+    CHECK(support != NULL && strcmp(support->process, "-") == 0);
+    CHECK(middle != NULL && strcmp(middle->process, "-") == 0);
+    CHECK(repeated != NULL && strcmp(repeated->process, "-") == 0);
+    CHECK(compose != NULL && strcmp(compose->process, "-") == 0);
     CHECK(live != NULL && strcmp(live->process, "codex") == 0);
 
     od_dashboard_free(&dashboard);
@@ -1055,7 +1066,7 @@ static void test_dashboard_declared_rows_show_variable_or_source_kind(void) {
     CHECK(rmdir(root) == 0);
 }
 
-static void test_dashboard_long_declaration_name_falls_back_to_source_kind(void) {
+static void test_dashboard_source_preserves_a_long_declaration_key(void) {
     char root[] = "/tmp/opendoor-dashboard-long-label-XXXXXX";
     CHECK(mkdtemp(root) != NULL);
     char key[OD_PROCESS_CAP + 16U];
@@ -1076,7 +1087,10 @@ static void test_dashboard_long_declaration_name_falls_back_to_source_kind(void)
     CHECK(od_dashboard_init(&dashboard, root, &discovery, &snapshot, &error) == OD_OK);
     CHECK(dashboard.count == 1U);
     if (dashboard.count == 1U) {
-        CHECK(strcmp(dashboard.rows[0].process, "env") == 0);
+        CHECK(strncmp(dashboard.rows[0].source, "env (", 5U) == 0);
+        CHECK(strstr(dashboard.rows[0].source, key) != NULL);
+        CHECK(strstr(dashboard.rows[0].source, " — ./.env") != NULL);
+        CHECK(strcmp(dashboard.rows[0].process, "-") == 0);
     }
     od_dashboard_free(&dashboard);
     CHECK(rmdir(root) == 0);
@@ -1161,7 +1175,7 @@ static void test_dashboard_project_ownership_and_all_declaration_matches(void) {
         }
         CHECK(row->relative_folder[0] == '.' && row->relative_folder[1] == '/');
         if (row->declared) {
-            CHECK(row->source[0] == '.' && row->source[1] == '/');
+            CHECK(strstr(row->source, " — ./") != NULL);
         }
         if (index > 0U) {
             const OdPortRow *previous = &dashboard.rows[index - 1U];
@@ -1253,7 +1267,7 @@ int main(void) {
     test_dashboard_merges_env_definition_with_compose_reference();
     test_dashboard_keeps_linked_source_when_same_file_port_is_deduplicated();
     test_dashboard_declared_rows_show_variable_or_source_kind();
-    test_dashboard_long_declaration_name_falls_back_to_source_kind();
+    test_dashboard_source_preserves_a_long_declaration_key();
     test_dashboard_project_ownership_and_all_declaration_matches();
     test_empty_dashboard_initializes_without_rows();
     if (failures != 0) {

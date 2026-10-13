@@ -36,6 +36,7 @@ add_library(opendoor_core
   src/allocation.c
   src/scan.c
   src/discovery.c
+  src/display.c
   src/history.c
   src/ui.c
   src/screens.c

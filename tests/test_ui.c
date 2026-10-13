@@ -449,8 +449,8 @@ static void test_dashboard_renders_declaration_names_and_live_processes(void) {
     od_render_dashboard(&canvas, &dashboard, "Scan complete", true);
     char *text = rendered_text(&canvas);
     CHECK(text != NULL && strstr(text, "PROCESS") != NULL);
-    CHECK(text != NULL && strstr(text, "API") != NULL);
-    CHECK(text != NULL && strstr(text, "project-worker-12345") == NULL);
+    CHECK(text != NULL && strstr(text, "env (API_PORT)") != NULL);
+    CHECK(text != NULL && strstr(text, "project-worker-12345") != NULL);
     CHECK(text != NULL && strstr(text, "node") != NULL);
     CHECK(text != NULL &&
           strstr(text, "./services/backend/config/.env.production") == NULL);
